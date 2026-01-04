@@ -26,94 +26,79 @@ package gocql
 
 import (
 	"bytes"
-	"sync"
+	"context"
 
-	"github.com/apache/cassandra-gocql-driver/v2/internal/lru"
+	"github.com/maypok86/otter/v2"
 )
 
 const defaultMaxPreparedStmts = 1000
 
-// preparedLRU is the prepared statement cache
+// preparedKey is the cache key for prepared statements.
+// Using a struct avoids string concatenation allocations on the hot path.
+type preparedKey struct {
+	hostID    string
+	keyspace  string
+	statement string
+}
+
+// preparedLRU is the prepared statement cache using otter for high-performance
+// concurrent access without global mutex contention.
 type preparedLRU struct {
-	mu  sync.Mutex
-	lru *lru.Cache
+	cache *otter.Cache[preparedKey, *preparedStatment]
 }
 
-func (p *preparedLRU) clear() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for p.lru.Len() > 0 {
-		p.lru.RemoveOldest()
+// newPreparedLRU creates a new prepared statement cache with the given maximum size.
+func newPreparedLRU(maxSize int) *preparedLRU {
+	return &preparedLRU{
+		cache: otter.Must(&otter.Options[preparedKey, *preparedStatment]{
+			MaximumSize: maxSize,
+		}),
 	}
 }
 
-func (p *preparedLRU) add(key string, val *inflightPrepare) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.lru.Add(key, val)
-}
-
-func (p *preparedLRU) remove(key string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.lru.Remove(key)
-}
-
-func (p *preparedLRU) execIfMissing(key string, fn func(lru *lru.Cache) *inflightPrepare) (*inflightPrepare, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	val, ok := p.lru.Get(key)
-	if ok {
-		return val.(*inflightPrepare), true
+// keyFor constructs a cache key from host, keyspace, and statement.
+func (p *preparedLRU) keyFor(hostID, keyspace, statement string) preparedKey {
+	return preparedKey{
+		hostID:    hostID,
+		keyspace:  keyspace,
+		statement: statement,
 	}
-
-	return fn(p.lru), false
 }
 
-func (p *preparedLRU) keyFor(hostID, keyspace, statement string) string {
-	// TODO: we should just use a struct for the key in the map
-	return hostID + keyspace + statement
+// get retrieves a prepared statement from the cache.
+// This is a lock-free read operation.
+func (p *preparedLRU) get(key preparedKey) (*preparedStatment, bool) {
+	return p.cache.GetIfPresent(key)
 }
 
-func (p *preparedLRU) evictPreparedID(key string, id []byte) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// getOrLoad retrieves a prepared statement from the cache, loading it if not present.
+// Otter handles deduplication of concurrent loads for the same key.
+func (p *preparedLRU) getOrLoad(ctx context.Context, key preparedKey, loader otter.Loader[preparedKey, *preparedStatment]) (*preparedStatment, error) {
+	return p.cache.Get(ctx, key, loader)
+}
 
-	val, ok := p.lru.Get(key)
-	if !ok {
-		return
-	}
+// set adds or updates a prepared statement in the cache.
+func (p *preparedLRU) set(key preparedKey, val *preparedStatment) {
+	p.cache.Set(key, val)
+}
 
-	ifp, ok := val.(*inflightPrepare)
-	if !ok {
-		return
-	}
+// delete removes a prepared statement from the cache.
+func (p *preparedLRU) delete(key preparedKey) {
+	p.cache.Invalidate(key)
+}
 
-	select {
-	case <-ifp.done:
-		if bytes.Equal(id, ifp.preparedStatment.id) {
-			p.lru.Remove(key)
+// evictPreparedID atomically removes an entry only if its ID matches.
+// This prevents removing a re-prepared statement that replaced the failed one.
+func (p *preparedLRU) evictPreparedID(key preparedKey, id []byte) {
+	p.cache.ComputeIfPresent(key, func(val *preparedStatment) (*preparedStatment, otter.ComputeOp) {
+		if val == nil || bytes.Equal(id, val.id) {
+			return nil, otter.InvalidateOp
 		}
-	default:
-	}
-
+		return val, otter.CancelOp
+	})
 }
 
-func (p *preparedLRU) get(key string) (*inflightPrepare, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	val, ok := p.lru.Get(key)
-	if !ok {
-		return nil, false
-	}
-
-	ifp, ok := val.(*inflightPrepare)
-	if !ok {
-		return nil, false
-	}
-
-	return ifp, true
+// clear removes all entries from the cache.
+func (p *preparedLRU) clear() {
+	p.cache.InvalidateAll()
 }

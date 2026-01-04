@@ -20,9 +20,10 @@ module github.com/apache/cassandra-gocql-driver/v2
 require (
 	github.com/golang/snappy v0.0.3
 	github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed
+	github.com/maypok86/otter/v2 v2.3.0
 	github.com/pierrec/lz4/v4 v4.1.8
 	github.com/rs/zerolog v1.34.0
-	github.com/stretchr/testify v1.9.0
+	github.com/stretchr/testify v1.11.1
 	go.uber.org/zap v1.27.0
 	gopkg.in/inf.v0 v0.9.1
 )
@@ -40,4 +41,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-go 1.19
+go 1.24.0

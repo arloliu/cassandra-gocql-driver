@@ -157,7 +157,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		prefetch:        cfg.NextPagePrefetch,
 		cfg:             cfg,
 		pageSize:        cfg.PageSize,
-		stmtsLRU:        &preparedLRU{lru: lru.New(cfg.MaxPreparedStmts)},
+		stmtsLRU:        newPreparedLRU(cfg.MaxPreparedStmts),
 		connectObserver: cfg.ConnectObserver,
 		ctx:             ctx,
 		cancel:          cancel,
@@ -214,10 +214,10 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	// Propagate session ready listener
 	s.sessionReadyListeners = newInternalSessionReadyListener(cfg.Metadata.SessionReadyListener)
 
-	//Check the TLS Config before trying to connect to anything external
+	// Check the TLS Config before trying to connect to anything external
 	connCfg, err := connConfig(&s.cfg)
 	if err != nil {
-		//TODO: Return a typed error
+		// TODO: Return a typed error
 		return nil, fmt.Errorf("gocql: unable to create session: %v", err)
 	}
 	s.connCfg = connCfg
@@ -239,8 +239,8 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	if err := s.init(); err != nil {
 		s.Close()
 		if err == ErrNoConnectionsStarted {
-			//This error used to be generated inside NewSession & returned directly
-			//Forward it on up to be backwards compatible
+			// This error used to be generated inside NewSession & returned directly
+			// Forward it on up to be backwards compatible
 			return nil, ErrNoConnectionsStarted
 		} else {
 			// TODO(zariel): dont wrap this error in fmt.Errorf, return a typed error
@@ -553,7 +553,6 @@ func (s *Session) Bind(stmt string, b func(q *QueryInfo) ([]interface{}, error))
 // Close closes all connections. The session is unusable after this
 // operation.
 func (s *Session) Close() {
-
 	s.sessionStateMu.Lock()
 	if s.isClosing {
 		s.sessionStateMu.Unlock()
@@ -686,7 +685,8 @@ func (s *Session) routingStatementMetadata(ctx context.Context, stmt string, key
 		keyspace = s.cfg.Keyspace
 	}
 
-	key := keyspace + stmt
+	// Use null byte separator to avoid key collisions (e.g., "ab" + "c" vs "a" + "bc")
+	key := keyspace + "\x00" + stmt
 	s.routingMetadataCache.mu.Lock()
 
 	// Using here keyspace + stmt as a cache key because
@@ -699,16 +699,27 @@ func (s *Session) routingStatementMetadata(ctx context.Context, stmt string, key
 		// Conn to prepare statements
 		inflight := entry.(*inflightCachedEntry)
 
-		// wait for any inflight work
-		inflight.wg.Wait()
+		// wait for any inflight work with context cancellation support
+		done := make(chan struct{})
+		go func() {
+			inflight.wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// inflight completed
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 
 		if inflight.err != nil {
 			return nil, inflight.err
 		}
 
-		key, _ := inflight.value.(*StatementMetadata)
+		meta, _ := inflight.value.(*StatementMetadata)
 
-		return key, nil
+		return meta, nil
 	}
 
 	// create a new inflight entry while the data is created
@@ -1032,8 +1043,7 @@ func (qm *hostMetricsManagerImpl) attempt(addLatency time.Duration, host *HostIn
 
 var emptyHostMetricsManager = &emptyHostMetricsManagerImpl{}
 
-type emptyHostMetricsManagerImpl struct {
-}
+type emptyHostMetricsManagerImpl struct{}
 
 func (qm *emptyHostMetricsManagerImpl) attempt(_ time.Duration, _ *HostInfo) *hostMetrics {
 	return nil

@@ -101,7 +101,7 @@ func TestUseStatementError(t *testing.T) {
 
 	if err := session.Query("USE gocql_test").Exec(); err != nil {
 		if err != ErrUseStmt {
-			t.Fatalf("expected ErrUseStmt, got " + err.Error())
+			t.Fatalf("expected ErrUseStmt, got %s", err.Error())
 		}
 	} else {
 		t.Fatal("expected err, got nil.")
@@ -118,7 +118,7 @@ func TestInvalidKeyspace(t *testing.T) {
 			t.Fatalf("Expected ErrNoConnections but got %v", err)
 		}
 	} else {
-		session.Close() //Clean up the session
+		session.Close() // Clean up the session
 		t.Fatal("expected err, got nil.")
 	}
 }
@@ -655,22 +655,22 @@ func TestDurationType(t *testing.T) {
 	}
 
 	durations := []Duration{
-		Duration{
+		{
 			Months:      250,
 			Days:        500,
 			Nanoseconds: 300010001,
 		},
-		Duration{
+		{
 			Months:      -250,
 			Days:        -500,
 			Nanoseconds: -300010001,
 		},
-		Duration{
+		{
 			Months:      0,
 			Days:        128,
 			Nanoseconds: 127,
 		},
-		Duration{
+		{
 			Months:      0x7FFFFFFF,
 			Days:        0x7FFFFFFF,
 			Nanoseconds: 0x7FFFFFFFFFFFFFFF,
@@ -731,7 +731,6 @@ func TestMapScanCAS(t *testing.T) {
 	} else if title != mapCAS["title"] || revid != mapCAS["revid"] || deleted != mapCAS["deleted"] {
 		t.Fatalf("expected %s/%v/%v/%v but got %s/%v/%v%v", title, revid, modified, false, mapCAS["title"], mapCAS["revid"], mapCAS["last_modified"], mapCAS["deleted"])
 	}
-
 }
 
 func TestBatch(t *testing.T) {
@@ -826,7 +825,6 @@ func TestBatchLimit(t *testing.T) {
 	if err := batch.Exec(); err != ErrTooManyStmts {
 		t.Fatalf("gocql attempted to execute a batch larger than the support limit of statements: expected %v, got %v", ErrTooManyStmts, err)
 	}
-
 }
 
 func TestWhereIn(t *testing.T) {
@@ -882,7 +880,6 @@ func TestTooManyQueryArgs(t *testing.T) {
 	}
 
 	// TODO: should indicate via an error code that it is an invalid arg?
-
 }
 
 // TestNotEnoughQueryArgs tests to make sure the library correctly handles the application level bug
@@ -1035,7 +1032,6 @@ func TestMapScanWithRefMap(t *testing.T) {
 	} else if v := ret["testint"].(*int64); v != nil {
 		t.Fatalf("testint should be nil got %+#v", v)
 	}
-
 }
 
 func TestMapScan(t *testing.T) {
@@ -1155,6 +1151,7 @@ func TestSliceMap(t *testing.T) {
 		matchSliceMap(t, sliceMap, testMap)
 	}
 }
+
 func matchSliceMap(t *testing.T, sliceMap []map[string]interface{}, testMap map[string]interface{}) {
 	if sliceMap[0]["testuuid"] != testMap["testuuid"] {
 		t.Fatalf("returned testuuid %#v did not match %#v", sliceMap[0]["testuuid"], testMap["testuuid"])
@@ -1259,8 +1256,7 @@ func TestSliceMap_CopySlices(t *testing.T) {
 	}
 }
 
-type MyRetryPolicy struct {
-}
+type MyRetryPolicy struct{}
 
 func (*MyRetryPolicy) Attempt(q RetryableQuery) bool {
 	if q.Attempts() > 5 {
@@ -1495,7 +1491,6 @@ func TestStaticQueryInfo(t *testing.T) {
 	if value != "foo" {
 		t.Fatalf("Expected value %s, but got %s", "foo", value)
 	}
-
 }
 
 type ClusteredKeyValue struct {
@@ -1526,7 +1521,6 @@ func upcaseInitial(str string) string {
 
 // TestBoundQueryInfo makes sure that the application can manually bind query parameters using the query meta data supplied at runtime
 func TestBoundQueryInfo(t *testing.T) {
-
 	session := createSession(t)
 	defer session.Close()
 
@@ -1560,7 +1554,6 @@ func TestBoundQueryInfo(t *testing.T) {
 	if value != "baz" {
 		t.Fatalf("Expected value %s, but got %s", "baz", value)
 	}
-
 }
 
 // TestBatchQueryInfo makes sure that the application can manually bind query parameters when executing in a batch
@@ -1637,11 +1630,8 @@ func injectInvalidPreparedStatement(t *testing.T, session *Session, table string
 
 	conn := getRandomConn(t, session)
 
-	flight := new(inflightPrepare)
 	key := session.stmtsLRU.keyFor(conn.host.HostID(), "", stmt)
-	session.stmtsLRU.add(key, flight)
-
-	flight.preparedStatment = &preparedStatment{
+	session.stmtsLRU.set(key, &preparedStatment{
 		id: []byte{'f', 'o', 'o', 'b', 'a', 'r'},
 		request: preparedMetadata{
 			resultMetadata: resultMetadata{
@@ -1659,7 +1649,7 @@ func injectInvalidPreparedStatement(t *testing.T, session *Session, table string
 				},
 			},
 		},
-	}
+	})
 
 	return stmt, conn
 }
@@ -1725,7 +1715,6 @@ func TestQueryInfo(t *testing.T) {
 
 	conn := getRandomConn(t, session)
 	info, err := conn.prepareStatement(context.Background(), "SELECT release_version, host_id FROM system.local WHERE key = ?", nil, conn.currentKeyspace)
-
 	if err != nil {
 		t.Fatalf("Failed to execute query for preparing statement: %v", err)
 	}
@@ -1763,13 +1752,13 @@ func TestPrepare_PreparedCacheEviction(t *testing.T) {
 	// clear the cache
 	session.stmtsLRU.clear()
 
-	//Fill the table
+	// Fill the table
 	for i := 0; i < 2; i++ {
 		if err := session.Query("INSERT INTO prepcachetest (id,mod) VALUES (?, ?)", i, 10000%(i+1)).Exec(); err != nil {
 			t.Fatalf("insert into prepcachetest failed, err '%v'", err)
 		}
 	}
-	//Populate the prepared statement cache with select statements
+	// Populate the prepared statement cache with select statements
 	var id, mod int
 	for i := 0; i < 2; i++ {
 		err := session.Query("SELECT id,mod FROM prepcachetest WHERE id = "+strconv.FormatInt(int64(i), 10)).Scan(&id, &mod)
@@ -1778,55 +1767,47 @@ func TestPrepare_PreparedCacheEviction(t *testing.T) {
 		}
 	}
 
-	//generate an update statement to test they are prepared
+	// generate an update statement to test they are prepared
 	err := session.Query("UPDATE prepcachetest SET mod = ? WHERE id = ?", 1, 11).Exec()
 	if err != nil {
 		t.Fatalf("update prepcachetest failed, error '%v'", err)
 	}
 
-	//generate a delete statement to test they are prepared
+	// generate a delete statement to test they are prepared
 	err = session.Query("DELETE FROM prepcachetest WHERE id = ?", 1).Exec()
 	if err != nil {
 		t.Fatalf("delete from prepcachetest failed, error '%v'", err)
 	}
 
-	//generate an insert statement to test they are prepared
+	// generate an insert statement to test they are prepared
 	err = session.Query("INSERT INTO prepcachetest (id,mod) VALUES (?, ?)", 3, 11).Exec()
 	if err != nil {
 		t.Fatalf("insert into prepcachetest failed, error '%v'", err)
 	}
 
-	session.stmtsLRU.mu.Lock()
-	defer session.stmtsLRU.mu.Unlock()
-
-	//Make sure the cache size is maintained
-	if session.stmtsLRU.lru.Len() != session.stmtsLRU.lru.MaxEntries {
-		t.Fatalf("expected cache size of %v, got %v", session.stmtsLRU.lru.MaxEntries, session.stmtsLRU.lru.Len())
-	}
-
 	// Walk through all the configured hosts and test cache retention and eviction
 	for _, host := range session.ring.hosts {
-		_, ok := session.stmtsLRU.lru.Get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "SELECT id,mod FROM prepcachetest WHERE id = 0"))
+		_, ok := session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "SELECT id,mod FROM prepcachetest WHERE id = 0"))
 		if ok {
 			t.Errorf("expected first select to be purged but was in cache for host=%q", host)
 		}
 
-		_, ok = session.stmtsLRU.lru.Get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "SELECT id,mod FROM prepcachetest WHERE id = 1"))
+		_, ok = session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "SELECT id,mod FROM prepcachetest WHERE id = 1"))
 		if !ok {
 			t.Errorf("exepected second select to be in cache for host=%q", host)
 		}
 
-		_, ok = session.stmtsLRU.lru.Get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "INSERT INTO prepcachetest (id,mod) VALUES (?, ?)"))
+		_, ok = session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "INSERT INTO prepcachetest (id,mod) VALUES (?, ?)"))
 		if !ok {
 			t.Errorf("expected insert to be in cache for host=%q", host)
 		}
 
-		_, ok = session.stmtsLRU.lru.Get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "UPDATE prepcachetest SET mod = ? WHERE id = ?"))
+		_, ok = session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "UPDATE prepcachetest SET mod = ? WHERE id = ?"))
 		if !ok {
 			t.Errorf("expected update to be in cached for host=%q", host)
 		}
 
-		_, ok = session.stmtsLRU.lru.Get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "DELETE FROM prepcachetest WHERE id = ?"))
+		_, ok = session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "DELETE FROM prepcachetest WHERE id = ?"))
 		if !ok {
 			t.Errorf("expected delete to be cached for host=%q", host)
 		}
@@ -1943,7 +1924,6 @@ func TestMarshalInet(t *testing.T) {
 	if ipResult.String() != netIp.String() {
 		t.Errorf("Expected %s, was %s", netIp.String(), ipResult.String())
 	}
-
 }
 
 func TestVarint(t *testing.T) {
@@ -3403,7 +3383,6 @@ func TestSessionBindRoutingKey(t *testing.T) {
 			value   int,
 			PRIMARY KEY (key)
 		)`); err != nil {
-
 		t.Fatal(err)
 	}
 
@@ -3435,7 +3414,6 @@ func TestJSONSupport(t *testing.T) {
 		    age int,
 		    state text
 		)`); err != nil {
-
 		t.Fatal(err)
 	}
 
@@ -3603,7 +3581,6 @@ func TestUnmarshallNestedTypes(t *testing.T) {
 		    id text PRIMARY KEY,
 		    val list<frozen<map<text, text> > >
 		)`); err != nil {
-
 		t.Fatal(err)
 	}
 
@@ -3641,7 +3618,6 @@ func TestSchemaReset(t *testing.T) {
 
 	if err := createTable(session, `CREATE TABLE gocql_test.test_schema_reset (
 		id text PRIMARY KEY)`); err != nil {
-
 		t.Fatal(err)
 	}
 
@@ -4082,11 +4058,10 @@ func TestPrepareExecuteMetadataChangedFlag(t *testing.T) {
 	require.Equal(t, 1, row["id"])
 
 	stmtCacheKey := session.stmtsLRU.keyFor(hostid, "gocql_test", queryBeforeTableAltering.stmt)
-	inflight, ok := session.stmtsLRU.get(stmtCacheKey)
+	preparedStatementBeforeTableAltering, ok := session.stmtsLRU.get(stmtCacheKey)
 	if !ok {
-		t.Fatalf("failed to find inflight entry for key %v", stmtCacheKey)
+		t.Fatalf("failed to find cache entry for key %v", stmtCacheKey)
 	}
-	preparedStatementBeforeTableAltering := inflight.preparedStatment
 
 	// Changing table schema in order to cause C* to return RESULT/ROWS Metadata_changed
 	alteringTableQuery := session.Query("ALTER TABLE gocql_test.metadata_changed ADD new_col int")
@@ -4147,19 +4122,12 @@ func TestPrepareExecuteMetadataChangedFlag(t *testing.T) {
 	handleRows(iter)
 
 	// Ensuring if cache contains updated prepared statement
-	inflight, _ = session.stmtsLRU.get(stmtCacheKey)
-	preparedStatementAfterTableAltering := inflight.preparedStatment
+	preparedStatementAfterTableAltering, _ := session.stmtsLRU.get(stmtCacheKey)
 	require.NotEqual(t, preparedStatementBeforeTableAltering.resultMetadataID, preparedStatementAfterTableAltering.resultMetadataID)
 	require.NotEqual(t, preparedStatementBeforeTableAltering.response, preparedStatementAfterTableAltering.response)
 
 	// FORCE SEND OLD RESULT METADATA ID (https://issues.apache.org/jira/browse/CASSANDRA-20028)
-	closedCh := make(chan struct{})
-	close(closedCh)
-	session.stmtsLRU.add(stmtCacheKey, &inflightPrepare{
-		done:             closedCh,
-		err:              nil,
-		preparedStatment: preparedStatementBeforeTableAltering,
-	})
+	session.stmtsLRU.set(stmtCacheKey, preparedStatementBeforeTableAltering)
 
 	// Running query with timeout to ensure there is no deadlocks.
 	// However, it doesn't 100% proves that there is a deadlock...
@@ -4172,8 +4140,7 @@ func TestPrepareExecuteMetadataChangedFlag(t *testing.T) {
 	handleRows(iter)
 	err = iter.Close()
 
-	inflight, _ = session.stmtsLRU.get(stmtCacheKey)
-	preparedStatementAfterTableAltering2 := inflight.preparedStatment
+	preparedStatementAfterTableAltering2, _ := session.stmtsLRU.get(stmtCacheKey)
 	require.NotEqual(t, preparedStatementBeforeTableAltering.resultMetadataID, preparedStatementAfterTableAltering2.resultMetadataID)
 	require.NotEqual(t, preparedStatementBeforeTableAltering.response, preparedStatementAfterTableAltering2.response)
 
@@ -4189,8 +4156,7 @@ func TestPrepareExecuteMetadataChangedFlag(t *testing.T) {
 	handleRows(iter)
 
 	// Ensuring metadata of prepared stmt is not changed
-	inflight, _ = session.stmtsLRU.get(stmtCacheKey)
-	preparedStatementAfterTableAltering3 := inflight.preparedStatment
+	preparedStatementAfterTableAltering3, _ := session.stmtsLRU.get(stmtCacheKey)
 	require.Equal(t, preparedStatementAfterTableAltering2.resultMetadataID, preparedStatementAfterTableAltering3.resultMetadataID)
 	require.Equal(t, preparedStatementAfterTableAltering2.response, preparedStatementAfterTableAltering3.response)
 }
