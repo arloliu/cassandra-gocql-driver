@@ -38,7 +38,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/apache/cassandra-gocql-driver/v2/internal/lru"
+	"github.com/maypok86/otter/v2"
 )
 
 // Session is the interface used by users to interact with the database.
@@ -54,7 +54,7 @@ type Session struct {
 	cons                 Consistency
 	pageSize             int
 	prefetch             float64
-	routingMetadataCache routingKeyInfoLRU
+	routingMetadataCache *routingKeyInfoLRU
 	schemaDescriber      *schemaDescriber
 	trace                Tracer
 	queryObserver        QueryObserver
@@ -176,7 +176,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 
 	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent, s.logger)
 
-	s.routingMetadataCache.lru = lru.New(cfg.MaxRoutingKeyInfo)
+	s.routingMetadataCache = newRoutingKeyInfoLRU(cfg.MaxRoutingKeyInfo)
 
 	s.hostSource = &ringDescriber{session: s}
 	s.ringRefresher = newRefreshDebouncer(ringRefreshDebounceTime, func() error { return refreshRing(s.hostSource) })
@@ -685,61 +685,19 @@ func (s *Session) routingStatementMetadata(ctx context.Context, stmt string, key
 		keyspace = s.cfg.Keyspace
 	}
 
-	// Use null byte separator to avoid key collisions (e.g., "ab" + "c" vs "a" + "bc")
-	key := keyspace + "\x00" + stmt
-	s.routingMetadataCache.mu.Lock()
+	cacheKey := s.routingMetadataCache.keyFor(keyspace, stmt)
 
-	// Using here keyspace + stmt as a cache key because
-	// the query keyspace could be overridden via SetKeyspace
-	entry, cached := s.routingMetadataCache.lru.Get(key)
-	if cached {
-		// done accessing the cache
-		s.routingMetadataCache.mu.Unlock()
-		// the entry is an inflight struct similar to that used by
-		// Conn to prepare statements
-		inflight := entry.(*inflightCachedEntry)
+	loader := otter.LoaderFunc[routingCacheKey, *StatementMetadata](
+		func(loadCtx context.Context, key routingCacheKey) (*StatementMetadata, error) {
+			meta, err := s.StatementMetadata(loadCtx, key.statement, key.keyspace)
+			if err != nil {
+				return nil, err
+			}
+			return &meta, nil
+		},
+	)
 
-		// wait for any inflight work with context cancellation support
-		done := make(chan struct{})
-		go func() {
-			inflight.wg.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			// inflight completed
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-
-		if inflight.err != nil {
-			return nil, inflight.err
-		}
-
-		meta, _ := inflight.value.(*StatementMetadata)
-
-		return meta, nil
-	}
-
-	// create a new inflight entry while the data is created
-	inflight := new(inflightCachedEntry)
-	inflight.wg.Add(1)
-	defer inflight.wg.Done()
-	s.routingMetadataCache.lru.Add(key, inflight)
-	s.routingMetadataCache.mu.Unlock()
-
-	var meta StatementMetadata
-	meta, inflight.err = s.StatementMetadata(ctx, stmt, keyspace)
-	if inflight.err != nil {
-		// don't cache this error
-		s.routingMetadataCache.Remove(key)
-		return nil, inflight.err
-	}
-
-	inflight.value = &meta
-
-	return &meta, nil
+	return s.routingMetadataCache.getOrLoad(ctx, cacheKey, loader)
 }
 
 // StatementMetadata represents various metadata about a statement.
@@ -2280,33 +2238,72 @@ func (c ColumnInfo) String() string {
 	return fmt.Sprintf("[column keyspace=%s table=%s name=%s type=%v]", c.Keyspace, c.Table, c.Name, c.TypeInfo)
 }
 
-// routing key indexes LRU cache
+// routingCacheKey is the cache key for routing metadata.
+// Using a struct avoids string concatenation allocations.
+type routingCacheKey struct {
+	keyspace  string
+	statement string
+}
+
+// routingKeyInfoLRU is the routing metadata cache using otter for high-performance
+// concurrent access without global mutex contention.
 type routingKeyInfoLRU struct {
-	lru *lru.Cache
-	mu  sync.Mutex
+	cache *otter.Cache[routingCacheKey, *StatementMetadata]
 }
 
-func (r *routingKeyInfoLRU) Remove(key string) {
-	r.mu.Lock()
-	r.lru.Remove(key)
-	r.mu.Unlock()
-}
-
-// Max adjusts the maximum size of the cache and cleans up the oldest records if
-// the new max is lower than the previous value. Not concurrency safe.
-func (r *routingKeyInfoLRU) Max(max int) {
-	r.mu.Lock()
-	for r.lru.Len() > max {
-		r.lru.RemoveOldest()
+// newRoutingKeyInfoLRU creates a new routing metadata cache with the given maximum size.
+func newRoutingKeyInfoLRU(maxSize int) *routingKeyInfoLRU {
+	if maxSize <= 0 {
+		maxSize = 1000 // Fallback to default if invalid
 	}
-	r.lru.MaxEntries = max
-	r.mu.Unlock()
+	return &routingKeyInfoLRU{
+		cache: otter.Must(&otter.Options[routingCacheKey, *StatementMetadata]{
+			MaximumSize: maxSize,
+		}),
+	}
 }
 
-type inflightCachedEntry struct {
-	wg    sync.WaitGroup
-	err   error
-	value interface{}
+// keyFor constructs a cache key from keyspace and statement.
+func (r *routingKeyInfoLRU) keyFor(keyspace, statement string) routingCacheKey {
+	return routingCacheKey{
+		keyspace:  keyspace,
+		statement: statement,
+	}
+}
+
+// get retrieves routing metadata from the cache.
+func (r *routingKeyInfoLRU) get(key routingCacheKey) (*StatementMetadata, bool) {
+	return r.cache.GetIfPresent(key)
+}
+
+// getOrLoad retrieves routing metadata from the cache, loading it if not present.
+// Otter handles deduplication of concurrent loads for the same key.
+func (r *routingKeyInfoLRU) getOrLoad(
+	ctx context.Context,
+	key routingCacheKey,
+	loader otter.Loader[routingCacheKey, *StatementMetadata],
+) (*StatementMetadata, error) {
+	return r.cache.Get(ctx, key, loader)
+}
+
+// set adds or updates routing metadata in the cache.
+func (r *routingKeyInfoLRU) set(key routingCacheKey, val *StatementMetadata) {
+	r.cache.Set(key, val)
+}
+
+// delete removes routing metadata from the cache.
+func (r *routingKeyInfoLRU) delete(key routingCacheKey) {
+	r.cache.Invalidate(key)
+}
+
+// size returns the estimated number of entries in the cache.
+func (r *routingKeyInfoLRU) size() int {
+	return r.cache.EstimatedSize()
+}
+
+// clear removes all entries from the cache.
+func (r *routingKeyInfoLRU) clear() {
+	r.cache.InvalidateAll()
 }
 
 // Tracer is the interface implemented by query tracers. Tracers have the

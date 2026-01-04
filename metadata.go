@@ -807,6 +807,7 @@ func refreshSchemas(session *Session) error {
 	if session.cfg.Metadata.CacheMode == Disabled {
 		return nil
 	}
+	session.routingMetadataCache.clear()
 	awaitErr := session.control.awaitSchemaAgreementWithTimeout(10 * time.Second)
 	if awaitErr != nil {
 		session.logger.Warning("Failed to await schema agreement, proceeding with schema refresh",

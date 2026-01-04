@@ -2991,7 +2991,7 @@ func TestRoutingStatementMetadata(t *testing.T) {
 	}
 
 	// verify the cache is working
-	cacheSize := session.routingMetadataCache.lru.Len()
+	cacheSize := session.routingMetadataCache.size()
 	if cacheSize != 1 {
 		t.Errorf("Expected cache size to be 1 but was %d", cacheSize)
 	}
@@ -3058,7 +3058,7 @@ func TestRoutingStatementMetadata(t *testing.T) {
 	}
 
 	// verify the cache is working
-	cacheSize = session.routingMetadataCache.lru.Len()
+	cacheSize = session.routingMetadataCache.size()
 	if cacheSize != 2 {
 		t.Errorf("Expected cache size to be 2 but was %d", cacheSize)
 	}
@@ -4251,17 +4251,14 @@ func TestRoutingKeyCacheUsesOverriddenKeyspace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	getStatementMetadata := func(key string) *StatementMetadata {
+	getStatementMetadata := func(keyspace, stmt string) *StatementMetadata {
 		t.Helper()
-		session.routingMetadataCache.mu.Lock()
-		value, ok := session.routingMetadataCache.lru.Get(key)
+		key := session.routingMetadataCache.keyFor(keyspace, stmt)
+		value, ok := session.routingMetadataCache.get(key)
 		if !ok {
-			t.Fatalf("routing key not found in cache for key %v", key)
+			t.Fatalf("routing key not found in cache for keyspace=%v stmt=%v", keyspace, stmt)
 		}
-		session.routingMetadataCache.mu.Unlock()
-
-		inflight := value.(*inflightCachedEntry)
-		return inflight.value.(*StatementMetadata)
+		return value
 	}
 
 	const insertQuery = "INSERT INTO routing_key_cache_uses_overridden_ks (id) VALUES (?)"
@@ -4274,7 +4271,7 @@ func TestRoutingKeyCacheUsesOverriddenKeyspace(t *testing.T) {
 	require.NoError(t, err)
 
 	// Ensuring that the cache contains the query with default ks
-	meta1 := getStatementMetadata("gocql_test" + b1.Entries[0].Stmt)
+	meta1 := getStatementMetadata("gocql_test", b1.Entries[0].Stmt)
 	require.Equal(t, "gocql_test", meta1.Keyspace)
 
 	// Running batch in gocql_test_routing_key_cache ks
@@ -4286,7 +4283,7 @@ func TestRoutingKeyCacheUsesOverriddenKeyspace(t *testing.T) {
 	require.NoError(t, err)
 
 	// Ensuring that the cache contains the query with gocql_test_routing_key_cache ks
-	meta2 := getStatementMetadata("gocql_test_routing_key_cache" + b2.Entries[0].Stmt)
+	meta2 := getStatementMetadata("gocql_test_routing_key_cache", b2.Entries[0].Stmt)
 	require.Equal(t, "gocql_test_routing_key_cache", meta2.Keyspace)
 
 	const selectStmt = "SELECT * FROM routing_key_cache_uses_overridden_ks WHERE id=?"
