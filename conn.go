@@ -40,8 +40,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/apache/cassandra-gocql-driver/v2/internal/lru"
 	"github.com/apache/cassandra-gocql-driver/v2/internal/streams"
+	"github.com/maypok86/otter/v2"
 )
 
 // approve the authenticator with the list of allowed authenticators. If the provided list is empty,
@@ -123,7 +123,7 @@ type SslOptions struct {
 	// client certificate
 	CertPath string
 	KeyPath  string
-	CaPath   string //optional depending on server config
+	CaPath   string // optional depending on server config
 	// If you want to verify the hostname and server cert (like a wildcard for cass cluster) then you should turn this
 	// on.
 	// This option is basically the inverse of tls.Config.InsecureSkipVerify.
@@ -1040,7 +1040,8 @@ func (c *deadlineContextWriter) writeContext(ctx context.Context, p []byte) (int
 }
 
 func newWriteCoalescer(conn deadlineWriter, writeTimeout, coalesceDuration time.Duration,
-	quit <-chan struct{}) *writeCoalescer {
+	quit <-chan struct{},
+) *writeCoalescer {
 	wc := &writeCoalescer{
 		writeCh: make(chan writeRequest),
 		c:       conn,
@@ -1443,87 +1444,52 @@ type preparedStatment struct {
 	response         resultMetadata
 }
 
-type inflightPrepare struct {
-	done chan struct{}
-	err  error
-
-	preparedStatment *preparedStatment
-}
-
 func (c *Conn) prepareStatement(ctx context.Context, stmt string, tracer Tracer, keyspace string) (*preparedStatment, error) {
-	stmtCacheKey := c.session.stmtsLRU.keyFor(c.host.HostID(), keyspace, stmt)
-	flight, ok := c.session.stmtsLRU.execIfMissing(stmtCacheKey, func(lru *lru.Cache) *inflightPrepare {
-		flight := &inflightPrepare{
-			done: make(chan struct{}),
+	cacheKey := c.session.stmtsLRU.keyFor(c.host.HostID(), keyspace, stmt)
+
+	loader := otter.LoaderFunc[preparedKey, *preparedStatment](func(loadCtx context.Context, _ preparedKey) (*preparedStatment, error) {
+		prep := &writePrepareFrame{
+			statement: stmt,
 		}
-		lru.Add(stmtCacheKey, flight)
-		return flight
+		if c.version > protoVersion4 {
+			prep.keyspace = keyspace
+		}
+
+		// Use connection context for the actual network call to ensure the prepare
+		// completes even if the caller's context is canceled (other waiters need the result).
+		framer, err := c.exec(c.ctx, prep, tracer)
+		if err != nil {
+			return nil, err
+		}
+
+		frame, err := framer.parseFrame()
+		if err != nil {
+			return nil, err
+		}
+
+		if len(framer.traceID) > 0 && tracer != nil {
+			tracer.Trace(framer.traceID)
+		}
+
+		switch x := frame.(type) {
+		case *resultPreparedFrame:
+			return &preparedStatment{
+				// defensively copy as we will recycle the underlying buffer after we return.
+				id:               copyBytes(x.preparedID),
+				resultMetadataID: copyBytes(x.resultMetadataID),
+				// the type info's should _not_ have a reference to the framers read buffer,
+				// therefore we can just copy them directly.
+				request:  x.reqMeta,
+				response: x.respMeta,
+			}, nil
+		case error:
+			return nil, x
+		default:
+			return nil, NewErrProtocol("Unknown type in response to prepare frame: %s", x)
+		}
 	})
 
-	if !ok {
-		go func() {
-			defer close(flight.done)
-
-			prep := &writePrepareFrame{
-				statement: stmt,
-			}
-			if c.version > protoVersion4 {
-				prep.keyspace = keyspace
-			}
-
-			// we won the race to do the load, if our context is canceled we shouldnt
-			// stop the load as other callers are waiting for it but this caller should get
-			// their context cancelled error.
-			framer, err := c.exec(c.ctx, prep, tracer)
-			if err != nil {
-				flight.err = err
-				c.session.stmtsLRU.remove(stmtCacheKey)
-				return
-			}
-
-			frame, err := framer.parseFrame()
-			if err != nil {
-				flight.err = err
-				c.session.stmtsLRU.remove(stmtCacheKey)
-				return
-			}
-
-			// TODO(zariel): tidy this up, simplify handling of frame parsing so its not duplicated
-			// everytime we need to parse a frame.
-			if len(framer.traceID) > 0 && tracer != nil {
-				tracer.Trace(framer.traceID)
-			}
-
-			switch x := frame.(type) {
-			case *resultPreparedFrame:
-				flight.preparedStatment = &preparedStatment{
-					// defensively copy as we will recycle the underlying buffer after we
-					// return.
-					id:               copyBytes(x.preparedID),
-					resultMetadataID: copyBytes(x.resultMetadataID),
-					// the type info's should _not_ have a reference to the framers read buffer,
-					// therefore we can just copy them directly.
-					request:  x.reqMeta,
-					response: x.respMeta,
-				}
-			case error:
-				flight.err = x
-			default:
-				flight.err = NewErrProtocol("Unknown type in response to prepare frame: %s", x)
-			}
-
-			if flight.err != nil {
-				c.session.stmtsLRU.remove(stmtCacheKey)
-			}
-		}()
-	}
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-flight.done:
-		return flight.preparedStatment, flight.err
-	}
+	return c.session.stmtsLRU.getOrLoad(ctx, cacheKey, loader)
 }
 
 func marshalQueryValue(typ TypeInfo, value interface{}, dst *queryValues) error {
@@ -1598,7 +1564,6 @@ func (c *Conn) executeQuery(ctx context.Context, q *internalQuery) *Iter {
 				Rval:        info.response.columns,
 				PKeyColumns: info.request.pkeyColumns,
 			})
-
 			if err != nil {
 				iter.err = err
 				return iter
@@ -1673,24 +1638,18 @@ func (c *Conn) executeQuery(ctx context.Context, q *internalQuery) *Iter {
 			//      changed resultset metadata with the Metadata_changed flag, the reported new
 			//      resultset metadata must be used in subsequent executions
 			stmtCacheKey := c.session.stmtsLRU.keyFor(c.host.HostID(), usedKeyspace, qryOpts.stmt)
-			oldInflight, ok := c.session.stmtsLRU.get(stmtCacheKey)
+			oldStmt, ok := c.session.stmtsLRU.get(stmtCacheKey)
 			if ok {
-				newInflight := &inflightPrepare{
-					done: make(chan struct{}),
-					preparedStatment: &preparedStatment{
-						id:               oldInflight.preparedStatment.id,
-						resultMetadataID: x.meta.newMetadataID,
-						request:          oldInflight.preparedStatment.request,
-						response:         x.meta,
-					},
+				newStmt := &preparedStatment{
+					id:               oldStmt.id,
+					resultMetadataID: x.meta.newMetadataID,
+					request:          oldStmt.request,
+					response:         x.meta,
 				}
-				// The driver should close this done to avoid deadlocks of
-				// other subsequent requests
-				close(newInflight.done)
-				c.session.stmtsLRU.add(stmtCacheKey, newInflight)
+				c.session.stmtsLRU.set(stmtCacheKey, newStmt)
 				// Updating info to ensure the code is looking at the updated
 				// version of the prepared statement
-				info = newInflight.preparedStatment
+				info = newStmt
 			}
 		}
 		iter.meta = x.meta
