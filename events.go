@@ -133,6 +133,7 @@ func (s *Session) handleEvent(framer *framer) {
 }
 
 func (s *Session) handleSchemaEvent(frames []frame) {
+	s.routingMetadataCache.clear()
 	// TODO: debounce events
 	for _, frame := range frames {
 		switch f := frame.(type) {

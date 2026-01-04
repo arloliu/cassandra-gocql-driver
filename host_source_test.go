@@ -82,7 +82,6 @@ func TestCassVersionBefore(t *testing.T) {
 			t.Errorf("%d: expected v%d.%d.%d to be before %v", i, test.major, test.minor, test.patch, test.version)
 		}
 	}
-
 }
 
 func TestNewHostInfoFromRow(t *testing.T) {
@@ -253,7 +252,7 @@ func TestIsValidPeer(t *testing.T) {
 }
 
 func TestHostInfo_ConnectAddress(t *testing.T) {
-	var localhost = net.IPv4(127, 0, 0, 1)
+	localhost := net.IPv4(127, 0, 0, 1)
 	tests := []struct {
 		name          string
 		connectAddr   net.IP
@@ -512,12 +511,12 @@ func TestErrorBroadcaster_MultipleListeners(t *testing.T) {
 	}()
 	wg.Wait()
 	if loadedVal := result.Load(); loadedVal != nil {
-		t.Errorf(loadedVal.(error).Error())
+		t.Errorf("%s", loadedVal.(error).Error())
 	}
 }
 
 func TestErrorBroadcaster_StopWithoutBroadcast(t *testing.T) {
-	var b = newErrorBroadcaster()
+	b := newErrorBroadcaster()
 	defer b.stop()
 	const numberOfListeners = 10
 	var listeners []<-chan error
@@ -547,6 +546,6 @@ func TestErrorBroadcaster_StopWithoutBroadcast(t *testing.T) {
 	}()
 	wg.Wait()
 	if loadedVal := result.Load(); loadedVal != nil {
-		t.Errorf(loadedVal.(error).Error())
+		t.Errorf("%s", loadedVal.(error).Error())
 	}
 }
