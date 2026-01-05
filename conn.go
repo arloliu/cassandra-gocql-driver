@@ -1231,7 +1231,9 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 	call := &callReq{
 		timeout:  make(chan struct{}),
 		streamID: stream,
-		resp:     make(chan callResp),
+		// Buffer of 1 allows closeWithError to send without blocking,
+		// preventing deadlock when caller is blocked before selecting on resp.
+		resp: make(chan callResp, 1),
 	}
 
 	if c.streamObserver != nil {
