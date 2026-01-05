@@ -40,8 +40,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/apache/cassandra-gocql-driver/v2/internal/streams"
 	"github.com/maypok86/otter/v2"
+
+	"github.com/apache/cassandra-gocql-driver/v2/internal/streams"
 )
 
 // approve the authenticator with the list of allowed authenticators. If the provided list is empty,
@@ -179,10 +180,11 @@ type Conn struct {
 
 	streams *streams.IDGenerator
 	mu      sync.Mutex
-	// calls stores a map from stream ID to callReq.
-	// This map is protected by mu.
-	// calls should not be used when closed is true, calls is set to nil when closed=true.
-	calls map[int]*callReq
+	// calls stores a mapping from stream ID to callReq.
+	//
+	// This is on the hot path for every request/response. It uses a sharded map
+	// to reduce lock contention without allocating a dense table sized to max streams.
+	calls *callMap
 
 	errorHandler ConnErrorHandler
 	compressor   Compressor
@@ -258,7 +260,7 @@ func (s *Session) dialWithoutObserver(ctx context.Context, host *HostInfo, cfg *
 			r:    bufio.NewReader(dialedHost.Conn),
 		},
 		cfg:           cfg,
-		calls:         make(map[int]*callReq),
+		calls:         newCallMap(64),
 		version:       uint8(cfg.ProtoVersion),
 		addr:          dialedHost.Conn.RemoteAddr().String(),
 		errorHandler:  errorHandler,
@@ -551,18 +553,14 @@ func (c *Conn) closeWithError(err error) {
 		return
 	}
 	c.closed = true
-
-	var callsToClose map[int]*callReq
-
-	// We should attempt to deliver the error back to the caller if it
-	// exists. However, don't block c.mu while we are delivering the
-	// error to outstanding calls.
-	if err != nil {
-		callsToClose = c.calls
-		// It is safe to change c.calls to nil. Nobody should use it after c.closed is set to true.
-		c.calls = nil
-	}
 	c.mu.Unlock()
+
+	// We should attempt to deliver the error back to the caller if it exists.
+	// Snapshot call handlers so we don't hold any shard locks while sending.
+	var callsToClose []*callReq
+	if err != nil && c.calls != nil {
+		callsToClose = c.calls.snapshot()
+	}
 
 	for _, req := range callsToClose {
 		// we need to send the error to all waiting queries.
@@ -582,6 +580,9 @@ func (c *Conn) closeWithError(err error) {
 	// if error was nil then unblock the quit channel
 	c.cancel()
 	cerr := c.r.Close()
+	if err != nil && c.calls != nil {
+		c.calls.clear()
+	}
 
 	if err != nil {
 		c.errorHandler.HandleError(c, err, true)
@@ -746,9 +747,8 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 		c.mu.Unlock()
 		return ErrConnectionClosed
 	}
-	call, ok := c.calls[head.stream]
-	delete(c.calls, head.stream)
 	c.mu.Unlock()
+	call, ok := c.calls.loadAndDelete(head.stream)
 	if call == nil || !ok {
 		c.logger.Warning("Received response for stream which has no handler.", NewLogFieldString("header", head.String()))
 		return c.discardFrame(r, head)
@@ -1196,17 +1196,21 @@ func (w *writeCoalescer) flush(resultChans []chan<- writeResult, buffers net.Buf
 // It fails with error if the connection already started closing or if a call for the given stream
 // already exists.
 func (c *Conn) addCall(call *callReq) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
+	if c.calls == nil {
 		return ErrConnectionClosed
 	}
-	existingCall := c.calls[call.streamID]
-	if existingCall != nil {
-		return fmt.Errorf("attempting to use stream already in use: %d -> %d", call.streamID,
-			existingCall.streamID)
+	if !c.calls.tryStore(call.streamID, call) {
+		return fmt.Errorf("attempting to use stream already in use: %d", call.streamID)
 	}
-	c.calls[call.streamID] = call
+
+	// Reject new calls once closing starts.
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		c.calls.delete(call.streamID)
+		return ErrConnectionClosed
+	}
+	c.mu.Unlock()
 	return nil
 }
 
@@ -1265,11 +1269,7 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 		close(call.timeout)
 		// We failed to serialize the frame into a buffer.
 		// This should not affect the connection as we didn't write anything. We just free the current call.
-		c.mu.Lock()
-		if !c.closed {
-			delete(c.calls, call.streamID)
-		}
-		c.mu.Unlock()
+		c.calls.delete(call.streamID)
 		// We need to release the stream after we remove the call from c.calls, otherwise the existingCall != nil
 		// check above could fail.
 		c.releaseStream(call)
@@ -1292,11 +1292,7 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && n == 0 {
 			// We have not started to write this frame.
 			// Release the stream as no response can come from the server on the stream.
-			c.mu.Lock()
-			if !c.closed {
-				delete(c.calls, call.streamID)
-			}
-			c.mu.Unlock()
+			c.calls.delete(call.streamID)
 			// We need to release the stream after we remove the call from c.calls, otherwise the existingCall != nil
 			// check above could fail.
 			c.releaseStream(call)
