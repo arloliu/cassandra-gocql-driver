@@ -49,7 +49,7 @@ func TestConn_CloseWithErrorNoDeadlock(t *testing.T) {
 	// Create a minimal Conn with just the fields needed for closeWithError
 	conn := &Conn{
 		streams: streams.New(protoVersion4),
-		calls:   make(map[int]*callReq),
+		calls:   newCallMap(64),
 		ctx:     ctx,
 		cancel:  cancel,
 		r:       &mockConnReader{},
@@ -67,9 +67,7 @@ func TestConn_CloseWithErrorNoDeadlock(t *testing.T) {
 		timeout:  make(chan struct{}),
 	}
 
-	conn.mu.Lock()
-	conn.calls[call.streamID] = call
-	conn.mu.Unlock()
+	conn.calls.tryStore(call.streamID, call)
 
 	// closeWithError should complete without blocking
 	// because the buffered channel allows the send to proceed
