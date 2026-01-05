@@ -422,7 +422,7 @@ func TestQueryMultinodeWithMetrics(t *testing.T) {
 
 	// Build a 3 node cluster to test host metric mapping
 	var nodes []*TestServer
-	var addresses = []string{
+	addresses := []string{
 		"127.0.0.1",
 		"127.0.0.2",
 		"127.0.0.3",
@@ -477,7 +477,6 @@ func TestQueryMultinodeWithMetrics(t *testing.T) {
 	if attempts != rt.NumRetries {
 		t.Fatalf("failed to retry the query %v time(s). Query executed %v times", rt.NumRetries, attempts)
 	}
-
 }
 
 type testRetryPolicy struct {
@@ -487,6 +486,7 @@ type testRetryPolicy struct {
 func (t *testRetryPolicy) Attempt(qry RetryableQuery) bool {
 	return qry.Attempts() <= t.NumRetries
 }
+
 func (t *testRetryPolicy) GetRetryType(err error) RetryType {
 	return Retry
 }
@@ -499,7 +499,7 @@ func TestSpeculativeExecution(t *testing.T) {
 
 	// Build a 3 node cluster
 	var nodes []*TestServer
-	var addresses = []string{
+	addresses := []string{
 		"127.0.0.1",
 		"127.0.0.2",
 		"127.0.0.3",
@@ -1511,7 +1511,7 @@ func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 			conn: server,
 			r:    bufio.NewReader(server),
 		},
-		calls:      make(map[int]*callReq),
+		calls:      newCallMap(64),
 		version:    protoVersion5,
 		addr:       server.RemoteAddr().String(),
 		streams:    streams.New(protoVersion5),
@@ -1539,8 +1539,8 @@ func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 		resp:     make(chan callResp),
 	}
 
-	c.calls[1] = call1
-	c.calls[2] = call2
+	c.calls.tryStore(1, call1)
+	c.calls.tryStore(2, call2)
 
 	req := writeQueryFrame{
 		statement: "SELECT * FROM system.local",
