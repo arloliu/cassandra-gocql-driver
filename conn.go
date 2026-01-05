@@ -1790,15 +1790,48 @@ func (c *Conn) executeBatch(ctx context.Context, b *internalBatch) *Iter {
 
 	stmts := make(map[string]string, len(b.batchOpts.entries))
 
+	// Local cache to deduplicate prepareStatement calls for repeated statements.
+	// Adaptive heuristic: disable local caching after threshold to avoid overhead
+	// for batches with many unique statements.
+	const batchDedupThreshold = 16
+	type batchPrepKey struct {
+		keyspace  string
+		statement string
+	}
+	localCache := make(map[batchPrepKey]*preparedStatment, min(n, batchDedupThreshold))
+	useLocalCache := true
+
 	for i := 0; i < n; i++ {
 		entry := &b.batchOpts.entries[i]
 		batchStmt := &req.statements[i]
 
 		if len(entry.Args) > 0 || entry.binding != nil {
-			info, err := c.prepareStatement(ctx, entry.Stmt, b.batchOpts.trace, usedKeyspace)
-			if err != nil {
-				iter.err = err
-				return iter
+			var info *preparedStatment
+			var err error
+
+			if useLocalCache {
+				key := batchPrepKey{keyspace: usedKeyspace, statement: entry.Stmt}
+				var ok bool
+				info, ok = localCache[key]
+				if !ok {
+					info, err = c.prepareStatement(ctx, entry.Stmt, b.batchOpts.trace, usedKeyspace)
+					if err != nil {
+						iter.err = err
+						return iter
+					}
+					if len(localCache) < batchDedupThreshold {
+						localCache[key] = info
+					} else {
+						// Too many unique statements, disable local caching for remaining entries
+						useLocalCache = false
+					}
+				}
+			} else {
+				info, err = c.prepareStatement(ctx, entry.Stmt, b.batchOpts.trace, usedKeyspace)
+				if err != nil {
+					iter.err = err
+					return iter
+				}
 			}
 
 			var values []interface{}
