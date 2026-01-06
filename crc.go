@@ -25,14 +25,15 @@ import (
 var (
 	// Initial CRC32 bytes: 0xFA, 0x2D, 0x55, 0xCA
 	initialCRC32Bytes = []byte{0xfa, 0x2d, 0x55, 0xca}
+	// Precomputed CRC state after feeding initialCRC32Bytes.
+	// This matches the behavior of crc32.NewIEEE()+Write(initialCRC32Bytes).
+	initialCRC32 = crc32.Update(0, crc32.IEEETable, initialCRC32Bytes)
 )
 
 // Crc32 calculates the CRC32 checksum of the given byte slice.
 func Crc32(b []byte) uint32 {
-	crc := crc32.NewIEEE()
-	crc.Write(initialCRC32Bytes) // Include initial CRC32 bytes
-	crc.Write(b)
-	return crc.Sum32()
+	// Avoid allocating a new hash.Hash per call; crc32.Update is allocation-free.
+	return crc32.Update(initialCRC32, crc32.IEEETable, b)
 }
 
 const (
