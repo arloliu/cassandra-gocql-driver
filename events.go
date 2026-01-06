@@ -111,6 +111,7 @@ func (e *eventDebouncer) debounce(frame frame) {
 }
 
 func (s *Session) handleEvent(framer *framer) {
+	defer framer.release() // Framer was read in processFrame, needs release here
 	frame, err := framer.parseFrame()
 	if err != nil {
 		s.logger.Error("Unable to parse event frame.", NewLogFieldError("err", err))

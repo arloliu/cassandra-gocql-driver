@@ -35,6 +35,7 @@ import (
 	"net"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -391,6 +392,21 @@ type framer struct {
 	types *RegisteredTypes
 }
 
+// framerPool is a pool of framer objects to reduce allocations.
+var framerPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, defaultBufSize)
+		return &framer{
+			buf:        buf[:0],
+			readBuffer: buf,
+		}
+	},
+}
+
+// maxPooledBufSize is the maximum buffer size to keep in the pool.
+// Larger buffers are discarded to prevent memory bloat from occasional large frames.
+const maxPooledBufSize = 64 * 1024
+
 func newFramer(compressor Compressor, version byte, r *RegisteredTypes) *framer {
 	buf := make([]byte, defaultBufSize)
 	f := &framer{
@@ -413,6 +429,43 @@ func newFramer(compressor Compressor, version byte, r *RegisteredTypes) *framer 
 	f.traceID = nil
 
 	return f
+}
+
+// getFramer retrieves a framer from the pool and initializes it.
+func getFramer(compressor Compressor, version byte, r *RegisteredTypes) *framer {
+	f := framerPool.Get().(*framer)
+	f.reset(compressor, version, r)
+	return f
+}
+
+// reset prepares a pooled framer for reuse.
+func (f *framer) reset(compressor Compressor, version byte, r *RegisteredTypes) {
+	f.buf = f.readBuffer[:0]
+	f.proto = version & protoVersionMask
+	f.compres = compressor
+	f.header = nil
+	f.traceID = nil
+	f.customPayload = nil
+	f.types = r
+
+	var flags byte
+	if compressor != nil && version < protoVersion5 {
+		flags |= flagCompress
+	}
+	f.flags = flags
+}
+
+// release returns the framer to the pool.
+func (f *framer) release() {
+	// Prevent memory bloat from large buffers
+	if cap(f.readBuffer) > maxPooledBufSize {
+		f.readBuffer = make([]byte, defaultBufSize)
+	}
+	if cap(f.compressBuf) > maxPooledBufSize {
+		f.compressBuf = nil
+	}
+	f.buf = f.readBuffer[:0]
+	framerPool.Put(f)
 }
 
 type frame interface {
@@ -527,6 +580,11 @@ func (f *framer) parseFrame() (frame, error) {
 		f.customPayload, err = f.readBytesMap()
 		if err != nil {
 			return nil, err
+		}
+		// Custom payload values are returned to callers and may outlive the framer.
+		// With framer pooling, we must ensure they don't retain references to pooled buffers.
+		for k, v := range f.customPayload {
+			f.customPayload[k] = copyBytes(v)
 		}
 	}
 
@@ -1415,7 +1473,8 @@ func (f *framer) parseResultPrepared() (frame, error) {
 	}
 	frame := &resultPreparedFrame{
 		frameHeader: *f.header,
-		preparedID:  b,
+		// Copy preparedID to avoid aliasing pooled buffer; callers may cache this.
+		preparedID: copyBytes(b),
 	}
 
 	if f.proto > protoVersion4 {
@@ -1626,7 +1685,7 @@ func (f *framer) parseAuthSuccessFrame() (frame, error) {
 	}
 	return &authSuccessFrame{
 		frameHeader: *f.header,
-		data:        b,
+		data:        copyBytes(b),
 	}, nil
 }
 
@@ -1647,7 +1706,7 @@ func (f *framer) parseAuthChallengeFrame() (frame, error) {
 	}
 	return &authChallengeFrame{
 		frameHeader: *f.header,
-		data:        b,
+		data:        copyBytes(b),
 	}, nil
 }
 

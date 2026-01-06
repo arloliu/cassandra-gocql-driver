@@ -29,6 +29,7 @@ package gocql
 
 // This file groups integration tests where Cassandra has to be set up with some special integration variables
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/big"
@@ -43,7 +44,6 @@ import (
 
 // TestAuthentication verifies that gocql will work with a host configured to only accept authenticated connections
 func TestAuthentication(t *testing.T) {
-
 	if *flagProto < 2 {
 		t.Skip("Authentication is not supported with protocol < 2")
 	}
@@ -60,7 +60,6 @@ func TestAuthentication(t *testing.T) {
 	}
 
 	session, err := cluster.CreateSession()
-
 	if err != nil {
 		t.Fatalf("Authentication error: %s", err)
 	}
@@ -102,7 +101,6 @@ func TestRingDiscovery(t *testing.T) {
 	if *clusterSize != size {
 		for p, pool := range session.pool.hostConnPools {
 			t.Logf("p=%q host=%v ips=%s", p, pool.host, pool.host.ConnectAddress().String())
-
 		}
 		t.Errorf("Expected a cluster size of %d, but actual size was %d", *clusterSize, size)
 	}
@@ -205,7 +203,7 @@ func TestCustomPayloadMessages(t *testing.T) {
 	}
 
 	// QueryMessage
-	var customPayload = map[string][]byte{"a": []byte{10, 20}, "b": []byte{20, 30}}
+	customPayload := map[string][]byte{"a": {10, 20}, "b": {20, 30}}
 	query := session.Query("SELECT id FROM testCustomPayloadMessages where id = ?", 42).Consistency(One).CustomPayload(customPayload)
 	iter := query.Iter()
 	rCustomPayload := iter.GetCustomPayload()
@@ -241,7 +239,7 @@ func TestCustomPayloadValues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	values := []map[string][]byte{map[string][]byte{"a": []byte{10, 20}, "b": []byte{20, 30}}, nil, map[string][]byte{"a": []byte{10, 20}, "b": nil}}
+	values := []map[string][]byte{{"a": {10, 20}, "b": {20, 30}}, nil, {"a": {10, 20}, "b": nil}}
 
 	for _, customPayload := range values {
 		query := session.Query("SELECT id FROM testCustomPayloadValues where id = ?", 42).Consistency(One).CustomPayload(customPayload)
@@ -250,6 +248,130 @@ func TestCustomPayloadValues(t *testing.T) {
 		if !reflect.DeepEqual(customPayload, rCustomPayload) {
 			t.Fatalf("The received custom payload %#v should match the sent %#v", rCustomPayload, customPayload)
 		}
+	}
+}
+
+func TestCustomPayloadDoesNotAliasAfterIterCloseAndPoolReuse(t *testing.T) {
+	cluster := createCluster(func(c *ClusterConfig) {
+		// Reduce connection variability to increase likelihood of reusing pooled framers.
+		c.NumConns = 1
+	})
+	session := createSessionFromCluster(cluster, t)
+	defer session.Close()
+	if session.cfg.ProtoVersion > 0 && session.cfg.ProtoVersion < 4 {
+		t.Skip("custom payload requires protocol v4+")
+	}
+
+	if err := createTable(session, "CREATE TABLE gocql_test.testCustomPayloadAlias (id int PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := createTable(session, "CREATE TABLE gocql_test.testCustomPayloadAliasBig (id int PRIMARY KEY, payload text)"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert a row with a large payload to force larger response frames later (still below maxPooledBufSize).
+	bigText := strings.Repeat("x", 60*1024)
+	if err := session.Query("INSERT INTO testCustomPayloadAliasBig(id,payload) VALUES(?, ?)", 1, bigText).Consistency(One).Exec(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send a custom payload and keep the returned []byte without copying.
+	customPayload := map[string][]byte{"a": bytes.Repeat([]byte{1}, 4096), "b": {2, 3, 4}}
+	iter := session.Query("SELECT id FROM testCustomPayloadAlias WHERE id = ?", 42).Consistency(One).CustomPayload(customPayload).Iter()
+	returned := iter.GetCustomPayload()
+	if !reflect.DeepEqual(customPayload, returned) {
+		_ = iter.Close()
+		t.Fatalf("The received custom payload %#v should match the sent %#v", returned, customPayload)
+	}
+
+	// Hold on to the returned slices (the bug we are guarding against is these aliasing pooled buffers).
+	gotA := returned["a"]
+	gotB := returned["b"]
+
+	if err := iter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute additional queries to increase pool reuse and overwrite buffers.
+	for i := 0; i < 50; i++ {
+		it := session.Query("SELECT payload FROM testCustomPayloadAliasBig WHERE id = ?", 1).Consistency(One).Iter()
+		var s string
+		_ = it.Scan(&s)
+		_ = it.Close()
+	}
+
+	if !bytes.Equal(gotA, customPayload["a"]) {
+		t.Fatalf("custom payload 'a' was mutated after Iter.Close and subsequent queries")
+	}
+	if !bytes.Equal(gotB, customPayload["b"]) {
+		t.Fatalf("custom payload 'b' was mutated after Iter.Close and subsequent queries")
+	}
+}
+
+func TestCustomPayloadDoesNotAliasAfterIterCloseAndPoolReuseWithBatchTraffic(t *testing.T) {
+	cluster := createCluster(func(c *ClusterConfig) {
+		// Reduce connection variability to increase likelihood of reusing pooled framers.
+		c.NumConns = 1
+	})
+	session := createSessionFromCluster(cluster, t)
+	defer session.Close()
+	if session.cfg.ProtoVersion > 0 && session.cfg.ProtoVersion < 4 {
+		t.Skip("custom payload requires protocol v4+")
+	}
+
+	if err := createTable(session, "CREATE TABLE gocql_test.testCustomPayloadAlias2 (id int PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := createTable(session, "CREATE TABLE gocql_test.testCustomPayloadAlias2Big (id int PRIMARY KEY, payload text)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := createTable(session, "CREATE TABLE gocql_test.testCustomPayloadAlias2Noise (id int PRIMARY KEY, v int)"); err != nil {
+		t.Fatal(err)
+	}
+
+	bigText := strings.Repeat("y", 60*1024)
+	if err := session.Query("INSERT INTO testCustomPayloadAlias2Big(id,payload) VALUES(?, ?)", 1, bigText).Consistency(One).Exec(); err != nil {
+		t.Fatal(err)
+	}
+
+	customPayload := map[string][]byte{"a": bytes.Repeat([]byte{7}, 4096), "b": {8, 9, 10}}
+	iter := session.Query("SELECT id FROM testCustomPayloadAlias2 WHERE id = ?", 42).Consistency(One).CustomPayload(customPayload).Iter()
+	returned := iter.GetCustomPayload()
+	if !reflect.DeepEqual(customPayload, returned) {
+		_ = iter.Close()
+		t.Fatalf("The received custom payload %#v should match the sent %#v", returned, customPayload)
+	}
+
+	gotA := returned["a"]
+	gotB := returned["b"]
+	if err := iter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mix in a large batch request (also uses pooled framers for request building).
+	noisePayload := map[string][]byte{"big": bytes.Repeat([]byte{1}, 70*1024)}
+	b := session.Batch(LoggedBatch)
+	b.CustomPayload = noisePayload
+	for i := 0; i < 100; i++ {
+		b.Query("INSERT INTO testCustomPayloadAlias2Noise(id,v) VALUES(?, ?)", i, i)
+	}
+	if err := b.Exec(); err != nil {
+		t.Fatalf("batch exec failed: %v", err)
+	}
+
+	// Execute additional large-ish response queries to increase pool reuse and overwrite buffers.
+	for i := 0; i < 50; i++ {
+		it := session.Query("SELECT payload FROM testCustomPayloadAlias2Big WHERE id = ?", 1).Consistency(One).Iter()
+		var s string
+		_ = it.Scan(&s)
+		_ = it.Close()
+	}
+
+	if !bytes.Equal(gotA, customPayload["a"]) {
+		t.Fatalf("custom payload 'a' was mutated after Iter.Close and subsequent batch/query activity")
+	}
+	if !bytes.Equal(gotB, customPayload["b"]) {
+		t.Fatalf("custom payload 'b' was mutated after Iter.Close and subsequent batch/query activity")
 	}
 }
 

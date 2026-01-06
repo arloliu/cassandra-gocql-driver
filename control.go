@@ -406,6 +406,7 @@ func (c *controlConn) registerEvents(conn *Conn) error {
 	if err != nil {
 		return err
 	}
+	defer framer.release()
 
 	frame, err := framer.parseFrame()
 	if err != nil {
@@ -427,7 +428,6 @@ func (c *controlConn) reconnect() {
 	defer atomic.StoreInt32(&c.reconnecting, 0)
 
 	_, err := c.attemptReconnect()
-
 	if err != nil {
 		c.session.logger.Error("Unable to reconnect control connection.",
 			NewLogFieldError("err", err))
@@ -442,7 +442,6 @@ func (c *controlConn) reconnect() {
 }
 
 func (c *controlConn) attemptReconnect() (*Conn, error) {
-
 	c.session.logger.Debug("Reconnecting the control connection.")
 
 	hosts := c.session.ring.allHosts()
@@ -541,6 +540,7 @@ func (c *controlConn) writeFrame(w frameBuilder) (frame, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer framer.release()
 
 	return framer.parseFrame()
 }

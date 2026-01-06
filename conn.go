@@ -439,8 +439,22 @@ func (s *startupCoordinator) write(ctx context.Context, frame frameBuilder, star
 	if err != nil {
 		return nil, err
 	}
+	defer framer.release()
 
-	return framer.parseFrame()
+	resp, err := framer.parseFrame()
+	if err != nil {
+		return nil, err
+	}
+
+	// Startup/auth responses must not retain references to pooled framer buffers.
+	switch v := resp.(type) {
+	case *authChallengeFrame:
+		v.data = copyBytes(v.data)
+	case *authSuccessFrame:
+		v.data = copyBytes(v.data)
+	}
+
+	return resp, nil
 }
 
 func (s *startupCoordinator) options(ctx context.Context, startupCompleted *atomic.Bool) error {
@@ -656,10 +670,12 @@ func (c *Conn) heartBeat(ctx context.Context) {
 
 		resp, err := framer.parseFrame()
 		if err != nil {
+			framer.release()
 			// invalid frame
 			failures++
 			continue
 		}
+		framer.release()
 
 		switch resp.(type) {
 		case *supportedFrame:
@@ -718,8 +734,9 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 		return fmt.Errorf("gocql: frame header stream is beyond call expected bounds: %d", head.stream)
 	} else if head.stream == -1 {
 		// TODO: handle cassandra event frames, we shouldnt get any currently
-		framer := newFramer(c.compressor, c.version, c.session.types)
+		framer := getFramer(c.compressor, c.version, c.session.types)
 		if err := framer.readFrame(r, &head); err != nil {
+			framer.release()
 			return err
 		}
 		go c.session.handleEvent(framer)
@@ -727,12 +744,14 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 	} else if head.stream <= 0 {
 		// reserved stream that we dont use, probably due to a protocol error
 		// or a bug in Cassandra, this should be an error, parse it and return.
-		framer := newFramer(c.compressor, c.version, c.session.types)
+		framer := getFramer(c.compressor, c.version, c.session.types)
 		if err := framer.readFrame(r, &head); err != nil {
+			framer.release()
 			return err
 		}
 
 		frame, err := framer.parseFrame()
+		framer.release() // Return to pool after parsing
 		if err != nil {
 			return err
 		}
@@ -756,13 +775,14 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 		panic(fmt.Sprintf("call has incorrect streamID: got %d expected %d", call.streamID, head.stream))
 	}
 
-	framer := newFramer(c.compressor, c.version, c.session.types)
+	framer := getFramer(c.compressor, c.version, c.session.types)
 
 	err = framer.readFrame(r, &head)
 	if err != nil {
 		// only net errors should cause the connection to be closed. Though
 		// cassandra returning corrupt frames will be returned here as well.
 		if _, ok := err.(net.Error); ok {
+			framer.release()
 			return err
 		}
 	}
@@ -772,8 +792,10 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 	select {
 	case call.resp <- callResp{framer: framer, err: err}:
 	case <-call.timeout:
+		framer.release()
 		c.releaseStream(call)
 	case <-ctx.Done():
+		framer.release()
 	}
 
 	return nil
@@ -1230,7 +1252,8 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 	}
 
 	// resp is basically a waiting semaphore protecting the framer
-	framer := newFramer(c.compressor, c.version, c.session.types)
+	framer := getFramer(c.compressor, c.version, c.session.types)
+	defer framer.release() // Request framer can be released after write completes
 
 	call := &callReq{
 		timeout:  make(chan struct{}),
@@ -1334,6 +1357,9 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 	case resp := <-call.resp:
 		close(call.timeout)
 		if resp.err != nil {
+			if resp.framer != nil {
+				resp.framer.release()
+			}
 			if !c.Closed() {
 				// if the connection is closed then we cant release the stream,
 				// this is because the request is still outstanding and we have
@@ -1354,6 +1380,7 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 		if v := resp.framer.header.version.version(); v != c.version {
 			errProtocol := NewErrProtocol("unexpected protocol version in response: got %d expected %d", v, c.version)
 			responseFrame, err := resp.framer.parseFrame()
+			resp.framer.release()
 			if err != nil {
 				c.logger.Warning("Framer error while attempting to parse potential protocol error.",
 					NewLogFieldError("err", err))
@@ -1459,6 +1486,7 @@ func (c *Conn) prepareStatement(ctx context.Context, stmt string, tracer Tracer,
 		if err != nil {
 			return nil, err
 		}
+		defer framer.release()
 
 		frame, err := framer.parseFrame()
 		if err != nil {
@@ -1618,6 +1646,7 @@ func (c *Conn) executeQuery(ctx context.Context, q *internalQuery) *Iter {
 
 	resp, err := framer.parseFrame()
 	if err != nil {
+		framer.release()
 		iter.err = err
 		return iter
 	}
@@ -1703,6 +1732,7 @@ func (c *Conn) executeQuery(ctx context.Context, q *internalQuery) *Iter {
 		// is not consistent with regards to its schema.
 		return iter
 	case *RequestErrUnprepared:
+		framer.release()
 		stmtCacheKey := c.session.stmtsLRU.keyFor(c.host.HostID(), usedKeyspace, qryOpts.stmt)
 		c.session.stmtsLRU.evictPreparedID(stmtCacheKey, x.StatementId)
 		return c.executeQuery(ctx, q)
@@ -1746,6 +1776,7 @@ func (c *Conn) UseKeyspace(keyspace string) error {
 	if err != nil {
 		return err
 	}
+	defer framer.release()
 
 	resp, err := framer.parseFrame()
 	if err != nil {
@@ -1893,8 +1924,10 @@ func (c *Conn) executeBatch(ctx context.Context, b *internalBatch) *Iter {
 
 	switch x := resp.(type) {
 	case *resultVoidFrame:
+		framer.release()
 		return iter
 	case *RequestErrUnprepared:
+		framer.release()
 		stmt, found := stmts[string(x.StatementId)]
 		if found {
 			key := c.session.stmtsLRU.keyFor(c.host.HostID(), usedKeyspace, stmt)
