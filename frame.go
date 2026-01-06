@@ -285,8 +285,8 @@ func (c *Consistency) UnmarshalText(text []byte) error {
 
 func (c Consistency) isSerial() bool {
 	return c == Serial || c == LocalSerial
-
 }
+
 func ParseConsistency(s string) Consistency {
 	var c Consistency
 	if err := c.UnmarshalText([]byte(strings.ToUpper(s))); err != nil {
@@ -306,9 +306,7 @@ const (
 	apacheCassandraTypePrefix = "org.apache.cassandra.db.marshal."
 )
 
-var (
-	ErrFrameTooBig = errors.New("frame length is bigger than the maximum allowed")
-)
+var ErrFrameTooBig = errors.New("frame length is bigger than the maximum allowed")
 
 const frameHeadSize = 9
 
@@ -333,7 +331,7 @@ func (f frameHeader) Header() frameHeader {
 	return f
 }
 
-const defaultBufSize = 128
+const defaultBufSize = 256
 
 type ObservedFrameHeader struct {
 	Version protoVersion
@@ -1694,7 +1692,6 @@ func (f *framer) parseEventFrame() (frame, error) {
 	default:
 		panic(fmt.Errorf("gocql: unknown event type: %q", eventType))
 	}
-
 }
 
 type writeAuthResponseFrame struct {
@@ -1934,10 +1931,10 @@ type writeBatchFrame struct {
 	defaultTimestamp      bool
 	defaultTimestampValue int64
 
-	//v4+
+	// v4+
 	customPayload map[string][]byte
 
-	//v5+
+	// v5+
 	keyspace     string
 	nowInSeconds *int
 }
