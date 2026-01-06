@@ -75,6 +75,10 @@ const (
 	maxFrameSize = 256 * 1024 * 1024
 
 	maxSegmentPayloadSize = 0x1FFFF
+
+	// minCompressSize is the minimum frame body size to consider for compression.
+	// Below this threshold, compression overhead often exceeds savings.
+	minCompressSize = 512
 )
 
 type protoVersion byte
@@ -821,18 +825,27 @@ func (f *framer) finish() error {
 		return ErrFrameTooBig
 	}
 
-	if f.proto < protoVersion5 && f.buf[1]&flagCompress == flagCompress {
+	bodyLen := len(f.buf) - frameHeadSize
+	if f.proto < protoVersion5 && f.buf[1]&flagCompress == flagCompress && bodyLen >= minCompressSize {
 		if f.compres == nil {
 			panic("compress flag set with no compressor")
 		}
 
-		// TODO: only compress frames which are big enough
 		compressed, err := f.compres.AppendCompressedWithLength(nil, f.buf[frameHeadSize:])
 		if err != nil {
 			return err
 		}
 
-		f.buf = append(f.buf[:frameHeadSize], compressed...)
+		// Only use compressed version if it's actually smaller
+		if len(compressed) < bodyLen {
+			f.buf = append(f.buf[:frameHeadSize], compressed...)
+		} else {
+			// Clear compress flag since we're sending uncompressed
+			f.buf[1] &^= flagCompress
+		}
+	} else if f.proto < protoVersion5 && f.buf[1]&flagCompress == flagCompress {
+		// Frame too small to compress, clear the flag
+		f.buf[1] &^= flagCompress
 	}
 	length := len(f.buf) - frameHeadSize
 	f.setLength(length)
