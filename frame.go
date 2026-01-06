@@ -383,6 +383,9 @@ type framer struct {
 
 	buf []byte
 
+	// compressBuf is a scratch buffer for compression/decompression to reduce allocations
+	compressBuf []byte
+
 	customPayload map[string][]byte
 
 	types *RegisteredTypes
@@ -490,10 +493,13 @@ func (f *framer) readFrame(r io.Reader, head *frameHeader) error {
 			return NewErrProtocol("no compressor available with compressed frame body")
 		}
 
-		f.buf, err = f.compres.AppendDecompressedWithLength(nil, f.buf)
+		// Reuse compressBuf to reduce allocations
+		f.compressBuf = f.compressBuf[:0]
+		f.compressBuf, err = f.compres.AppendDecompressedWithLength(f.compressBuf, f.buf)
 		if err != nil {
 			return err
 		}
+		f.buf = f.compressBuf
 	}
 
 	f.header = head
@@ -831,7 +837,9 @@ func (f *framer) finish() error {
 			panic("compress flag set with no compressor")
 		}
 
-		compressed, err := f.compres.AppendCompressedWithLength(nil, f.buf[frameHeadSize:])
+		// Reuse compressBuf to reduce allocations
+		f.compressBuf = f.compressBuf[:0]
+		compressed, err := f.compres.AppendCompressedWithLength(f.compressBuf, f.buf[frameHeadSize:])
 		if err != nil {
 			return err
 		}
