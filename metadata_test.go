@@ -32,11 +32,21 @@
 package gocql
 
 import (
+	"reflect"
 	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// requireNotSameRef asserts that two maps or slices do not share the same
+// underlying storage. testify's NotSame requires pointer types (*T), but maps
+// and slices are reference types with an internal pointer — use reflect instead.
+func requireNotSameRef(t *testing.T, a, b interface{}) {
+	t.Helper()
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	require.NotEqual(t, va.Pointer(), vb.Pointer(), "expected different underlying storage")
+}
 
 // Tests V1 and V2 metadata "compilation" from example data which might be returned
 // from metadata schema queries (see getKeyspaceMetadata, getTableMetadata, and getColumnMetadata)
@@ -1460,11 +1470,11 @@ func TestKeyspaceMetadataClone(t *testing.T) {
 		require.Equal(t, original.StrategyClass, clone.StrategyClass)
 
 		// Verify maps are different instances
-		require.NotSame(t, original.StrategyOptions, clone.StrategyOptions)
-		require.NotSame(t, original.Tables, clone.Tables)
-		require.NotSame(t, original.Functions, clone.Functions)
-		require.NotSame(t, original.Aggregates, clone.Aggregates)
-		require.NotSame(t, original.UserTypes, clone.UserTypes)
+		requireNotSameRef(t, original.StrategyOptions, clone.StrategyOptions)
+		requireNotSameRef(t, original.Tables, clone.Tables)
+		requireNotSameRef(t, original.Functions, clone.Functions)
+		requireNotSameRef(t, original.Aggregates, clone.Aggregates)
+		requireNotSameRef(t, original.UserTypes, clone.UserTypes)
 
 		// Verify modifying clone doesn't affect original
 		clone.Name = "modified"
@@ -1510,12 +1520,12 @@ func TestTableMetadataClone(t *testing.T) {
 		require.Equal(t, original.Name, clone.Name)
 
 		// Verify slices and maps are different instances
-		require.NotSame(t, original.KeyAliases, clone.KeyAliases)
-		require.NotSame(t, original.ColumnAliases, clone.ColumnAliases)
-		require.NotSame(t, original.PartitionKey, clone.PartitionKey)
-		require.NotSame(t, original.ClusteringColumns, clone.ClusteringColumns)
-		require.NotSame(t, original.Columns, clone.Columns)
-		require.NotSame(t, original.OrderedColumns, clone.OrderedColumns)
+		requireNotSameRef(t, original.KeyAliases, clone.KeyAliases)
+		requireNotSameRef(t, original.ColumnAliases, clone.ColumnAliases)
+		requireNotSameRef(t, original.PartitionKey, clone.PartitionKey)
+		requireNotSameRef(t, original.ClusteringColumns, clone.ClusteringColumns)
+		requireNotSameRef(t, original.Columns, clone.Columns)
+		requireNotSameRef(t, original.OrderedColumns, clone.OrderedColumns)
 
 		// Verify modifying clone doesn't affect original
 		clone.Name = "modified"
@@ -1586,7 +1596,7 @@ func TestFunctionMetadataClone(t *testing.T) {
 		require.Equal(t, original.Body, clone.Body)
 
 		// Verify slices are different instances
-		require.NotSame(t, original.ArgumentNames, clone.ArgumentNames)
+		requireNotSameRef(t, original.ArgumentNames, clone.ArgumentNames)
 
 		// Verify modifying clone doesn't affect original
 		clone.Name = "modified"
@@ -1647,7 +1657,7 @@ func TestUserTypeMetadataClone(t *testing.T) {
 		require.Equal(t, original.Name, clone.Name)
 
 		// Verify slices are different instances
-		require.NotSame(t, original.FieldNames, clone.FieldNames)
+		requireNotSameRef(t, original.FieldNames, clone.FieldNames)
 
 		// Verify modifying clone doesn't affect original
 		clone.Name = "modified"
@@ -1688,9 +1698,9 @@ func TestMaterializedViewMetadataClone(t *testing.T) {
 		require.Equal(t, original.Keyspace, clone.Keyspace)
 		require.Equal(t, original.Name, clone.Name)
 
-		// Verify maps are different instances
-		require.NotSame(t, original.Caching, clone.Caching)
-		require.NotSame(t, original.Compaction, clone.Compaction)
+		// Verify maps and pointer are different instances
+		requireNotSameRef(t, original.Caching, clone.Caching)
+		requireNotSameRef(t, original.Compaction, clone.Compaction)
 		require.NotSame(t, original.BaseTable, clone.BaseTable)
 
 		// Verify modifying clone doesn't affect original
