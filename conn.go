@@ -1819,16 +1819,20 @@ func (c *Conn) executeBatch(ctx context.Context, b *internalBatch) *Iter {
 
 	stmts := make(map[string]string, len(b.batchOpts.entries))
 
-	// Local cache to deduplicate prepareStatement calls for repeated statements.
-	// Adaptive heuristic: disable local caching after threshold to avoid overhead
-	// for batches with many unique statements.
+	// Local cache to deduplicate prepareStatement calls for repeated statements
+	// within a single batch execution. Capped at batchDedupThreshold entries to
+	// bound memory and map overhead for batches with many distinct statements.
+	//
+	// Crucially, the cache is always consulted even after it stops growing: a
+	// statement already stored continues to get cache hits regardless of how many
+	// unique statements appear later. Only new unique statements beyond the cap
+	// fall through to the global prepared-statement cache.
 	const batchDedupThreshold = 16
 	type batchPrepKey struct {
 		keyspace  string
 		statement string
 	}
 	localCache := make(map[batchPrepKey]*preparedStatment, min(n, batchDedupThreshold))
-	useLocalCache := true
 
 	for i := 0; i < n; i++ {
 		entry := &b.batchOpts.entries[i]
@@ -1838,28 +1842,17 @@ func (c *Conn) executeBatch(ctx context.Context, b *internalBatch) *Iter {
 			var info *preparedStatment
 			var err error
 
-			if useLocalCache {
-				key := batchPrepKey{keyspace: usedKeyspace, statement: entry.Stmt}
-				var ok bool
-				info, ok = localCache[key]
-				if !ok {
-					info, err = c.prepareStatement(ctx, entry.Stmt, b.batchOpts.trace, usedKeyspace)
-					if err != nil {
-						iter.err = err
-						return iter
-					}
-					if len(localCache) < batchDedupThreshold {
-						localCache[key] = info
-					} else {
-						// Too many unique statements, disable local caching for remaining entries
-						useLocalCache = false
-					}
-				}
-			} else {
+			key := batchPrepKey{keyspace: usedKeyspace, statement: entry.Stmt}
+			var ok bool
+			info, ok = localCache[key]
+			if !ok {
 				info, err = c.prepareStatement(ctx, entry.Stmt, b.batchOpts.trace, usedKeyspace)
 				if err != nil {
 					iter.err = err
 					return iter
+				}
+				if len(localCache) < batchDedupThreshold {
+					localCache[key] = info
 				}
 			}
 

@@ -160,10 +160,7 @@ func TestConn_AddCallCloseRace(t *testing.T) {
 				return
 			}
 
-			// addCall succeeded. In real code the caller would write a frame and
-			// then select on call.resp. Here we simulate a write failure by closing
-			// the timeout channel so closeWithError (if it has already snapshotted
-			// this call) can drain via <-req.timeout instead of blocking on resp.
+			// Close timeout so closeWithError can drain this call without blocking on resp.
 			close(call.timeout)
 			conn.streams.Clear(streamID)
 		}()

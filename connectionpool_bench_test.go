@@ -241,7 +241,6 @@ func BenchmarkConnCalls_Scaling(b *testing.B) {
 	parallelisms := []int{1, 8, 64}
 
 	for _, p := range parallelisms {
-		p := p
 		b.Run(fmt.Sprintf("baseline_mutex/p%d", p), func(b *testing.B) {
 			baseline := &callsMutexMap{m: make(map[int]*callReq)}
 			b.SetParallelism(p)
