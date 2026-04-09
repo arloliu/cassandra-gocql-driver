@@ -1,115 +1,66 @@
 package gocql
 
-import "sync"
+import "sync/atomic"
 
-// callMap is a sharded map from streamID to *callReq.
+// callMap is a dense array of atomic pointers indexed directly by stream ID.
 //
-// This is on the hot path for every request (register handler) and response
-// (lookup+delete handler). Sharding reduces lock contention compared to a single
-// mutex protecting one map, while keeping memory proportional to the number of
-// in-flight requests (unlike a dense atomic table sized to max streams).
+// All hot-path operations are lock-free:
+//   - tryStore: CAS(nil → call) — succeeds only if the slot is empty.
+//   - loadAndDelete: atomic Swap(nil) — returns the previous value.
+//   - delete: Store(nil).
 //
-// Invariants expected by Conn:
-// - tryStore is used to ensure at most one callReq exists per streamID.
-// - loadAndDelete transfers ownership of the callReq to the receiver.
-// - snapshot is used on close to notify waiters (it does not delete entries).
-// - clear removes all entries (used after close notification to allow GC).
+// The stream allocator (IDGenerator) already uses lock-free CAS on a bitmap.
+// This makes the entire request-tracking hot path lock-free, removing the
+// last mutex from the per-request critical section.
+//
+// Memory: one pointer (8 bytes) per stream slot. For proto v4 (32768 streams)
+// this is 256 KB per connection. For proto v1/v2 (128 streams) this is 1 KB.
+//
+// Close is rare; its O(numStreams) scan is acceptable.
 type callMap struct {
-	mask   uint32
-	shards []callMapShard
+	entries []atomic.Pointer[callReq]
 }
 
-type callMapShard struct {
-	mu sync.Mutex
-	m  map[int]*callReq
-}
-
-func newCallMap(numShards int) *callMap {
-	// Ensure power-of-two shard count so we can use a mask.
-	if numShards <= 0 {
-		numShards = 64
-	}
-	shardsPow2 := 1
-	for shardsPow2 < numShards {
-		shardsPow2 <<= 1
-	}
-
-	shards := make([]callMapShard, shardsPow2)
-	for i := range shards {
-		shards[i].m = make(map[int]*callReq)
-	}
-
+// newCallMap creates a callMap for the given maximum stream count.
+// Pass streams.IDGenerator.NumStreams to size it correctly for the connection.
+func newCallMap(maxStreams int) *callMap {
 	return &callMap{
-		mask:   uint32(shardsPow2 - 1),
-		shards: shards,
+		entries: make([]atomic.Pointer[callReq], maxStreams),
 	}
 }
 
-func (c *callMap) shard(streamID int) *callMapShard {
-	// streamID is a small non-negative int in practice. Masking is enough.
-	idx := uint32(streamID) & c.mask
-	return &c.shards[idx]
-}
-
-// tryStore stores call for streamID if it does not already exist.
+// tryStore stores call for streamID if the slot is currently empty.
 // Returns true on success.
 func (c *callMap) tryStore(streamID int, call *callReq) bool {
-	s := c.shard(streamID)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.m[streamID] != nil {
-		return false
-	}
-
-	s.m[streamID] = call
-
-	return true
+	return c.entries[streamID].CompareAndSwap(nil, call)
 }
 
-// delete removes the call for streamID if present.
+// delete clears the slot for streamID.
 func (c *callMap) delete(streamID int) {
-	s := c.shard(streamID)
-	s.mu.Lock()
-	delete(s.m, streamID)
-	s.mu.Unlock()
+	c.entries[streamID].Store(nil)
 }
 
-// loadAndDelete atomically gets and removes the call for streamID.
+// loadAndDelete atomically removes and returns the call for streamID.
 func (c *callMap) loadAndDelete(streamID int) (*callReq, bool) {
-	s := c.shard(streamID)
-	s.mu.Lock()
-	call, ok := s.m[streamID]
-	if ok {
-		delete(s.m, streamID)
-	}
-	s.mu.Unlock()
-
-	return call, ok
+	call := c.entries[streamID].Swap(nil)
+	return call, call != nil
 }
 
 // snapshot returns a point-in-time slice of currently registered calls.
-// It does not delete from the map.
+// It does not remove entries.
 func (c *callMap) snapshot() []*callReq {
-	// Best-effort sizing: keep it simple; close is rare.
 	var calls []*callReq
-	for i := range c.shards {
-		s := &c.shards[i]
-		s.mu.Lock()
-		for _, call := range s.m {
+	for i := range c.entries {
+		if call := c.entries[i].Load(); call != nil {
 			calls = append(calls, call)
 		}
-		s.mu.Unlock()
 	}
-
 	return calls
 }
 
+// clear removes all entries.
 func (c *callMap) clear() {
-	for i := range c.shards {
-		s := &c.shards[i]
-		s.mu.Lock()
-		// Allocate a fresh map to drop references quickly.
-		s.m = make(map[int]*callReq)
-		s.mu.Unlock()
+	for i := range c.entries {
+		c.entries[i].Store(nil)
 	}
 }

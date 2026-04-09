@@ -68,7 +68,7 @@ func BenchmarkConn_Contention(b *testing.B) {
 	// Compare request tracking implementations.
 	//
 	// Baseline: single mutex + map (original implementation)
-	// Refactor: sharded map (callMap)
+	// Atomic:   dense []atomic.Pointer[callReq] indexed by stream ID (current implementation)
 	//
 	// Workloads:
 	// - workerStream: each worker reuses its own stream id (no stream allocator cost)
@@ -76,15 +76,17 @@ func BenchmarkConn_Contention(b *testing.B) {
 	//
 	// Note: these microbenches are intentionally lock-heavy.
 	b.Run("baseline_mutex_map/workerStream", BenchmarkConnCalls_Baseline_WorkerStream)
-	b.Run("sharded_map/workerStream", BenchmarkConnCalls_Sharded_WorkerStream)
-	b.Run("sharded_map_plus_conn_mu/workerStream", BenchmarkConnCalls_ShardedPlusConnMu_WorkerStream)
+	b.Run("atomic_map/workerStream", BenchmarkConnCalls_Atomic_WorkerStream)
+	b.Run("atomic_map_plus_conn_mu/workerStream", BenchmarkConnCalls_AtomicPlusConnMu_WorkerStream)
 
 	b.Run("baseline_mutex_map/allocator", BenchmarkConnCalls_Baseline_Allocator)
-	b.Run("sharded_map/allocator", BenchmarkConnCalls_Sharded_Allocator)
-	b.Run("sharded_map_plus_conn_mu/allocator", BenchmarkConnCalls_ShardedPlusConnMu_Allocator)
+	b.Run("atomic_map/allocator", BenchmarkConnCalls_Atomic_Allocator)
+	b.Run("atomic_map_plus_conn_mu/allocator", BenchmarkConnCalls_AtomicPlusConnMu_Allocator)
 }
 
-const benchCallMapShards = 64
+// benchCallMapSize is the atomic array size for benchmarks.
+// Matches proto v4 max streams (32768) — the same value used by dialWithoutObserver.
+const benchCallMapSize = 32768
 
 // The following top-level benchmarks exist so profiling can target one case
 // precisely (sub-benchmark regex filtering can be surprisingly finicky).
@@ -94,13 +96,13 @@ func BenchmarkConnCalls_Baseline_WorkerStream(b *testing.B) {
 	benchmarkCallsWorkerStream(b, baseline)
 }
 
-func BenchmarkConnCalls_Sharded_WorkerStream(b *testing.B) {
-	sharded := newCallMap(benchCallMapShards)
+func BenchmarkConnCalls_Atomic_WorkerStream(b *testing.B) {
+	sharded := newCallMap(benchCallMapSize)
 	benchmarkCallsWorkerStream(b, sharded)
 }
 
-func BenchmarkConnCalls_ShardedPlusConnMu_WorkerStream(b *testing.B) {
-	sharded := newCallMap(benchCallMapShards)
+func BenchmarkConnCalls_AtomicPlusConnMu_WorkerStream(b *testing.B) {
+	sharded := newCallMap(benchCallMapSize)
 	shardedWithConnMu := &callsWithOuterMu{inner: sharded}
 	benchmarkCallsWorkerStream(b, shardedWithConnMu)
 }
@@ -110,13 +112,13 @@ func BenchmarkConnCalls_Baseline_Allocator(b *testing.B) {
 	benchmarkCallsWithAllocator(b, baseline)
 }
 
-func BenchmarkConnCalls_Sharded_Allocator(b *testing.B) {
-	sharded := newCallMap(benchCallMapShards)
+func BenchmarkConnCalls_Atomic_Allocator(b *testing.B) {
+	sharded := newCallMap(benchCallMapSize)
 	benchmarkCallsWithAllocator(b, sharded)
 }
 
-func BenchmarkConnCalls_ShardedPlusConnMu_Allocator(b *testing.B) {
-	sharded := newCallMap(benchCallMapShards)
+func BenchmarkConnCalls_AtomicPlusConnMu_Allocator(b *testing.B) {
+	sharded := newCallMap(benchCallMapSize)
 	shardedWithConnMu := &callsWithOuterMu{inner: sharded}
 	benchmarkCallsWithAllocator(b, shardedWithConnMu)
 }
@@ -219,4 +221,42 @@ func benchmarkCallsWithAllocator(b *testing.B, calls callTracker) {
 			conn.streams.Clear(stream)
 		}
 	})
+}
+
+// BenchmarkConnCalls_Scaling measures call-map throughput across increasing
+// parallelism levels to determine whether sharding actually reduces contention
+// at typical Cassandra driver concurrency.
+//
+// Each sub-benchmark uses b.SetParallelism(p), so actual goroutines = p * GOMAXPROCS.
+// Typical stream pools per connection: 128–2048 (proto v4 max: 32768).
+// With 64 shards and sequential stream IDs, each shard serves ~concurrency/64 goroutines.
+//
+// Run with:
+//
+//	go test -bench=BenchmarkConnCalls_Scaling -benchmem -tags cassandra
+func BenchmarkConnCalls_Scaling(b *testing.B) {
+	// p=1 → GOMAXPROCS goroutines (baseline single-threaded-per-core)
+	// p=8 → 8*GOMAXPROCS goroutines (moderate concurrency)
+	// p=64 → 64*GOMAXPROCS goroutines (high concurrency)
+	parallelisms := []int{1, 8, 64}
+
+	for _, p := range parallelisms {
+		p := p
+		b.Run(fmt.Sprintf("baseline_mutex/p%d", p), func(b *testing.B) {
+			baseline := &callsMutexMap{m: make(map[int]*callReq)}
+			b.SetParallelism(p)
+			benchmarkCallsWithAllocator(b, baseline)
+		})
+		b.Run(fmt.Sprintf("atomic_map/p%d", p), func(b *testing.B) {
+			sharded := newCallMap(benchCallMapSize)
+			b.SetParallelism(p)
+			benchmarkCallsWithAllocator(b, sharded)
+		})
+		b.Run(fmt.Sprintf("atomic_plus_conn_mu/p%d", p), func(b *testing.B) {
+			sharded := newCallMap(benchCallMapSize)
+			shardedWithMu := &callsWithOuterMu{inner: sharded}
+			b.SetParallelism(p)
+			benchmarkCallsWithAllocator(b, shardedWithMu)
+		})
+	}
 }

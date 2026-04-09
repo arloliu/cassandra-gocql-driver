@@ -121,12 +121,13 @@ func TestCallMap_Clear_RemovesAllEntries(t *testing.T) {
 }
 
 func TestCallMap_ConcurrentStoreAndLoadAndDelete(t *testing.T) {
-	cm := newCallMap(64)
-
 	const (
 		goroutines = 32
 		iters      = 2000
 	)
+	// Size the map to cover all stream IDs used by the test.
+	// The atomic array is indexed by stream ID, so it must be large enough.
+	cm := newCallMap(goroutines * iters)
 
 	var (
 		wg      sync.WaitGroup

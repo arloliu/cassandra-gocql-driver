@@ -254,19 +254,20 @@ func (s *Session) dialWithoutObserver(ctx context.Context, host *HostInfo, cfg *
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
+	streamGen := streams.New(cfg.ProtoVersion)
 	c := &Conn{
 		r: &connReader{
 			conn: dialedHost.Conn,
 			r:    bufio.NewReader(dialedHost.Conn),
 		},
 		cfg:           cfg,
-		calls:         newCallMap(64),
+		calls:         newCallMap(streamGen.NumStreams),
 		version:       uint8(cfg.ProtoVersion),
 		addr:          dialedHost.Conn.RemoteAddr().String(),
 		errorHandler:  errorHandler,
 		compressor:    cfg.Compressor,
 		session:       s,
-		streams:       streams.New(cfg.ProtoVersion),
+		streams:       streamGen,
 		host:          host,
 		isSchemaV2:    true, // Try using "system.peers_v2" until proven otherwise
 		frameObserver: s.frameObserver,
@@ -1218,9 +1219,6 @@ func (w *writeCoalescer) flush(resultChans []chan<- writeResult, buffers net.Buf
 // It fails with error if the connection already started closing or if a call for the given stream
 // already exists.
 func (c *Conn) addCall(call *callReq) error {
-	if c.calls == nil {
-		return ErrConnectionClosed
-	}
 	if !c.calls.tryStore(call.streamID, call) {
 		return fmt.Errorf("attempting to use stream already in use: %d", call.streamID)
 	}
