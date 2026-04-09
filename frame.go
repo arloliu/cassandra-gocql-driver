@@ -77,8 +77,11 @@ const (
 
 	maxSegmentPayloadSize = 0x1FFFF
 
-	// minCompressSize is the minimum frame body size to consider for compression.
-	// Below this threshold, compression overhead often exceeds savings.
+	// minCompressSize is the minimum frame body size eligible for compression.
+	// Compressors (LZ4, Snappy) carry a fixed header and algorithmic overhead
+	// that typically exceeds any size reduction on small payloads. 512 bytes is
+	// a conservative lower bound: benchmarks on typical CQL responses show
+	// net-negative compression below this point (compressed > original).
 	minCompressSize = 512
 )
 
