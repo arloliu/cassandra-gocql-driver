@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func TestConn_CloseWithErrorNoDeadlock(t *testing.T) {
 	// Create a minimal Conn with just the fields needed for closeWithError
 	conn := &Conn{
 		streams: streams.New(protoVersion4),
-		calls:   newCallMap(64),
+		calls:   newCallMap(streams.New(protoVersion4).NumStreams),
 		ctx:     ctx,
 		cancel:  cancel,
 		r:       &mockConnReader{},
@@ -92,6 +93,90 @@ func TestConn_CloseWithErrorNoDeadlock(t *testing.T) {
 		}
 	default:
 		t.Error("expected error to be sent to call.resp")
+	}
+}
+
+// TestConn_AddCallCloseRace verifies that concurrent addCall and closeWithError
+// are free of data races and do not deadlock.
+//
+// The locking model changed from the original: addCall now calls tryStore
+// (shard lock) before acquiring c.mu to check c.closed. This creates a window
+// where closeWithError can snapshot and notify a call that addCall will then
+// also reject with ErrConnectionClosed.
+//
+// Expected invariants:
+//   - No data races (verified by go test -race)
+//   - No deadlocks
+//   - No panics
+//
+// The "double notification" scenario is harmless: call.resp is buffered(1), so
+// closeWithError's send never blocks; the caller who got ErrConnectionClosed
+// from addCall never reads from resp; the unread value is GC'd.
+func TestConn_AddCallCloseRace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn := &Conn{
+		streams: streams.New(protoVersion4),
+		calls:   newCallMap(streams.New(protoVersion4).NumStreams),
+		ctx:     ctx,
+		cancel:  cancel,
+		r:       &mockConnReader{},
+		errorHandler: connErrorHandlerFn(func(c *Conn, err error, closed bool) {
+			// no-op
+		}),
+		logger: NewLogger(LogLevelNone),
+	}
+
+	const numWorkers = 500
+	var wg sync.WaitGroup
+
+	// Trigger close concurrently — tiny sleep so some addCall goroutines start first.
+	go func() {
+		time.Sleep(5 * time.Microsecond)
+		conn.closeWithError(errors.New("connection closed by test"))
+	}()
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			streamID, ok := conn.streams.GetStream()
+			if !ok {
+				return // stream pool exhausted
+			}
+
+			call := &callReq{
+				streamID: streamID,
+				resp:     make(chan callResp, 1),
+				timeout:  make(chan struct{}),
+			}
+
+			err := conn.addCall(call)
+			if err != nil {
+				// addCall rejected: stream was never committed, just release it.
+				conn.streams.Clear(streamID)
+				return
+			}
+
+			// addCall succeeded. In real code the caller would write a frame and
+			// then select on call.resp. Here we simulate a write failure by closing
+			// the timeout channel so closeWithError (if it has already snapshotted
+			// this call) can drain via <-req.timeout instead of blocking on resp.
+			close(call.timeout)
+			conn.streams.Clear(streamID)
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+		// pass — no deadlock
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timed out: possible deadlock in addCall or closeWithError")
 	}
 }
 

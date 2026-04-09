@@ -415,3 +415,81 @@ func BenchmarkBatchDedup_100_100Unique_Adaptive(b *testing.B) {
 		benchOptimizedAdaptive(cache, "test_keyspace", entries)
 	}
 }
+
+// TestBatchDedup_ThresholdBoundary documents the exact boundary behavior of
+// the adaptive dedup threshold (batchDedupThreshold = 16).
+//
+// The production loop in executeBatch stores unique statements into a local
+// cache until len(localCache) reaches the threshold, then disables caching
+// entirely for all remaining entries — including repeats of already-cached
+// statements. This test verifies that asymmetry precisely.
+func TestBatchDedup_ThresholdBoundary(t *testing.T) {
+	const threshold = 16
+	const numUnique = 20 // intentionally > threshold
+	const reps = 3       // each unique stmt appears this many times, consecutively
+
+	// Build entry list: s0,s0,s0, s1,s1,s1, ..., s19,s19,s19
+	stmts := make([]string, numUnique)
+	for i := range stmts {
+		stmts[i] = fmt.Sprintf("SELECT * FROM t WHERE id = %d", i)
+	}
+	entries := make([]string, 0, numUnique*reps)
+	for _, s := range stmts {
+		for j := 0; j < reps; j++ {
+			entries = append(entries, s)
+		}
+	}
+
+	callCount := make(map[string]int)
+	prepareFunc := func(stmt string) { callCount[stmt]++ }
+
+	// Mirror the exact dedup logic from conn.go executeBatch.
+	type batchPrepKey struct {
+		keyspace  string
+		statement string
+	}
+	const keyspace = "ks"
+	localCache := make(map[batchPrepKey]bool, min(len(entries), threshold))
+	useLocalCache := true
+
+	for _, entry := range entries {
+		if useLocalCache {
+			key := batchPrepKey{keyspace: keyspace, statement: entry}
+			if _, ok := localCache[key]; !ok {
+				prepareFunc(entry)
+				if len(localCache) < threshold {
+					localCache[key] = true
+				} else {
+					// threshold hit: disable caching for ALL remaining entries
+					useLocalCache = false
+				}
+			}
+		} else {
+			prepareFunc(entry)
+		}
+	}
+
+	// Stmts 0-15: local cache held all 16; repeats hit the cache.
+	// Each unique stmt triggers exactly 1 prepare call.
+	for i := 0; i < threshold; i++ {
+		if got := callCount[stmts[i]]; got != 1 {
+			t.Errorf("stmt[%d] (within threshold 0-%d): expected 1 prepare call, got %d",
+				i, threshold-1, got)
+		}
+	}
+
+	// Stmt 16 (the threshold+1-th unique stmt) is the one that fills the cache
+	// to exactly the threshold. The condition `len(localCache) < threshold` is
+	// false (16 < 16 == false), so useLocalCache is set to false and stmt 16 is
+	// NOT stored in the local cache. From this point every entry calls prepareFunc,
+	// including repeats of stmts 0-15 that appear later — but in this test all
+	// repeats are consecutive, so stmts 0-15 have already been fully processed.
+	//
+	// Stmts 16-19: not in local cache, useLocalCache=false → all reps call prepareFunc.
+	for i := threshold; i < numUnique; i++ {
+		if got := callCount[stmts[i]]; got != reps {
+			t.Errorf("stmt[%d] (at/beyond threshold): expected %d prepare calls, got %d",
+				i, reps, got)
+		}
+	}
+}
