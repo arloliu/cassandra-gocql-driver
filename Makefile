@@ -15,6 +15,18 @@ ifeq (${CCM_CONFIG_DIR},)
 endif
 CCM_CONFIG_DIR := $(shell readlink --canonicalize ${CCM_CONFIG_DIR})
 
+# Project-local CCM install. Keeps Python deps out of the system site-packages
+# and sidesteps PEP 668 ("externally-managed-environment") on Debian/Ubuntu.
+CCM_VENV := ${MAKEFILE_PATH}/.ccm-venv
+CCM_PYTHON := python3
+CCM_PIP := ${CCM_VENV}/bin/pip
+CCM_STAMP := ${CCM_VENV}/.installed-${CCM_VERSION}
+
+# Make the venv's `ccm` visible to every recipe (including the $(ccm liveset)
+# subshells used by test-integration). Targets that need CCM still depend on
+# .prepare-ccm so the venv is created before first use.
+export PATH := ${CCM_VENV}/bin:${PATH}
+
 CASSANDRA_CONFIG ?= "client_encryption_options.enabled: true" \
 "client_encryption_options.keystore: ${KEY_PATH}/.keystore" \
 "client_encryption_options.keystore_password: cassandra" \
@@ -46,6 +58,13 @@ endif
 
 ifneq (${JAVA17_HOME},)
 	export JAVA17_HOME
+endif
+
+# Derive JAVA_HOME from `java` on PATH if the caller didn't provide one. Only
+# accept versions Cassandra 3.x–5.x supports (11 / 17); anything else falls
+# through to the SDKMAN-based install-java target.
+ifeq ($(strip ${JAVA_HOME}),)
+JAVA_HOME := $(shell command -v java >/dev/null 2>&1 && java -version 2>&1 | grep -qE '"(11|17)\.' && readlink -f $$(command -v java) 2>/dev/null | sed 's:/bin/java$$::')
 endif
 
 ifneq (${JAVA_HOME},)
@@ -113,10 +132,15 @@ fix: .prepare-golangci
 	golangci-lint run --fix
 
 .prepare-java:
-ifeq ($(shell if [ -f ~/.sdkman/bin/sdkman-init.sh ]; then echo "installed"; else echo "not-installed"; fi), not-installed)
+ifneq (${JAVA_HOME},)
+	@echo "Using JAVA_HOME=${JAVA_HOME}"
+else ifeq ($(shell if [ -f ~/.sdkman/bin/sdkman-init.sh ]; then echo "installed"; else echo "not-installed"; fi), not-installed)
 	@$(MAKE) install-java
+	@echo "Java installed via SDKMAN. Re-source your shell (or set JAVA_HOME) before re-running make."
+	@exit 1
 else
-	@exit 0
+	@echo "JAVA_HOME is not set and could not be auto-detected. Source ~/.sdkman/bin/sdkman-init.sh or set JAVA_HOME explicitly."
+	@exit 1
 endif
 
 install-java:
@@ -139,22 +163,25 @@ install-java:
 		fi; \
 	)
 
-.prepare-ccm:
-	@ccm --help 2>/dev/null 1>&2; \
-	if [[ $$? -le 127 ]] && grep ${CCM_VERSION} ${CCM_CONFIG_DIR}/ccm-version 2>/dev/null 1>&2; then \
-	  	echo "CCM ${CCM_VERSION} is already installed"; \
-	else \
-	  	echo "Install CCM ${CCM_VERSION}"; \
-      	pip install "git+https://github.com/riptano/ccm.git@${CCM_VERSION}"; \
-      	mkdir ${CCM_CONFIG_DIR} 2>/dev/null 1>&2 || true; \
-      	echo ${CCM_VERSION} > ${CCM_CONFIG_DIR}/ccm-version; \
+.prepare-ccm: ${CCM_STAMP}
+
+${CCM_STAMP}:
+	@if [ ! -x ${CCM_VENV}/bin/python ]; then \
+		echo "Creating CCM venv at ${CCM_VENV}"; \
+		${CCM_PYTHON} -m venv ${CCM_VENV}; \
 	fi
+	@echo "Installing CCM ${CCM_VERSION}"
+	@rm -f ${CCM_VENV}/.installed-*
+	@${CCM_PIP} install -q --upgrade pip
+	@${CCM_PIP} install -q "setuptools<81"
+	@${CCM_PIP} install -q "git+https://github.com/riptano/ccm.git@${CCM_VERSION}"
+	@mkdir -p ${CCM_CONFIG_DIR}
+	@echo ${CCM_VERSION} > ${CCM_CONFIG_DIR}/ccm-version
+	@touch ${CCM_STAMP}
 
 install-ccm:
-	@echo "Install CCM ${CCM_VERSION}"
-	@pip install "git+https://github.com/riptano/ccm.git@${CCM_VERSION}"
-	@mkdir ${CCM_CONFIG_DIR} 2>/dev/null 1>&2 || true
-	@echo ${CCM_VERSION} > ${CCM_CONFIG_DIR}/ccm-version
+	@rm -rf ${CCM_VENV}
+	@$(MAKE) .prepare-ccm
 
 .prepare-golangci:
 	@if ! golangci-lint --version 2>/dev/null | grep ${GOLANGCI_VERSION} >/dev/null; then \
