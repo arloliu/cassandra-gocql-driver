@@ -26,31 +26,15 @@ package gocql
 
 import (
 	"context"
-	crand "crypto/rand"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 )
-
-var (
-	randr    *rand.Rand
-	mutRandr sync.Mutex
-)
-
-func init() {
-	b := make([]byte, 4)
-	if _, err := crand.Read(b); err != nil {
-		panic(fmt.Sprintf("unable to seed random number generator: %v", err))
-	}
-
-	randr = rand.New(rand.NewSource(int64(readInt(b))))
-}
 
 const (
 	controlConnStarting = 0
@@ -192,11 +176,9 @@ func shuffleHosts(hosts []*HostInfo) []*HostInfo {
 	shuffled := make([]*HostInfo, len(hosts))
 	copy(shuffled, hosts)
 
-	mutRandr.Lock()
-	randr.Shuffle(len(hosts), func(i, j int) {
+	rand.Shuffle(len(shuffled), func(i, j int) {
 		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 	})
-	mutRandr.Unlock()
 
 	return shuffled
 }

@@ -32,6 +32,7 @@
 package gocql
 
 import (
+	"fmt"
 	"net"
 	"sort"
 	"strings"
@@ -1096,6 +1097,331 @@ func TestHostPolicy_TokenAware_TopologyChangeUpdatesAllKeyspaces(t *testing.T) {
 		}
 		if otherStillHasHost {
 			t.Error("other keyspace still has removed host in replica map - STALE after topology change!")
+		}
+	})
+}
+
+// shuffleTestKeyspace is shared by the shuffle regression tests below.
+const shuffleTestKeyspace = "ks"
+
+// setupShuffleTestPolicy wires a TokenAwareHostPolicy + SimpleStrategy keyspace
+// of the given replication factor, with OrderedPartitioner so routing keys map
+// directly to tokens. Returns the policy and a pre-built query targeting the
+// shared keyspace -- callers add hosts and set RoutingKey on the query.
+func setupShuffleTestPolicy(rf int, fallback HostSelectionPolicy, opts ...func(*tokenAwareHostPolicy)) (HostSelectionPolicy, *Query) {
+	policy := TokenAwareHostPolicy(fallback, opts...)
+	policyInternal := policy.(*tokenAwareHostPolicy)
+	policyInternal.getKeyspaceName = func() string { return shuffleTestKeyspace }
+
+	ksMeta := &KeyspaceMetadata{
+		Name:          shuffleTestKeyspace,
+		StrategyClass: "SimpleStrategy",
+		StrategyOptions: map[string]interface{}{
+			"class":              "SimpleStrategy",
+			"replication_factor": rf,
+		},
+	}
+	ksMeta.placementStrategy = getStrategy(ksMeta, nopLoggerSingleton)
+	policyInternal.getSchemaMeta = func() *schemaMeta {
+		return &schemaMeta{
+			keyspaceMeta: map[string]*KeyspaceMetadata{shuffleTestKeyspace: ksMeta},
+		}
+	}
+
+	query := &Query{}
+	query.getKeyspace = func() string { return shuffleTestKeyspace }
+	return policy, query
+}
+
+// firstHostDistribution drives policy.Pick(query) the given number of times
+// and tallies how often each host appears as the first returned host. Fails
+// the test if any iteration returns nil.
+func firstHostDistribution(t *testing.T, policy HostSelectionPolicy, query *Query, iterations int) map[string]int {
+	t.Helper()
+	dist := make(map[string]int)
+	for i := 0; i < iterations; i++ {
+		iter := policy.Pick(newInternalQuery(query, nil))
+		host := iter()
+		if host == nil {
+			t.Fatalf("expected non-nil first host on iteration %d", i)
+		}
+		dist[host.Info().HostID()]++
+	}
+	return dist
+}
+
+// TestHostPolicy_TokenAware_Shuffle_DownReplica verifies that when one of the
+// replicas for a token is down, the remaining live replicas each receive
+// roughly equal first-host traffic. Regression test: an earlier refactor
+// rotated the starting offset across the raw replica list and then filtered
+// out !IsUp hosts during iteration, which biased traffic toward whichever
+// live replica immediately followed the down host (e.g., RF=3 [A,B,C] with
+// A down → B receives 2/3 of first-host picks instead of 1/2). The rotation
+// must happen over the filtered-live subset.
+func TestHostPolicy_TokenAware_Shuffle_DownReplica(t *testing.T) {
+	policy, query := setupShuffleTestPolicy(3, RoundRobinHostPolicy(), ShuffleReplicas())
+
+	// 4 hosts at ring positions 10, 30, 50, 70. SimpleStrategy RF=3 on
+	// OrderedPartitioner with routing key "05" walks the ring from token 10,
+	// producing replicas [A@10, B@30, C@50].
+	hosts := [...]*HostInfo{
+		{hostId: "A", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}},
+		{hostId: "B", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}},
+		{hostId: "C", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
+		{hostId: "D", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}},
+	}
+	for _, host := range &hosts {
+		policy.AddHost(host)
+	}
+	policy.SetPartitioner("OrderedPartitioner")
+
+	// Mark A down. Live replicas for token "05" are now {B, C}.
+	hosts[0].setState(NodeDown)
+	query.RoutingKey([]byte("05"))
+
+	const iterations = 600
+	firstHosts := firstHostDistribution(t, policy, query, iterations)
+
+	if firstHosts["A"] != 0 {
+		t.Errorf("down replica A should never be first, got %d picks", firstHosts["A"])
+	}
+	// Rotation over live-locals gives exactly 50/50 (counter cycles 0,1,0,1).
+	// Loose lower bound of 40% leaves slack but still catches the old
+	// rotate-over-raw-list bias (which produces a 67/33 split).
+	minRequired := iterations * 4 / 10
+	if firstHosts["B"] < minRequired {
+		t.Errorf("expected B to be first at least %d times, got %d (distribution: %v)",
+			minRequired, firstHosts["B"], firstHosts)
+	}
+	if firstHosts["C"] < minRequired {
+		t.Errorf("expected C to be first at least %d times, got %d (distribution: %v)",
+			minRequired, firstHosts["C"], firstHosts)
+	}
+}
+
+// TestHostPolicy_TokenAware_Shuffle_ClusteredLocalReplicas verifies that
+// when local replicas cluster next to each other in the raw replica list
+// (and remote replicas are filtered out by tier), each local replica still
+// receives roughly equal first-host traffic. Regression test: rotating over
+// the raw list and filtering during iteration biases toward whichever local
+// replica immediately follows runs of remote replicas (e.g., [L,L,R,R] →
+// 3:1 skew toward L0). The rotation must happen over the filtered-local
+// subset.
+func TestHostPolicy_TokenAware_Shuffle_ClusteredLocalReplicas(t *testing.T) {
+	policy, query := setupShuffleTestPolicy(4, DCAwareRoundRobinPolicy("local"), ShuffleReplicas())
+
+	// 6 hosts on the ring at tokens 10..60, with the first two in the local
+	// DC and the rest remote. SimpleStrategy walks the ring without DC
+	// awareness, so for routing key "05" (ring walk starts at token 10) and
+	// RF=4 the replica list is [L0, L1, R0, R1] -- locals clustered at front.
+	// DCAware fallback classifies L0, L1 as tier 0 and R0, R1 as tier 1.
+	hosts := [...]*HostInfo{
+		{hostId: "L0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}, dataCenter: "local"},
+		{hostId: "L1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}, dataCenter: "local"},
+		{hostId: "R0", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}, dataCenter: "remote"},
+		{hostId: "R1", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}, dataCenter: "remote"},
+		{hostId: "R2", connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"50"}, dataCenter: "remote"},
+		{hostId: "R3", connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"60"}, dataCenter: "remote"},
+	}
+	for _, host := range &hosts {
+		policy.AddHost(host)
+	}
+	policy.SetPartitioner("OrderedPartitioner")
+	query.RoutingKey([]byte("05"))
+
+	const iterations = 600
+	firstHosts := firstHostDistribution(t, policy, query, iterations)
+
+	// Remote replicas must never be picked first (they are tier 1 and
+	// nonLocalReplicasFallback is not enabled).
+	for _, id := range []string{"R0", "R1", "R2", "R3"} {
+		if firstHosts[id] != 0 {
+			t.Errorf("remote replica %s should never be first, got %d picks", id, firstHosts[id])
+		}
+	}
+	// Rotation over [L0, L1] gives exactly 50/50; old rotate-over-raw-list
+	// produces ~75/25 (L0 wins for 3 of 4 starts).
+	minRequired := iterations * 4 / 10
+	if firstHosts["L0"] < minRequired {
+		t.Errorf("expected L0 to be first at least %d times, got %d (distribution: %v)",
+			minRequired, firstHosts["L0"], firstHosts)
+	}
+	if firstHosts["L1"] < minRequired {
+		t.Errorf("expected L1 to be first at least %d times, got %d (distribution: %v)",
+			minRequired, firstHosts["L1"], firstHosts)
+	}
+}
+
+// TestHostPolicy_TokenAware_Shuffle_RemoteFallback verifies that when local
+// replicas are down/exhausted and NonLocalReplicasFallback is enabled, the
+// remote-tier replicas also rotate across queries instead of always returning
+// the same first remote replica. Regression test: an earlier version of the
+// rotation refactor only rotated localLive and consumed remote tiers from
+// index 0, so during a local-DC outage every query landed on the same remote
+// coordinator -- the exact failover case where load distribution matters most.
+func TestHostPolicy_TokenAware_Shuffle_RemoteFallback(t *testing.T) {
+	policy, query := setupShuffleTestPolicy(4,
+		DCAwareRoundRobinPolicy("local"),
+		ShuffleReplicas(),
+		NonLocalReplicasFallback(),
+	)
+
+	// SimpleStrategy RF=4, routing key "05" → replicas [L0, L1, R0, R1] by
+	// ring walk. With DCAware("local") fallback: L0/L1 are tier 0, R0/R1 are
+	// tier 1 and stashed for non-local fallback.
+	hosts := [...]*HostInfo{
+		{hostId: "L0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}, dataCenter: "local"},
+		{hostId: "L1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}, dataCenter: "local"},
+		{hostId: "R0", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}, dataCenter: "remote"},
+		{hostId: "R1", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}, dataCenter: "remote"},
+		{hostId: "R2", connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"50"}, dataCenter: "remote"},
+		{hostId: "R3", connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"60"}, dataCenter: "remote"},
+	}
+	for _, host := range &hosts {
+		policy.AddHost(host)
+	}
+	policy.SetPartitioner("OrderedPartitioner")
+
+	// Simulate a local-DC outage: both local replicas down. The first host
+	// returned by Pick must come from the remote replica fallback (R0/R1).
+	hosts[0].setState(NodeDown)
+	hosts[1].setState(NodeDown)
+	query.RoutingKey([]byte("05"))
+
+	const iterations = 600
+	firstHosts := firstHostDistribution(t, policy, query, iterations)
+
+	// L0, L1 are down → never first.
+	for _, id := range []string{"L0", "L1"} {
+		if firstHosts[id] != 0 {
+			t.Errorf("down replica %s should never be first, got %d picks", id, firstHosts[id])
+		}
+	}
+	// R2 and R3 are not replicas of the routing key's token; they should not
+	// appear via the token-aware fallback path.
+	for _, id := range []string{"R2", "R3"} {
+		if firstHosts[id] != 0 {
+			t.Errorf("non-replica %s should never be first, got %d picks", id, firstHosts[id])
+		}
+	}
+	// Rotation over [R0, R1] gives exactly 50/50; without remote-tier
+	// rotation, R0 wins every Pick.
+	minRequired := iterations * 4 / 10
+	if firstHosts["R0"] < minRequired {
+		t.Errorf("expected R0 to be first at least %d times, got %d (distribution: %v)",
+			minRequired, firstHosts["R0"], firstHosts)
+	}
+	if firstHosts["R1"] < minRequired {
+		t.Errorf("expected R1 to be first at least %d times, got %d (distribution: %v)",
+			minRequired, firstHosts["R1"], firstHosts)
+	}
+}
+
+// TestHostPolicy_TokenAware_Shuffle_AllReplicasDown verifies that when every
+// replica for a token is down and NonLocalReplicasFallback is disabled, the
+// iterator falls through to the wrapped fallback policy. This exercises the
+// `t.fallback.Pick(qry)` tail path and the `used[]` dedup that filters
+// already-returned hosts from the fallback's output -- neither is touched by
+// the other shuffle regression tests.
+func TestHostPolicy_TokenAware_Shuffle_AllReplicasDown(t *testing.T) {
+	policy, query := setupShuffleTestPolicy(3, RoundRobinHostPolicy(), ShuffleReplicas())
+
+	// SimpleStrategy RF=3, routing key "05" → replicas [A@10, B@30, C@50].
+	// D is not a replica for this token but should still appear via the
+	// RoundRobin fallback once the (now-dead) replicas are exhausted.
+	hosts := [...]*HostInfo{
+		{hostId: "A", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}},
+		{hostId: "B", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}},
+		{hostId: "C", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
+		{hostId: "D", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}},
+	}
+	for _, host := range &hosts {
+		policy.AddHost(host)
+	}
+	policy.SetPartitioner("OrderedPartitioner")
+
+	// Mark all three replicas down so localLive is empty.
+	hosts[0].setState(NodeDown)
+	hosts[1].setState(NodeDown)
+	hosts[2].setState(NodeDown)
+	query.RoutingKey([]byte("05"))
+
+	// Drive Pick once and walk the iterator to completion. Expectations:
+	//   - No down replica is ever returned.
+	//   - D (the non-replica) is returned at most once (via the fallback).
+	//   - No host is returned twice (the `used[]` map must deduplicate
+	//     between the empty replica iterator and the fallback's output).
+	iter := policy.Pick(newInternalQuery(query, nil))
+	seen := make(map[string]int)
+	for h := iter(); h != nil; h = iter() {
+		seen[h.Info().HostID()]++
+	}
+
+	for _, id := range []string{"A", "B", "C"} {
+		if seen[id] != 0 {
+			t.Errorf("down replica %s should not be returned, got %d times", id, seen[id])
+		}
+	}
+	if seen["D"] != 1 {
+		t.Errorf("expected fallback host D returned exactly once, got %d times (seen=%v)", seen["D"], seen)
+	}
+}
+
+// benchmarkShufflePolicy builds a token-aware policy with shuffle enabled,
+// modelling a production-scale workload: 100 single-DC hosts with RF=5, so
+// each token has 5 replicas. The routing key is fixed so every Pick targets
+// the same 5-host replica set -- the steady-state hot path.
+func benchmarkShufflePolicy(b *testing.B) (HostSelectionPolicy, *internalQuery) {
+	b.Helper()
+	const (
+		numHosts = 100
+		rf       = 5
+	)
+	policy, query := setupShuffleTestPolicy(rf, RoundRobinHostPolicy(), ShuffleReplicas())
+	for i := 0; i < numHosts; i++ {
+		policy.AddHost(&HostInfo{
+			hostId:         fmt.Sprintf("%03d", i),
+			connectAddress: net.IPv4(10, 0, byte(i/256), byte(i%256)),
+			tokens:         []string{fmt.Sprintf("%03d", i)},
+		})
+	}
+	policy.SetPartitioner("OrderedPartitioner")
+	// Routing key "005" walks the ring from token "005", yielding 5 replicas
+	// at indices 5..9.
+	query.RoutingKey([]byte("005"))
+	return policy, newInternalQuery(query, nil)
+}
+
+// BenchmarkTokenAwareHostPolicy_PickShuffleSerial measures per-Pick cost on a
+// single goroutine. Mostly captures allocation/classification overhead -- the
+// global RNG mutex from the prior implementation is uncontended here, so this
+// benchmark is the *least* favorable comparison for the lock-free rotation.
+func BenchmarkTokenAwareHostPolicy_PickShuffleSerial(b *testing.B) {
+	policy, iq := benchmarkShufflePolicy(b)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		iter := policy.Pick(iq)
+		if iter() == nil {
+			b.Fatal("unexpected nil host")
+		}
+	}
+}
+
+// BenchmarkTokenAwareHostPolicy_PickShuffleParallel measures per-Pick cost
+// under contention from GOMAXPROCS goroutines. This is the load shape the
+// refactor targets: every concurrent query used to serialize on the global
+// mutRandr mutex inside shuffleHosts.
+func BenchmarkTokenAwareHostPolicy_PickShuffleParallel(b *testing.B) {
+	policy, iq := benchmarkShufflePolicy(b)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			iter := policy.Pick(iq)
+			iter()
 		}
 	})
 }

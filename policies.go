@@ -31,7 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -396,8 +396,12 @@ func (r *roundRobinHostPolicy) HostDown(host *HostInfo) {
 	r.RemoveHost(host)
 }
 
-// ShuffleReplicas returns an option function to enable shuffling of replicas in token-aware host selection.
-// When enabled, the set of replicas for a partition key will be traversed in randomized order.
+// ShuffleReplicas returns an option function to spread coordinator load across
+// replicas in token-aware host selection. When enabled, the starting replica for
+// each query is rotated across the live local replicas so each receives roughly
+// equal coordinator traffic instead of all queries hitting the primary replica
+// first. Rotation is done with a lock-free atomic counter; the per-call order
+// is deterministic rather than randomized.
 func ShuffleReplicas() func(*tokenAwareHostPolicy) {
 	return func(t *tokenAwareHostPolicy) {
 		t.shuffleReplicas = true
@@ -426,13 +430,16 @@ func NonLocalReplicasFallback() func(policy *tokenAwareHostPolicy) {
 	}
 }
 
-// ShuffledTokenAwareHostPolicy is a token aware host selection policy that shuffles replicas.
+// ShuffledTokenAwareHostPolicy is a token aware host selection policy that
+// spreads coordinator load across replicas by rotating the starting replica for
+// each query. See ShuffleReplicas for details.
 func ShuffledTokenAwareHostPolicy(fallback HostSelectionPolicy, opts ...func(*tokenAwareHostPolicy)) HostSelectionPolicy {
 	p := &tokenAwareHostPolicy{
 		fallback:                fallback,
 		shuffleReplicas:         true,
 		shuffleDecisionExplicit: true,
 	}
+	p.replicaRotation.Store(rand.Uint64())
 	for _, opt := range opts {
 		opt(p)
 	}
@@ -444,6 +451,7 @@ func ShuffledTokenAwareHostPolicy(fallback HostSelectionPolicy, opts ...func(*to
 // owns the partition. Fallback is used when routing information is not available.
 func TokenAwareHostPolicy(fallback HostSelectionPolicy, opts ...func(*tokenAwareHostPolicy)) HostSelectionPolicy {
 	p := &tokenAwareHostPolicy{fallback: fallback}
+	p.replicaRotation.Store(rand.Uint64())
 	for _, opt := range opts {
 		opt(p)
 	}
@@ -470,6 +478,12 @@ type tokenAwareHostPolicy struct {
 	nonLocalReplicasFallback bool
 	shuffleDecisionExplicit  bool
 
+	// replicaRotation is an atomic counter used to pick a starting offset into
+	// the live local replica subset when shuffleReplicas is enabled. This spreads
+	// coordinator load across eligible replicas without a mutex on the query hot
+	// path. Seeded randomly at construction to avoid cross-process phase-lock.
+	replicaRotation atomic.Uint64
+
 	// mu protects writes to hosts, partitioner, metadata.
 	// reads can be unlocked as long as they are not used for updating state later.
 	mu          sync.Mutex
@@ -493,7 +507,7 @@ func (t *tokenAwareHostPolicy) Init(s *Session) {
 	t.getSchemaMeta = s.schemaDescriber.getSchemaMetaForRead
 	t.logger = s.logger
 	if !t.shuffleDecisionExplicit {
-		t.logger.Warning("By default, token aware policy doesn't shuffle the replicas which isn't recommended. If this is intentional, use the DoNotShuffleReplicas option to make this warning go away (e.g. TokenAwareHostPolicy(fallbackpolicy, DoNotShuffleReplicas))")
+		t.logger.Warning("By default, token aware policy doesn't rotate the starting replica across queries, which can concentrate coordinator load on the primary replica for each token. Enabling rotation is recommended; if you intentionally want the deterministic ring order, use the DoNotShuffleReplicas option to silence this warning (e.g. TokenAwareHostPolicy(fallbackpolicy, DoNotShuffleReplicas))")
 	}
 }
 
@@ -713,15 +727,11 @@ func (t *tokenAwareHostPolicy) Pick(qry ExecutableStatement) NextHost {
 		replicas = []*HostInfo{host}
 	} else {
 		replicas = ht.hosts
-		if t.shuffleReplicas {
-			replicas = shuffleHosts(replicas)
-		}
 	}
 
 	var (
 		fallbackIter NextHost
-		i, j, k      int
-		remote       [][]*HostInfo
+		j, k         int
 		tierer       HostTierer
 		tiererOk     bool
 		maxTier      uint
@@ -733,52 +743,90 @@ func (t *tokenAwareHostPolicy) Pick(qry ExecutableStatement) NextHost {
 		maxTier = 1
 	}
 
+	// Classify replicas upfront: collect live local-tier replicas into one
+	// list, and live higher-tier replicas into a per-tier list for fallback.
+	// Rotating within each eligible-and-up subset (rather than over the raw
+	// replica list) is what gives uniform coordinator-load distribution; raw-list
+	// rotation skews toward replicas that immediately follow runs of filtered-out
+	// hosts in the deterministic topology order. Remote tiers get the same
+	// rotation treatment as local so a single remote replica does not become the
+	// hot coordinator when locals are down/exhausted.
+	//
+	// Note: IsUp is snapshot here rather than reread on each NextHost call. The
+	// window from Pick to the last NextHost is short and the executor handles
+	// transport-level failures anyway, so the difference is not user-visible.
+	localLive := make([]*HostInfo, 0, len(replicas))
+	var remoteLive [][]*HostInfo
 	if t.nonLocalReplicasFallback {
-		remote = make([][]*HostInfo, maxTier)
+		remoteLive = make([][]*HostInfo, maxTier)
+	}
+	for _, h := range replicas {
+		var tier uint
+		if tiererOk {
+			tier = tierer.HostTier(h)
+		} else if t.fallback.IsLocal(h) {
+			tier = 0
+		} else {
+			tier = 1
+		}
+
+		if tier == 0 {
+			if h.IsUp() {
+				localLive = append(localLive, h)
+			}
+		} else if t.nonLocalReplicasFallback && h.IsUp() {
+			remoteLive[tier-1] = append(remoteLive[tier-1], h)
+		}
+	}
+
+	// One atomic increment per Pick; the resulting value is used to derive a
+	// rotation start for the local subset and for each remote tier
+	// independently (modulo per-subset size). Tiers rotate within themselves;
+	// tier ordering is preserved.
+	var rotSeed uint64
+	if t.shuffleReplicas {
+		rotSeed = t.replicaRotation.Add(1)
+	}
+
+	localStart := 0
+	if t.shuffleReplicas && len(localLive) > 1 {
+		localStart = int(rotSeed % uint64(len(localLive)))
+	}
+
+	var remoteStart []int
+	if remoteLive != nil {
+		remoteStart = make([]int, len(remoteLive))
+		if t.shuffleReplicas {
+			for i, tierHosts := range remoteLive {
+				if len(tierHosts) > 1 {
+					remoteStart[i] = int(rotSeed % uint64(len(tierHosts)))
+				}
+			}
+		}
 	}
 
 	used := make(map[*HostInfo]bool, len(replicas))
+	var localIdx int
 	return func() SelectedHost {
-		for i < len(replicas) {
-			h := replicas[i]
-			i++
-
-			var tier uint
-			if tiererOk {
-				tier = tierer.HostTier(h)
-			} else if t.fallback.IsLocal(h) {
-				tier = 0
-			} else {
-				tier = 1
-			}
-
-			if tier != 0 {
-				if t.nonLocalReplicasFallback {
-					remote[tier-1] = append(remote[tier-1], h)
-				}
-				continue
-			}
-
-			if h.IsUp() {
-				used[h] = true
-				return (*selectedHost)(h)
-			}
+		for localIdx < len(localLive) {
+			h := localLive[(localStart+localIdx)%len(localLive)]
+			localIdx++
+			used[h] = true
+			return (*selectedHost)(h)
 		}
 
 		if t.nonLocalReplicasFallback {
-			for j < len(remote) && k < len(remote[j]) {
-				h := remote[j][k]
-				k++
-
-				if k >= len(remote[j]) {
+			for j < len(remoteLive) {
+				tierHosts := remoteLive[j]
+				if k >= len(tierHosts) {
 					j++
 					k = 0
+					continue
 				}
-
-				if h.IsUp() {
-					used[h] = true
-					return (*selectedHost)(h)
-				}
+				h := tierHosts[(remoteStart[j]+k)%len(tierHosts)]
+				k++
+				used[h] = true
+				return (*selectedHost)(h)
 			}
 		}
 
