@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `TokenAwareHostPolicy` now rotates the starting replica across queries by default, spreading coordinator load across the live local replicas instead of concentrating it on the primary replica for each token. The `ShuffleReplicas` option becomes redundant (kept for backwards compatibility); use `DoNotShuffleReplicas` to opt back into the previous deterministic ring-order behavior.
+- The startup warning previously emitted when `TokenAwareHostPolicy` was constructed without an explicit shuffle decision has been removed; the new default is the recommended behavior.
+- Replica selection on the per-query hot path no longer takes a global `sync.Mutex`. The previous implementation serialized every concurrent query on a shared `*rand.Rand`; replicas are now rotated via a lock-free atomic counter, which improves `Pick` throughput by ~2.3x at GOMAXPROCS=32 with RF=5.
+
+### Fixed
+
+- Remote-tier iteration in `TokenAwareHostPolicy` with `NonLocalReplicasFallback` no longer halts permanently the first time it encounters an empty intermediate tier. Previously, a `RackAwareRoundRobinPolicy` fallback could silently drop tier-2 replicas if no tier-1 replicas were present in a given token's replica set.
+
 ## [2.1.0]
 
 ### Added

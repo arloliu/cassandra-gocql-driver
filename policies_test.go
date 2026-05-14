@@ -1367,6 +1367,99 @@ func TestHostPolicy_TokenAware_Shuffle_AllReplicasDown(t *testing.T) {
 	}
 }
 
+// TestHostPolicy_TokenAware_Shuffle_EmptyMiddleTier verifies that when an
+// intermediate remote tier is empty (e.g. RackAware with replicas in the
+// local rack and a remote DC but none in other local racks), the iterator
+// correctly advances past the empty tier instead of halting. Regression
+// test for a pre-existing bug in the prior remote-tier loop guard
+// (for j < len(remote) && k < len(remote[j])), which would terminate the
+// loop the first time it saw a zero-length tier and silently drop later
+// non-empty tiers.
+func TestHostPolicy_TokenAware_Shuffle_EmptyMiddleTier(t *testing.T) {
+	policy, query := setupShuffleTestPolicy(3,
+		RackAwareRoundRobinPolicy("local", "b"),
+		NonLocalReplicasFallback(),
+	)
+
+	// RF=3 SimpleStrategy ring walk for routing key "05" picks [A, B, C]:
+	//   A = local DC, rack b   (tier 0)
+	//   B = local DC, rack b   (tier 0)
+	//   C = remote DC          (tier 2)
+	//   D is local DC, rack a but is NOT in this token's replica set.
+	// So tier 1 (local DC, other rack) is empty within the replica set.
+	hosts := [...]*HostInfo{
+		{hostId: "A", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}, dataCenter: "local", rack: "b"},
+		{hostId: "B", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}, dataCenter: "local", rack: "b"},
+		{hostId: "C", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}, dataCenter: "remote", rack: "a"},
+		{hostId: "D", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}, dataCenter: "local", rack: "a"},
+	}
+	for _, host := range &hosts {
+		policy.AddHost(host)
+	}
+	policy.SetPartitioner("OrderedPartitioner")
+
+	// Take both tier-0 replicas down so the iterator must reach into the
+	// remote fallback to find a coordinator.
+	hosts[0].setState(NodeDown)
+	hosts[1].setState(NodeDown)
+	query.RoutingKey([]byte("05"))
+
+	iter := policy.Pick(newInternalQuery(query, nil))
+	first := iter()
+	if first == nil {
+		t.Fatal("expected non-nil host -- iterator halted on empty tier 1 instead of advancing to tier 2")
+	}
+	// C is the only tier-2 replica; it must be returned via the token-aware
+	// remote-fallback path, ahead of any non-replica host from the rack-aware
+	// policy fallback (which would otherwise come from the closure tail).
+	if id := first.Info().HostID(); id != "C" {
+		t.Errorf("expected remote replica C from tier 2, got %s (likely returned via policy fallback because the empty-tier guard skipped tier 2)", id)
+	}
+}
+
+// TestHostPolicy_TokenAware_Shuffle_CrossPolicyIndependence verifies that
+// two TokenAwareHostPolicy instances constructed back-to-back rotate
+// independently. The rotation counter is seeded with rand.Uint64() at
+// construction so multiple sessions or co-located policies do not all
+// start at the same offset and produce identical pick sequences.
+func TestHostPolicy_TokenAware_Shuffle_CrossPolicyIndependence(t *testing.T) {
+	// Build N independent policies, take one Pick from each, and check that
+	// the first-host distribution is not concentrated on a single host. With
+	// 3 live replicas and N=60 policies, a deterministic seed would give 60
+	// of one host and 0 of the other two; random seeding spreads the load.
+	const (
+		numPolicies = 60
+		minDistinct = 2 // at least 2 of 3 replicas chosen as first across policies
+	)
+	hosts := []*HostInfo{
+		{hostId: "A", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}},
+		{hostId: "B", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}},
+		{hostId: "C", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
+		{hostId: "D", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}},
+	}
+
+	firstHosts := make(map[string]int)
+	for i := 0; i < numPolicies; i++ {
+		policy, query := setupShuffleTestPolicy(3, RoundRobinHostPolicy())
+		for _, h := range hosts {
+			policy.AddHost(h)
+		}
+		policy.SetPartitioner("OrderedPartitioner")
+		query.RoutingKey([]byte("05"))
+
+		iter := policy.Pick(newInternalQuery(query, nil))
+		h := iter()
+		if h == nil {
+			t.Fatalf("policy %d: unexpected nil host", i)
+		}
+		firstHosts[h.Info().HostID()]++
+	}
+	if len(firstHosts) < minDistinct {
+		t.Errorf("expected at least %d distinct first hosts across %d policies (independent seeding), got %d: %v",
+			minDistinct, numPolicies, len(firstHosts), firstHosts)
+	}
+}
+
 // benchmarkShufflePolicy builds a token-aware policy with shuffle enabled,
 // modelling a production-scale workload: 100 single-DC hosts with RF=5, so
 // each token has 5 replicas. The routing key is fixed so every Pick targets

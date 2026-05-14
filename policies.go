@@ -396,25 +396,25 @@ func (r *roundRobinHostPolicy) HostDown(host *HostInfo) {
 	r.RemoveHost(host)
 }
 
-// ShuffleReplicas returns an option function to spread coordinator load across
-// replicas in token-aware host selection. When enabled, the starting replica for
-// each query is rotated across the live local replicas so each receives roughly
-// equal coordinator traffic instead of all queries hitting the primary replica
-// first. Rotation is done with a lock-free atomic counter; the per-call order
-// is deterministic rather than randomized.
+// ShuffleReplicas returns an option function that enables rotation of the
+// starting replica across queries (the default since the rotation-by-default
+// change). Retained for backwards compatibility -- new code can rely on the
+// default behavior and omit this option.
 func ShuffleReplicas() func(*tokenAwareHostPolicy) {
 	return func(t *tokenAwareHostPolicy) {
 		t.shuffleReplicas = true
-		t.shuffleDecisionExplicit = true
 	}
 }
 
-// DoNotShuffleReplicas returns an option function to disable shuffling of replicas in token-aware host selection.
-// When disabled, replicas are traversed in their natural (token ring) order.
+// DoNotShuffleReplicas returns an option function that disables replica
+// rotation, restoring the deterministic ring-order behavior. Use this when
+// you want every query for a given token to start at the same replica (for
+// example, to maintain a stable coordinator across a sequence of queries).
+// Note that this concentrates coordinator load on the primary replica for
+// each token range.
 func DoNotShuffleReplicas() func(*tokenAwareHostPolicy) {
 	return func(t *tokenAwareHostPolicy) {
 		t.shuffleReplicas = false
-		t.shuffleDecisionExplicit = true
 	}
 }
 
@@ -430,27 +430,27 @@ func NonLocalReplicasFallback() func(policy *tokenAwareHostPolicy) {
 	}
 }
 
-// ShuffledTokenAwareHostPolicy is a token aware host selection policy that
-// spreads coordinator load across replicas by rotating the starting replica for
-// each query. See ShuffleReplicas for details.
+// ShuffledTokenAwareHostPolicy is now equivalent to TokenAwareHostPolicy --
+// replica rotation is enabled by default. Retained for backwards compatibility.
+//
+// Deprecated: use TokenAwareHostPolicy directly.
 func ShuffledTokenAwareHostPolicy(fallback HostSelectionPolicy, opts ...func(*tokenAwareHostPolicy)) HostSelectionPolicy {
-	p := &tokenAwareHostPolicy{
-		fallback:                fallback,
-		shuffleReplicas:         true,
-		shuffleDecisionExplicit: true,
-	}
-	p.replicaRotation.Store(rand.Uint64())
-	for _, opt := range opts {
-		opt(p)
-	}
-	return p
+	return TokenAwareHostPolicy(fallback, opts...)
 }
 
 // TokenAwareHostPolicy is a token aware host selection policy, where hosts are
 // selected based on the partition key, so queries are sent to the host which
 // owns the partition. Fallback is used when routing information is not available.
+//
+// By default the starting replica for each query is rotated across the live
+// local replicas so each replica receives roughly equal coordinator traffic.
+// Pass DoNotShuffleReplicas to disable rotation and traverse replicas in their
+// natural ring order instead.
 func TokenAwareHostPolicy(fallback HostSelectionPolicy, opts ...func(*tokenAwareHostPolicy)) HostSelectionPolicy {
-	p := &tokenAwareHostPolicy{fallback: fallback}
+	p := &tokenAwareHostPolicy{
+		fallback:        fallback,
+		shuffleReplicas: true,
+	}
 	p.replicaRotation.Store(rand.Uint64())
 	for _, opt := range opts {
 		opt(p)
@@ -476,7 +476,6 @@ type tokenAwareHostPolicy struct {
 
 	shuffleReplicas          bool
 	nonLocalReplicasFallback bool
-	shuffleDecisionExplicit  bool
 
 	// replicaRotation is an atomic counter used to pick a starting offset into
 	// the live local replica subset when shuffleReplicas is enabled. This spreads
@@ -506,9 +505,6 @@ func (t *tokenAwareHostPolicy) Init(s *Session) {
 	t.getKeyspaceName = func() string { return s.cfg.Keyspace }
 	t.getSchemaMeta = s.schemaDescriber.getSchemaMetaForRead
 	t.logger = s.logger
-	if !t.shuffleDecisionExplicit {
-		t.logger.Warning("By default, token aware policy doesn't rotate the starting replica across queries, which can concentrate coordinator load on the primary replica for each token. Enabling rotation is recommended; if you intentionally want the deterministic ring order, use the DoNotShuffleReplicas option to silence this warning (e.g. TokenAwareHostPolicy(fallbackpolicy, DoNotShuffleReplicas))")
-	}
 }
 
 func (t *tokenAwareHostPolicy) IsLocal(host *HostInfo) bool {
