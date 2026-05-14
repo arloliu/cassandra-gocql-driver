@@ -429,6 +429,52 @@ func TestUDT_Unmarshal_TruncatedPayload_ReturnsError(t *testing.T) {
 	}
 }
 
+// UDT field with a negative length prefix other than -1 is a corrupt
+// frame, not NULL. The protocol reserves -1 specifically for NULL; any
+// other negative value should error rather than silently surfacing as
+// an empty/zero element.
+func TestUDT_Unmarshal_NegativeNonNullLength_ReturnsError(t *testing.T) {
+	udt := UDTTypeInfo{
+		Name:     "test_udt",
+		Keyspace: "test_ks",
+		Elements: []UDTField{
+			{Name: "s", Type: varcharLikeTypeInfo{typ: TypeAscii}},
+		},
+	}
+	// Single field, length prefix = -2 (0xFFFFFFFE)
+	data := []byte{0xFF, 0xFF, 0xFF, 0xFE}
+
+	var dst map[string]interface{}
+	err := Unmarshal(udt, data, &dst)
+	if err == nil {
+		t.Fatalf("expected error for length prefix -2 (only -1 is NULL); got nil, dst=%v", dst)
+	}
+}
+
+// Tuple with 1-3 trailing bytes (not enough for a length prefix) is a
+// corrupt frame. Used to be silently treated as an absent element and
+// returned zero-value with err == nil.
+func TestTuple_Unmarshal_TruncatedLengthPrefix_ReturnsError(t *testing.T) {
+	tt := TupleTypeInfo{
+		Elems: []TypeInfo{intTypeInfo{}},
+	}
+
+	cases := [][]byte{
+		{0x00},
+		{0x00, 0x00},
+		{0x00, 0x00, 0x00},
+	}
+	for _, data := range cases {
+		t.Run("", func(t *testing.T) {
+			var dst struct{ N int }
+			err := Unmarshal(tt, data, &dst)
+			if err == nil {
+				t.Fatalf("expected error for %d trailing bytes; got nil, dst=%v", len(data), dst)
+			}
+		})
+	}
+}
+
 // UDT into a struct whose unexported field name matches a UDT element name
 // must return an error, not panic on Addr().Interface().
 func TestUDT_Unmarshal_UnexportedFieldMatch_ReturnsError(t *testing.T) {

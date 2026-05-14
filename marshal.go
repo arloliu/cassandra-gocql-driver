@@ -2608,16 +2608,20 @@ func (tuple TupleTypeInfo) Marshal(value interface{}) ([]byte, error) {
 // the element body, the remaining buffer, and an error if the buffer
 // cannot satisfy the length prefix or the declared payload.
 //
-// A negative length prefix is the wire encoding for NULL and returns a
-// nil body with no error.
+// The protocol reserves a length prefix of -1 to encode NULL; readBytes
+// returns a nil body with no error for that case. Other negative values
+// are not valid in this context and produce an error.
 func readBytes(p []byte) ([]byte, []byte, error) {
 	if len(p) < 4 {
 		return nil, p, unmarshalErrorf("not enough bytes to read length prefix: have %d, need 4", len(p))
 	}
 	size := readInt(p)
 	p = p[4:]
-	if size < 0 {
+	if size == -1 {
 		return nil, p, nil
+	}
+	if size < 0 {
+		return nil, p, unmarshalErrorf("invalid negative length prefix %d (only -1 is valid for NULL)", size)
 	}
 	if int(size) > len(p) {
 		return nil, p, unmarshalErrorf("length prefix says %d bytes but only %d remain", size, len(p))
@@ -2638,7 +2642,7 @@ func (tuple TupleTypeInfo) Unmarshal(data []byte, value interface{}) error {
 		for i := range tuple.Elems {
 			// each element inside data is a [bytes]
 			var p []byte
-			if len(data) >= 4 {
+			if len(data) > 0 {
 				var rbErr error
 				p, data, rbErr = readBytes(data)
 				if rbErr != nil {
@@ -2656,7 +2660,7 @@ func (tuple TupleTypeInfo) Unmarshal(data []byte, value interface{}) error {
 		for i := range tuple.Elems {
 			// each element inside data is a [bytes]
 			var p []byte
-			if len(data) >= 4 {
+			if len(data) > 0 {
 				var rbErr error
 				p, data, rbErr = readBytes(data)
 				if rbErr != nil {
@@ -2690,7 +2694,7 @@ func (tuple TupleTypeInfo) Unmarshal(data []byte, value interface{}) error {
 
 		for i := range tuple.Elems {
 			var p []byte
-			if len(data) >= 4 {
+			if len(data) > 0 {
 				var rbErr error
 				p, data, rbErr = readBytes(data)
 				if rbErr != nil {
@@ -2722,7 +2726,7 @@ func (tuple TupleTypeInfo) Unmarshal(data []byte, value interface{}) error {
 
 		for i := range tuple.Elems {
 			var p []byte
-			if len(data) >= 4 {
+			if len(data) > 0 {
 				var rbErr error
 				p, data, rbErr = readBytes(data)
 				if rbErr != nil {
