@@ -202,46 +202,76 @@ func (iter *Iter) MapScan(m map[string]interface{}) bool {
 		return false
 	}
 
-	cols := iter.Columns()
-	columnNames := make([]string, 0, len(cols))
-	values := make([]interface{}, 0, len(cols))
-	for _, column := range iter.Columns() {
-		if c, ok := column.TypeInfo.(TupleTypeInfo); ok {
-			for i := range c.Elems {
-				columnName := TupleColumnName(column.Name, i)
-				if dest, ok := m[columnName]; ok {
-					values = append(values, dest)
-				} else {
-					zero := c.Elems[i].Zero()
-					// technically this is a *interface{} but later we will fix it
-					values = append(values, &zero)
-				}
-				columnNames = append(columnNames, columnName)
+	cache := iter.mapScanCache
+	if cache == nil {
+		cache = buildMapScanCache(iter.meta.columns)
+		iter.mapScanCache = cache
+	}
+
+	values := cache.values
+	for i, name := range cache.names {
+		if dest, ok := m[name]; ok {
+			values[i] = dest
+		} else {
+			// Refresh the slot every row. Required for correctness when a
+			// TypeInfo.Zero() returns a mutable pointer (varint -> *big.Int,
+			// decimal -> *inf.Dec): the top-level Unmarshal reflect path
+			// detects the pointer kind inside the interface and recurses,
+			// which causes the type's *T handler to mutate the pointee in
+			// place. Without this reset, every row's MapScan result would
+			// alias the same pointer, corrupting previously-returned row
+			// maps and panicking on NULL-then-non-NULL.
+			cache.zeros[i] = cache.zeroTypes[i].Zero()
+			values[i] = &cache.zeros[i]
+		}
+	}
+
+	if !iter.Scan(values...) {
+		return false
+	}
+
+	for i, name := range cache.names {
+		if iptr, ok := values[i].(*interface{}); ok {
+			m[name] = *iptr
+		} else {
+			// User pre-populated m with a typed pointer (e.g. *int).
+			// Mirror the legacy behavior: store the dereferenced value.
+			m[name] = dereference(values[i])
+		}
+	}
+
+	return true
+}
+
+// buildMapScanCache constructs the per-Iter MapScan cache from the
+// scan-order column list, expanding tuple columns into one entry per
+// element to match the keys MapScan exposes (TupleColumnName).
+//
+// zeroTypes is parallel to names/zeros and holds the TypeInfo used to
+// refresh each slot per row in MapScan (see comment there for why the
+// refresh is required for correctness).
+func buildMapScanCache(cols []ColumnInfo) *iterMapScanCache {
+	c := &iterMapScanCache{
+		names:     make([]string, 0, len(cols)),
+		zeros:     make([]any, 0, len(cols)),
+		zeroTypes: make([]TypeInfo, 0, len(cols)),
+	}
+	for _, column := range cols {
+		if tt, ok := column.TypeInfo.(TupleTypeInfo); ok {
+			for i := range tt.Elems {
+				c.names = append(c.names, TupleColumnName(column.Name, i))
+				c.zeros = append(c.zeros, nil)
+				c.zeroTypes = append(c.zeroTypes, tt.Elems[i])
 			}
 		} else {
-			if dest, ok := m[column.Name]; ok {
-				values = append(values, dest)
-			} else {
-				zero := column.TypeInfo.Zero()
-				// technically this is a *interface{} but later we will fix it
-				values = append(values, &zero)
-			}
-			columnNames = append(columnNames, column.Name)
+			c.names = append(c.names, column.Name)
+			c.zeros = append(c.zeros, nil)
+			c.zeroTypes = append(c.zeroTypes, column.TypeInfo)
 		}
 	}
-	if iter.Scan(values...) {
-		for i, name := range columnNames {
-			if iptr, ok := values[i].(*interface{}); ok {
-				m[name] = *iptr
-			} else {
-				// TODO: it seems wrong to dereference the values that were passed in
-				// originally in the map but that's what it was doing before
-				m[name] = dereference(values[i])
-			}
-		}
-		return true
-	}
-	return false
+	c.values = make([]any, len(c.names))
+
+	return c
 }
 
 func copyBytes(p []byte) []byte {
@@ -260,7 +290,6 @@ func LookupIP(host string) ([]net.IP, error) {
 		return nil, &net.DNSError{}
 	}
 	return net.LookupIP(host)
-
 }
 
 func ringString(hosts []*HostInfo) string {

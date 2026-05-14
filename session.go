@@ -1047,25 +1047,42 @@ type Query struct {
 	nowInSecondsValue *int
 }
 
+// queryRoutingInfo holds the keyspace and table associated with a query
+// execution. Both fields are populated as the executor learns them — from
+// the routing-metadata cache during host selection and again from the
+// prepared-statement metadata after prepare. Speculative execution can
+// drive these writes concurrently, but every writer writes the same
+// canonical values, so the race is benign.
+//
+// The fields are exposed through an atomic.Pointer so reads are
+// lock-free; this matters because Iter.Keyspace / Iter.Table and the
+// observer paths read from here on every query attempt and (in some
+// integrations) every row.
 type queryRoutingInfo struct {
-	// mu protects contents of queryRoutingInfo.
-	mu sync.RWMutex
+	v atomic.Pointer[routingKsTable]
+}
 
+type routingKsTable struct {
 	keyspace string
-
-	table string
+	table    string
 }
 
 func (qr *queryRoutingInfo) getKeyspace() string {
-	qr.mu.RLock()
-	defer qr.mu.RUnlock()
-	return qr.keyspace
+	if p := qr.v.Load(); p != nil {
+		return p.keyspace
+	}
+	return ""
 }
 
 func (qr *queryRoutingInfo) getTable() string {
-	qr.mu.RLock()
-	defer qr.mu.RUnlock()
-	return qr.table
+	if p := qr.v.Load(); p != nil {
+		return p.table
+	}
+	return ""
+}
+
+func (qr *queryRoutingInfo) set(keyspace, table string) {
+	qr.v.Store(&routingKsTable{keyspace: keyspace, table: table})
 }
 
 func (q *Query) defaultsFromSession() {
@@ -1555,6 +1572,21 @@ type Iter struct {
 
 	framer *framer
 	closed int32
+
+	// mapScanCache is lazily built on the first MapScan call and reused
+	// for every subsequent row in this page. Replaced by paging swaps.
+	mapScanCache *iterMapScanCache
+}
+
+// iterMapScanCache holds the per-Iter buffers that MapScan reuses
+// across rows: column names, default-value slots whose addresses are
+// handed to Scan when the user has not pre-populated the map, and a
+// reusable values slice for the Scan call.
+type iterMapScanCache struct {
+	names     []string   // tuple-expanded scan-order column names
+	zeros     []any      // per-entry default storage; refreshed per row
+	zeroTypes []TypeInfo // TypeInfo per entry, used to refresh zeros[i] each row
+	values    []any      // reused buffer passed to iter.Scan(values...)
 }
 
 func newErrIter(err error, metrics *queryMetrics, keyspace string, routingInfo *queryRoutingInfo, getKeyspace func() string) *Iter {
@@ -1888,6 +1920,10 @@ func (iter *Iter) Close() error {
 			iter.framer.release()
 			iter.framer = nil
 		}
+		// Drop the MapScan cache so its zeros slots — which retain the
+		// last row's values, including possibly large strings or blob
+		// []byte — are not held alive by a long-lived closed Iter.
+		iter.mapScanCache = nil
 	}
 
 	return iter.err

@@ -429,10 +429,7 @@ func (q *internalQuery) GetRoutingKey() ([]byte, error) {
 	}
 
 	if meta != nil {
-		q.routingInfo.mu.Lock()
-		q.routingInfo.keyspace = meta.Keyspace
-		q.routingInfo.table = meta.Table
-		q.routingInfo.mu.Unlock()
+		q.routingInfo.set(meta.Keyspace, meta.Table)
 	}
 	return createRoutingKey(meta, q.qryOpts.values)
 }
@@ -649,10 +646,7 @@ func (b *internalBatch) GetRoutingKey() ([]byte, error) {
 	}
 
 	if meta != nil {
-		b.routingInfo.mu.Lock()
-		b.routingInfo.keyspace = meta.Keyspace
-		b.routingInfo.table = meta.Table
-		b.routingInfo.mu.Unlock()
+		b.routingInfo.set(meta.Keyspace, meta.Table)
 	}
 
 	return createRoutingKey(meta, entry.Args)

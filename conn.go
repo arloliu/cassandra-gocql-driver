@@ -1621,13 +1621,11 @@ func (c *Conn) executeQuery(ctx context.Context, q *internalQuery) *Iter {
 		}
 
 		// Set "keyspace" and "table" property in the query if it is present in preparedMetadata
-		q.routingInfo.mu.Lock()
-		q.routingInfo.keyspace = info.request.keyspace
-		if info.request.keyspace == "" {
-			q.routingInfo.keyspace = usedKeyspace
+		ks := info.request.keyspace
+		if ks == "" {
+			ks = usedKeyspace
 		}
-		q.routingInfo.table = info.request.table
-		q.routingInfo.mu.Unlock()
+		q.routingInfo.set(ks, info.request.table)
 	} else {
 		frame = &writeQueryFrame{
 			statement:     qryOpts.stmt,
