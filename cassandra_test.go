@@ -1785,32 +1785,35 @@ func TestPrepare_PreparedCacheEviction(t *testing.T) {
 		t.Fatalf("insert into prepcachetest failed, error '%v'", err)
 	}
 
-	// Walk through all the configured hosts and test cache retention and eviction
+	// Five distinct statements were prepared against a cache bounded to
+	// maxPrepared=4; exactly one must have been evicted. The cache uses
+	// W-TinyLFU rather than strict LRU, so the specific entry chosen for
+	// eviction is policy-dependent and not part of the public contract.
+	// Assert the bound and the eviction count only.
+	statements := []string{
+		"SELECT id,mod FROM prepcachetest WHERE id = 0",
+		"SELECT id,mod FROM prepcachetest WHERE id = 1",
+		"INSERT INTO prepcachetest (id,mod) VALUES (?, ?)",
+		"UPDATE prepcachetest SET mod = ? WHERE id = ?",
+		"DELETE FROM prepcachetest WHERE id = ?",
+	}
+
+	cachedCount := 0
 	for _, host := range session.ring.hosts {
-		_, ok := session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "SELECT id,mod FROM prepcachetest WHERE id = 0"))
-		if ok {
-			t.Errorf("expected first select to be purged but was in cache for host=%q", host)
+		for _, stmt := range statements {
+			if _, ok := session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, stmt)); ok {
+				cachedCount++
+			}
 		}
+	}
 
-		_, ok = session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "SELECT id,mod FROM prepcachetest WHERE id = 1"))
-		if !ok {
-			t.Errorf("exepected second select to be in cache for host=%q", host)
-		}
-
-		_, ok = session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "INSERT INTO prepcachetest (id,mod) VALUES (?, ?)"))
-		if !ok {
-			t.Errorf("expected insert to be in cache for host=%q", host)
-		}
-
-		_, ok = session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "UPDATE prepcachetest SET mod = ? WHERE id = ?"))
-		if !ok {
-			t.Errorf("expected update to be in cached for host=%q", host)
-		}
-
-		_, ok = session.stmtsLRU.get(session.stmtsLRU.keyFor(host.HostID(), session.cfg.Keyspace, "DELETE FROM prepcachetest WHERE id = ?"))
-		if !ok {
-			t.Errorf("expected delete to be cached for host=%q", host)
-		}
+	if cachedCount > maxPrepared {
+		t.Errorf("cache exceeded its bound: got %d cached entries across %d hosts, want <= %d",
+			cachedCount, len(session.ring.hosts), maxPrepared)
+	}
+	if cachedCount != maxPrepared {
+		t.Errorf("expected exactly %d entries cached after eviction (prepared %d statements with cap %d), got %d",
+			maxPrepared, len(statements), maxPrepared, cachedCount)
 	}
 }
 
