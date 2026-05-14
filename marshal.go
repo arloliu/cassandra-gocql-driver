@@ -2604,14 +2604,25 @@ func (tuple TupleTypeInfo) Marshal(value interface{}) ([]byte, error) {
 	return nil, marshalErrorf("cannot marshal %T into tuple. Accepted types: struct, []interface{}, array, slice, UnsetValue.", value)
 }
 
-func readBytes(p []byte) ([]byte, []byte) {
-	// TODO: really should use a framer
+// readBytes reads a [int32 length][bytes] element from p and returns
+// the element body, the remaining buffer, and an error if the buffer
+// cannot satisfy the length prefix or the declared payload.
+//
+// A negative length prefix is the wire encoding for NULL and returns a
+// nil body with no error.
+func readBytes(p []byte) ([]byte, []byte, error) {
+	if len(p) < 4 {
+		return nil, p, unmarshalErrorf("not enough bytes to read length prefix: have %d, need 4", len(p))
+	}
 	size := readInt(p)
 	p = p[4:]
 	if size < 0 {
-		return nil, p
+		return nil, p, nil
 	}
-	return p[:size], p[size:]
+	if int(size) > len(p) {
+		return nil, p, unmarshalErrorf("length prefix says %d bytes but only %d remain", size, len(p))
+	}
+	return p[:size], p[size:], nil
 }
 
 // Unmarshal unmarshals the byte slice into the value.
@@ -2628,7 +2639,11 @@ func (tuple TupleTypeInfo) Unmarshal(data []byte, value interface{}) error {
 			// each element inside data is a [bytes]
 			var p []byte
 			if len(data) >= 4 {
-				p, data = readBytes(data)
+				var rbErr error
+				p, data, rbErr = readBytes(data)
+				if rbErr != nil {
+					return rbErr
+				}
 			}
 			err := Unmarshal(tuple.Elems[i], p, v[i])
 			if err != nil {
@@ -2642,7 +2657,11 @@ func (tuple TupleTypeInfo) Unmarshal(data []byte, value interface{}) error {
 			// each element inside data is a [bytes]
 			var p []byte
 			if len(data) >= 4 {
-				p, data = readBytes(data)
+				var rbErr error
+				p, data, rbErr = readBytes(data)
+				if rbErr != nil {
+					return rbErr
+				}
 			}
 			err := Unmarshal(tuple.Elems[i], p, &s[i])
 			if err != nil {
@@ -2672,7 +2691,11 @@ func (tuple TupleTypeInfo) Unmarshal(data []byte, value interface{}) error {
 		for i := range tuple.Elems {
 			var p []byte
 			if len(data) >= 4 {
-				p, data = readBytes(data)
+				var rbErr error
+				p, data, rbErr = readBytes(data)
+				if rbErr != nil {
+					return rbErr
+				}
 			}
 
 			// handle null data
@@ -2700,7 +2723,11 @@ func (tuple TupleTypeInfo) Unmarshal(data []byte, value interface{}) error {
 		for i := range tuple.Elems {
 			var p []byte
 			if len(data) >= 4 {
-				p, data = readBytes(data)
+				var rbErr error
+				p, data, rbErr = readBytes(data)
+				if rbErr != nil {
+					return rbErr
+				}
 			}
 
 			// handle null data
@@ -2953,8 +2980,11 @@ func (udt UDTTypeInfo) Unmarshal(data []byte, value interface{}) error {
 				return unmarshalErrorf("can not unmarshal UDT: field [%d]%s: unexpected eof", id, e.Name)
 			}
 
-			var p []byte
-			p, data = readBytes(data)
+			p, rest, rbErr := readBytes(data)
+			if rbErr != nil {
+				return unmarshalErrorf("can not unmarshal UDT: field [%d]%s: %s", id, e.Name, rbErr.Error())
+			}
+			data = rest
 			if err := v.UnmarshalUDT(e.Name, e.Type, p); err != nil {
 				return err
 			}
@@ -3011,8 +3041,11 @@ func (udt UDTTypeInfo) Unmarshal(data []byte, value interface{}) error {
 			return unmarshalErrorf("can not unmarshal UDT: field [%d]%s: unexpected eof", id, e.Name)
 		}
 
-		var p []byte
-		p, data = readBytes(data)
+		p, rest, rbErr := readBytes(data)
+		if rbErr != nil {
+			return unmarshalErrorf("can not unmarshal UDT: field [%d]%s: %s", id, e.Name, rbErr.Error())
+		}
+		data = rest
 
 		f, ok := fields[e.Name]
 		if !ok {
@@ -3024,8 +3057,12 @@ func (udt UDTTypeInfo) Unmarshal(data []byte, value interface{}) error {
 			}
 		}
 
-		if !f.IsValid() || !f.CanAddr() {
-			return unmarshalErrorf("cannot unmarshal UDT into %T: field %v is not valid", value, e.Name)
+		if !f.CanAddr() || !f.CanInterface() {
+			// CanInterface is false for unexported fields even when the
+			// parent value is addressable; calling Addr().Interface() on
+			// such a field would panic, so reject the destination type
+			// rather than crash.
+			return unmarshalErrorf("cannot unmarshal UDT into %T: field %v is not exported or addressable", value, e.Name)
 		}
 
 		fk := f.Addr().Interface()
@@ -3037,8 +3074,14 @@ func (udt UDTTypeInfo) Unmarshal(data []byte, value interface{}) error {
 	return nil
 }
 
-// Unmarshals data into map and store its pointer in the dstMap.
+// unmarshalIntoMap decodes a UDT body into the map pointed to by dstMap.
+// dstMap must be non-nil; calling with a typed-nil pointer is a programming
+// error and returns an UnmarshalError rather than panicking. On NULL input
+// data the map is set to nil; otherwise a fresh map is allocated.
 func (udt UDTTypeInfo) unmarshalIntoMap(data []byte, dstMap *map[string]interface{}) error {
+	if dstMap == nil {
+		return unmarshalErrorf("cannot unmarshal UDT into nil *map[string]interface{}")
+	}
 	if data == nil {
 		*dstMap = nil
 		return nil
@@ -3055,8 +3098,11 @@ func (udt UDTTypeInfo) unmarshalIntoMap(data []byte, dstMap *map[string]interfac
 			return unmarshalErrorf("can not unmarshal UDT: field [%d]%s: unexpected eof", id, e.Name)
 		}
 
-		var p []byte
-		p, data = readBytes(data)
+		p, rest, rbErr := readBytes(data)
+		if rbErr != nil {
+			return unmarshalErrorf("can not unmarshal UDT: field [%d]%s: %s", id, e.Name, rbErr.Error())
+		}
+		data = rest
 
 		v := reflect.New(reflect.TypeOf(e.Type.Zero()))
 		if err := Unmarshal(e.Type, p, v.Interface()); err != nil {

@@ -257,6 +257,206 @@ func TestMapScan_Varint_NullThenNonNull(t *testing.T) {
 	}
 }
 
+// buildUDTBody serializes the body of a UDT value (the concatenated
+// per-field [int32 len][bytes] entries; the outer [int32 totalLen]
+// frame is added by makeIterFromRows just like for any other column).
+func buildUDTBody(fields ...[]byte) []byte {
+	var buf []byte
+	for _, f := range fields {
+		if f == nil {
+			// per-field NULL: length = -1
+			buf = append(buf, 0xFF, 0xFF, 0xFF, 0xFF)
+			continue
+		}
+		n := int32(len(f))
+		buf = append(buf, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+		buf = append(buf, f...)
+	}
+	return buf
+}
+
+// UDT scanned via MapScan must yield a populated map, not the legacy
+// empty-stub map that was returned before CASSGO-115. With the per-row
+// cache reset in place, this also verifies that successive rows produce
+// distinct underlying maps so previously-returned rows are not mutated.
+func TestMapScan_UDT_PopulatedMapDistinctAcrossRows(t *testing.T) {
+	udt := UDTTypeInfo{
+		Name:     "test_udt",
+		Keyspace: "test_ks",
+		Elements: []UDTField{
+			{Name: "first", Type: varcharLikeTypeInfo{typ: TypeAscii}},
+			{Name: "second", Type: smallIntTypeInfo{}},
+		},
+	}
+	cols := []ColumnInfo{{Name: "u", TypeInfo: udt}}
+
+	row1 := buildUDTBody([]byte("alpha"), []byte("\x00\x01"))   // first=alpha second=1
+	row2 := buildUDTBody([]byte("beta"), []byte("\x00\x02"))    // first=beta second=2
+	iter := makeIterFromRows(cols, [][][]byte{{row1}, {row2}})
+
+	m1 := make(map[string]interface{})
+	if !iter.MapScan(m1) {
+		t.Fatalf("row 1 MapScan failed: %v", iter.err)
+	}
+	u1, ok := m1["u"].(map[string]interface{})
+	if !ok || u1 == nil {
+		t.Fatalf("row 1 udt: want map[string]interface{}, got %T %v", m1["u"], m1["u"])
+	}
+	if u1["first"] != "alpha" {
+		t.Errorf("row 1 first: got %v, want alpha", u1["first"])
+	}
+	if u1["second"] != int16(1) {
+		t.Errorf("row 1 second: got %v (%T), want int16(1)", u1["second"], u1["second"])
+	}
+
+	m2 := make(map[string]interface{})
+	if !iter.MapScan(m2) {
+		t.Fatalf("row 2 MapScan failed: %v", iter.err)
+	}
+	u2 := m2["u"].(map[string]interface{})
+
+	// Distinct maps: row 1's map must not have been mutated.
+	if &u1 == &u2 { // address-of map header (not meaningful, kept for clarity)
+		t.Errorf("row 1 and row 2 returned the same map header")
+	}
+	if u1["first"] != "alpha" || u1["second"] != int16(1) {
+		t.Errorf("row 1 was mutated by row 2: %v", u1)
+	}
+	if u2["first"] != "beta" {
+		t.Errorf("row 2 first: got %v, want beta", u2["first"])
+	}
+	if u2["second"] != int16(2) {
+		t.Errorf("row 2 second: got %v (%T), want int16(2)", u2["second"], u2["second"])
+	}
+}
+
+// NULL UDT followed by a non-NULL UDT must populate the second row's map
+// correctly without leaking state from the NULL row or panicking. The
+// reflect path's interface-null branch writes a typed nil map back into
+// the cache slot; the per-row Zero() reset (which also produces a typed
+// nil map for UDT) keeps the next row on the regular *interface{} path.
+func TestMapScan_UDT_NullThenNonNull(t *testing.T) {
+	udt := UDTTypeInfo{
+		Name:     "test_udt",
+		Keyspace: "test_ks",
+		Elements: []UDTField{
+			{Name: "first", Type: varcharLikeTypeInfo{typ: TypeAscii}},
+			{Name: "second", Type: smallIntTypeInfo{}},
+		},
+	}
+	cols := []ColumnInfo{{Name: "u", TypeInfo: udt}}
+
+	row2 := buildUDTBody([]byte("after_null"), []byte("\x00\x07"))
+	iter := makeIterFromRows(cols, [][][]byte{{nil}, {row2}})
+
+	m1 := make(map[string]interface{})
+	if !iter.MapScan(m1) {
+		t.Fatalf("row 1 (NULL) MapScan failed: %v", iter.err)
+	}
+	// NULL UDT can surface as either nil map or absent key depending on which
+	// branch handles it; both are acceptable as long as no panic occurs.
+	if v, ok := m1["u"].(map[string]interface{}); ok && v != nil {
+		t.Errorf("row 1 (NULL) udt should be nil map; got %v", v)
+	}
+
+	m2 := make(map[string]interface{})
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("row 2 panicked: %v", r)
+		}
+	}()
+	if !iter.MapScan(m2) {
+		t.Fatalf("row 2 MapScan failed: %v", iter.err)
+	}
+	u2, ok := m2["u"].(map[string]interface{})
+	if !ok || u2 == nil {
+		t.Fatalf("row 2 udt should be a populated map; got %T %v", m2["u"], m2["u"])
+	}
+	if u2["first"] != "after_null" {
+		t.Errorf("row 2 first: got %v, want after_null", u2["first"])
+	}
+	if u2["second"] != int16(7) {
+		t.Errorf("row 2 second: got %v (%T), want int16(7)", u2["second"], u2["second"])
+	}
+}
+
+// UDT into a typed-nil *map[string]interface{} must return an error, not
+// panic. Symmetric to the *interface{} guard upstream added in CASSGO-115.
+func TestUDT_Unmarshal_NilMapPointer_ReturnsError(t *testing.T) {
+	udt := UDTTypeInfo{
+		Name:     "test_udt",
+		Keyspace: "test_ks",
+		Elements: []UDTField{
+			{Name: "first", Type: varcharLikeTypeInfo{typ: TypeAscii}},
+		},
+	}
+	data := buildUDTBody([]byte("x"))
+
+	var dst *map[string]interface{}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("expected error, got panic: %v", r)
+		}
+	}()
+	err := Unmarshal(udt, data, dst)
+	if err == nil {
+		t.Fatal("expected error for nil *map[string]interface{}, got nil")
+	}
+}
+
+// UDT body whose declared field length exceeds the remaining buffer must
+// return an error from readBytes, not panic with index out of range.
+func TestUDT_Unmarshal_TruncatedPayload_ReturnsError(t *testing.T) {
+	udt := UDTTypeInfo{
+		Name:     "test_udt",
+		Keyspace: "test_ks",
+		Elements: []UDTField{
+			{Name: "first", Type: varcharLikeTypeInfo{typ: TypeAscii}},
+		},
+	}
+	// Length prefix claims 100 bytes but body only has 5.
+	corrupt := []byte{0x00, 0x00, 0x00, 0x64, 'h', 'e', 'l', 'l', 'o'}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("expected error, got panic: %v", r)
+		}
+	}()
+	var dst map[string]interface{}
+	err := Unmarshal(udt, corrupt, &dst)
+	if err == nil {
+		t.Fatal("expected error for truncated UDT payload, got nil")
+	}
+}
+
+// UDT into a struct whose unexported field name matches a UDT element name
+// must return an error, not panic on Addr().Interface().
+func TestUDT_Unmarshal_UnexportedFieldMatch_ReturnsError(t *testing.T) {
+	udt := UDTTypeInfo{
+		Name:     "test_udt",
+		Keyspace: "test_ks",
+		Elements: []UDTField{
+			{Name: "first", Type: varcharLikeTypeInfo{typ: TypeAscii}},
+		},
+	}
+	data := buildUDTBody([]byte("x"))
+
+	type withUnexported struct {
+		first string // lowercase: unexported, name matches the UDT element
+	}
+	var dst withUnexported
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("expected error, got panic: %v", r)
+		}
+	}()
+	err := Unmarshal(udt, data, &dst)
+	if err == nil {
+		t.Fatal("expected error for unexported field, got nil")
+	}
+}
+
 // Regression: NULL followed by a non-NULL decimal must not panic. A buggy
 // cache that stores a typed-nil *inf.Dec after the NULL would cause the
 // type handler to dereference a nil pointer (*v = *inf.NewDecBig(...)).
