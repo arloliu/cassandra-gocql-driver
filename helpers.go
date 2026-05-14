@@ -245,6 +245,9 @@ func (iter *Iter) MapScan(m map[string]interface{}) bool {
 }
 
 func copyBytes(p []byte) []byte {
+	if p == nil {
+		return nil
+	}
 	b := make([]byte, len(p))
 	copy(b, p)
 	return b
