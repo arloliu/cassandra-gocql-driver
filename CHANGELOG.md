@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Remote-tier iteration in `TokenAwareHostPolicy` with `NonLocalReplicasFallback` no longer halts permanently the first time it encounters an empty intermediate tier. Previously, a `RackAwareRoundRobinPolicy` fallback could silently drop tier-2 replicas if no tier-1 replicas were present in a given token's replica set.
 
+## [2.1.1]
+
+### Fixed
+
+- Iter.MapScan is unable to scan data of user-defined types fix (CASSGO-115)
+
 ## [2.1.0]
 
 ### Added
