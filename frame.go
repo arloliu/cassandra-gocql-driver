@@ -316,6 +316,26 @@ const (
 
 var ErrFrameTooBig = errors.New("frame length is bigger than the maximum allowed")
 
+// maxFrameElementCount caps the number of elements the framer will pre-allocate
+// for a single peer-controlled count (column lists, pkey indices, error maps,
+// string lists, etc.). A maxFrameSize-bytes frame body cannot encode more than
+// ~maxFrameSize elements (each element is at least one byte on the wire), so
+// 1<<20 is generous in absolute terms while ruling out catastrophic allocations
+// from a hostile or buggy peer sending a 4-byte length of MaxInt32.
+const maxFrameElementCount = 1 << 20
+
+// checkBoundedCount validates a peer-supplied element count. Use at every site
+// that does make([]T, n) (or equivalent) with n sourced from the wire.
+func checkBoundedCount(n int, kind string) error {
+	if n < 0 {
+		return fmt.Errorf("gocql: negative %s count in frame: %d", kind, n)
+	}
+	if n > maxFrameElementCount {
+		return fmt.Errorf("gocql: %s count %d exceeds maximum %d", kind, n, maxFrameElementCount)
+	}
+	return nil
+}
+
 const frameHeadSize = 9
 
 func readInt(p []byte) int32 {
@@ -568,7 +588,9 @@ func (f *framer) parseFrame() (frame, error) {
 	}
 
 	if f.header.flags&flagTracing == flagTracing {
-		f.readTrace()
+		if err := f.readTrace(); err != nil {
+			return nil, err
+		}
 	}
 
 	var err error
@@ -856,6 +878,9 @@ func (f *framer) readErrorMap() (ErrorMap, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkBoundedCount(numErrs, "error map entry"); err != nil {
+		return nil, err
+	}
 	errMap := make(ErrorMap, numErrs)
 	for i := 0; i < numErrs; i++ {
 		ip, err := f.readInetAdressOnly()
@@ -927,15 +952,16 @@ func (f *framer) writeTo(w io.Writer) error {
 	return err
 }
 
-func (f *framer) readTrace() {
+func (f *framer) readTrace() error {
 	if len(f.buf) < 16 {
-		panic(fmt.Errorf("not enough bytes in buffer to read trace uuid require 16 got: %d", len(f.buf)))
+		return fmt.Errorf("gocql: not enough bytes in buffer to read trace uuid: require 16 got %d", len(f.buf))
 	}
 	if len(f.traceID) != 16 {
 		f.traceID = make([]byte, 16)
 	}
 	copy(f.traceID, f.buf[:16])
 	f.buf = f.buf[16:]
+	return nil
 }
 
 type readyFrame struct {
@@ -1165,14 +1191,17 @@ func (f *framer) parsePreparedMetadata() (preparedMetadata, error) {
 	if err != nil {
 		return preparedMetadata{}, err
 	}
-	if meta.colCount < 0 {
-		return preparedMetadata{}, fmt.Errorf("received negative column count: %d", meta.colCount)
+	if err := checkBoundedCount(meta.colCount, "column"); err != nil {
+		return preparedMetadata{}, err
 	}
 	meta.actualColCount = meta.colCount
 
 	if f.proto >= protoVersion4 {
 		pkeyCount, err := f.readInt()
 		if err != nil {
+			return preparedMetadata{}, err
+		}
+		if err := checkBoundedCount(pkeyCount, "partition key"); err != nil {
 			return preparedMetadata{}, err
 		}
 		pkeys := make([]int, pkeyCount)
@@ -1312,8 +1341,8 @@ func (f *framer) parseResultMetadata() (resultMetadata, error) {
 	if err != nil {
 		return resultMetadata{}, err
 	}
-	if meta.colCount < 0 {
-		return resultMetadata{}, fmt.Errorf("received negative column count: %d", meta.colCount)
+	if err := checkBoundedCount(meta.colCount, "column"); err != nil {
+		return resultMetadata{}, err
 	}
 	meta.actualColCount = meta.colCount
 
