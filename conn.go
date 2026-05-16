@@ -731,6 +731,8 @@ func (c *Conn) heartBeat(ctx context.Context) {
 
 		framer, err := c.exec(context.Background(), &writeOptionsFrame{}, nil)
 		if err != nil {
+			// c.exec failures are write/network errors. These DO indicate
+			// the connection may be unhealthy; count toward the threshold.
 			failures++
 			continue
 		}
@@ -738,19 +740,34 @@ func (c *Conn) heartBeat(ctx context.Context) {
 		resp, err := framer.parseFrame()
 		if err != nil {
 			framer.release()
-			// invalid frame
-			failures++
+			// Parse errors here mean we read a complete frame off the wire
+			// but failed to decode it (corrupt body, protocol mismatch,
+			// etc.). These are far more likely transient than indicative
+			// of a dead connection — the wire round-trip itself succeeded.
+			// Log at Debug and DO NOT count toward the failure threshold;
+			// otherwise 5 transient parse glitches in 25s would
+			// unnecessarily flap the connection.
+			c.logger.Debug("Heartbeat parse error ignored (transient).",
+				NewLogFieldString("host_id", c.host.HostID()),
+				NewLogFieldError("err", err))
 			continue
 		}
 		framer.release()
 
-		switch resp.(type) {
+		switch r := resp.(type) {
 		case *supportedFrame:
 			// Everything ok
 			sleepTime = 5 * time.Second
 			failures = 0
 		case error:
-			// TODO: should we do something here?
+			// Server replied with an error frame to OPTIONS. Operationally
+			// relevant (e.g. server-side problem, malformed request) but
+			// not necessarily a sign that the connection itself is dead.
+			// Log and continue without incrementing failures, same as the
+			// parse-error path above.
+			c.logger.Debug("Heartbeat received error response.",
+				NewLogFieldString("host_id", c.host.HostID()),
+				NewLogFieldError("err", r))
 		default:
 			panic(fmt.Sprintf("gocql: unknown frame in response to options: %T", resp))
 		}

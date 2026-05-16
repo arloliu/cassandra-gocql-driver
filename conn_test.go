@@ -1057,6 +1057,13 @@ type newTestServerOpts struct {
 
 	customRequestHandler       func(srv *TestServer, reqFrame, respFrame *framer) error
 	dontFailOnProtocolMismatch bool
+
+	// optionsRespFn, when set, may override the default opOptions
+	// response generation. The hook returns true if it wrote a
+	// response; false makes the server fall through to the default
+	// opSupported reply. This lets tests intercept *some* opOptions
+	// (e.g. heartbeats) while allowing startup negotiation to succeed.
+	optionsRespFn func(respFrame *framer, stream int) bool
 }
 
 func (nts newTestServerOpts) newServer(t testing.TB, ctx context.Context) *TestServer {
@@ -1084,6 +1091,7 @@ func (nts newTestServerOpts) newServer(t testing.TB, ctx context.Context) *TestS
 
 		customRequestHandler:       nts.customRequestHandler,
 		dontFailOnProtocolMismatch: nts.dontFailOnProtocolMismatch,
+		optionsRespFn:              nts.optionsRespFn,
 	}
 
 	go srv.closeWatch()
@@ -1152,6 +1160,11 @@ type TestServer struct {
 	// customRequestHandler allows overriding the default request handling for testing purposes.
 	customRequestHandler       func(srv *TestServer, reqFrame, respFrame *framer) error
 	dontFailOnProtocolMismatch bool
+
+	// optionsRespFn lets tests override only the opOptions response while
+	// preserving all other default handling. Returns true if it wrote a
+	// response; false to fall through to the default opSupported reply.
+	optionsRespFn func(respFrame *framer, stream int) bool
 }
 
 func (srv *TestServer) closeWatch() {
@@ -1271,6 +1284,9 @@ func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, star
 		}
 		respFrame.writeHeader(0, opReady, head.stream)
 	case opOptions:
+		if srv.optionsRespFn != nil && srv.optionsRespFn(respFrame, head.stream) {
+			break
+		}
 		respFrame.writeHeader(0, opSupported, head.stream)
 		respFrame.writeShort(0)
 	case opQuery:
