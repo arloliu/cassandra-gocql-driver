@@ -1343,6 +1343,21 @@ func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, star
 			name = name[:n]
 		}
 		switch strings.ToLower(name) {
+		case "always-unprep":
+			// Returns id=99 which is intentionally NOT 1 or 2, so the
+			// opExecute default branch will respond with
+			// ErrCodeUnprepared. This drives the re-prepare retry loop
+			// in Conn.executeQuery — used by the recursion-cap test.
+			respFrame.writeHeader(0, opResult, head.stream)
+			respFrame.writeInt(resultKindPrepared)
+			respFrame.writeShortBytes(binary.BigEndian.AppendUint64(nil, 99))
+			respFrame.writeInt(0)
+			respFrame.writeInt(0)
+			if srv.protocol >= protoVersion4 {
+				respFrame.writeInt(0)
+			}
+			respFrame.writeInt(int32(flagNoMetaData))
+			respFrame.writeInt(0)
 		case "nometadata":
 			respFrame.writeHeader(0, opResult, head.stream)
 			respFrame.writeInt(resultKindPrepared)
