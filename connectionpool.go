@@ -635,24 +635,28 @@ func (pool *hostConnPool) connect() (err error) {
 	// try to connect
 	var conn *Conn
 	reconnectionPolicy := pool.session.cfg.ReconnectionPolicy
-	for i := 0; i < reconnectionPolicy.GetMaxRetries(); i++ {
+	maxRetries := reconnectionPolicy.GetMaxRetries()
+	for i := 0; i < maxRetries; i++ {
 		conn, err = pool.session.connect(pool.session.ctx, pool.host, pool)
 		if err == nil {
 			break
-		}
-		if opErr, isOpErr := err.(*net.OpError); isOpErr {
-			// if the error is not a temporary error (ex: network unreachable) don't
-			//  retry
-			if !opErr.Temporary() {
-				break
-			}
 		}
 		pool.logger.Warning("Pool failed to connect to host. Reconnecting according to the reconnection policy.",
 			NewLogFieldIP("host", pool.host.ConnectAddress()),
 			NewLogFieldString("host_id", pool.host.HostID()),
 			NewLogFieldError("err", err),
 			NewLogFieldString("reconnectionPolicy", fmt.Sprintf("%T", reconnectionPolicy)))
-		time.Sleep(reconnectionPolicy.GetInterval(i))
+		// Skip the inter-attempt sleep after the final attempt — no
+		// further retry will run, so waiting only adds latency before
+		// the error surfaces.
+		if i+1 >= maxRetries {
+			break
+		}
+		select {
+		case <-time.After(reconnectionPolicy.GetInterval(i)):
+		case <-pool.session.ctx.Done():
+			return pool.session.ctx.Err()
+		}
 	}
 
 	if err != nil {

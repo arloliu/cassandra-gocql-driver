@@ -70,6 +70,18 @@ func (l *channelLogger) hasLeakWarning() (string, bool) {
 	return "", false
 }
 
+func (l *channelLogger) countWarnings(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, m := range l.captured {
+		if strings.Contains(m, substr) {
+			n++
+		}
+	}
+	return n
+}
+
 // runQueryAndDropIter executes one query and drops the iter without
 // calling Close. Wrapping this in its own function ensures the local
 // variable is not kept alive by the test function's stack frame.
