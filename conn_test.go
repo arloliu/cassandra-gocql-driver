@@ -944,7 +944,7 @@ func TestWriteCoalescing_WriteAfterClose(t *testing.T) {
 		server.Close()
 		close(done)
 	}()
-	w := newWriteCoalescer(client, 0, 5*time.Millisecond, ctx.Done())
+	w := newWriteCoalescer(client, 0, 5*time.Millisecond, ctx.Done(), nil, nil)
 
 	// ensure 1 write works
 	if _, err := w.writeContext(context.Background(), []byte("one")); err != nil {

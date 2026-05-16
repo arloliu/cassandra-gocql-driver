@@ -205,6 +205,14 @@ type Conn struct {
 	cancel context.CancelFunc
 
 	logger StructuredLogger
+
+	// Per-instance test hooks for goroutine panic-recovery tests. Set by
+	// tests to a panicking func to exercise the corresponding recover
+	// wrapper. Default nil (no-op).
+	testServePanicAt       func()
+	testHeartBeatPanicAt   func()
+	testStartupRecvPanicAt func()
+	testStartupSendPanicAt func()
 }
 
 // connect establishes a connection to a Cassandra node using session's connection config.
@@ -318,7 +326,22 @@ func (c *Conn) init(ctx context.Context, dialedHost *DialedHost) error {
 
 	// dont coalesce startup frames
 	if c.session.cfg.WriteCoalesceWaitTime > 0 && !c.cfg.disableCoalesce && !dialedHost.DisableCoalesce {
-		c.w = newWriteCoalescer(dialedHost.Conn, c.writeTimeout, c.session.cfg.WriteCoalesceWaitTime, ctx.Done())
+		c.w = newWriteCoalescer(dialedHost.Conn, c.writeTimeout, c.session.cfg.WriteCoalesceWaitTime,
+			ctx.Done(), c.logger,
+			func(err error, pending []chan<- writeResult) {
+				// Drain pending writeContext callers with the panic error
+				// so they unblock immediately. Result chans are buffer-1;
+				// flush() may already have sent to some (then resultChans
+				// is reset to nil — see writeFlusherImpl). Use non-blocking
+				// sends so a full chan does not hang recovery.
+				for _, ch := range pending {
+					select {
+					case ch <- writeResult{err: err}:
+					default:
+					}
+				}
+				c.closeWithError(err)
+			})
 	}
 
 	go c.serve(ctx)
@@ -356,6 +379,22 @@ func (s *startupCoordinator) setupConn(ctx context.Context) error {
 
 	startupErr := make(chan error)
 	go func() {
+		// Push panic-as-error into startupErr so setupConn unblocks
+		// immediately instead of waiting until ctx timeout. The select
+		// with <-ctx.Done() handles the case where setupConn has already
+		// moved on (likely because it observed an error from the other
+		// goroutine first).
+		defer recoverGoroutine(s.conn.logger, "Conn.startup.recvPump", func(err error) {
+			select {
+			case startupErr <- err:
+			case <-ctx.Done():
+			}
+		})
+
+		if s.conn.testStartupRecvPanicAt != nil {
+			s.conn.testStartupRecvPanicAt()
+		}
+
 		for range s.frameTicker {
 			err := s.conn.recv(ctx, startupCompleted.Load())
 			if err != nil {
@@ -371,6 +410,17 @@ func (s *startupCoordinator) setupConn(ctx context.Context) error {
 
 	go func() {
 		defer close(s.frameTicker)
+		defer recoverGoroutine(s.conn.logger, "Conn.startup.optionsSender", func(err error) {
+			select {
+			case startupErr <- err:
+			case <-ctx.Done():
+			}
+		})
+
+		if s.conn.testStartupSendPanicAt != nil {
+			s.conn.testStartupSendPanicAt()
+		}
+
 		err := s.options(ctx, startupCompleted)
 		select {
 		case startupErr <- err:
@@ -615,6 +665,14 @@ func (c *Conn) Close() {
 // to execute any queries. This method runs as long as the connection is
 // open and is therefore usually called in a separate goroutine.
 func (c *Conn) serve(ctx context.Context) {
+	defer recoverGoroutine(c.logger, "Conn.serve", func(err error) {
+		c.closeWithError(err)
+	})
+
+	if c.testServePanicAt != nil {
+		c.testServePanicAt()
+	}
+
 	var err error
 	for err == nil {
 		err = c.recv(ctx, true)
@@ -643,6 +701,14 @@ func (p *protocolError) Error() string {
 }
 
 func (c *Conn) heartBeat(ctx context.Context) {
+	defer recoverGoroutine(c.logger, "Conn.heartBeat", func(err error) {
+		c.closeWithError(err)
+	})
+
+	if c.testHeartBeatPanicAt != nil {
+		c.testHeartBeatPanicAt()
+	}
+
 	sleepTime := 1 * time.Second
 	timer := time.NewTimer(sleepTime)
 	defer timer.Stop()
@@ -740,7 +806,10 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 			framer.release()
 			return err
 		}
-		go c.session.handleEvent(framer)
+		go func() {
+			defer recoverGoroutine(c.logger, "Session.handleEvent", nil)
+			c.session.handleEvent(framer)
+		}()
 		return nil
 	} else if head.stream <= 0 {
 		// reserved stream that we dont use, probably due to a protocol error
@@ -1063,13 +1132,16 @@ func (c *deadlineContextWriter) writeContext(ctx context.Context, p []byte) (int
 }
 
 func newWriteCoalescer(conn deadlineWriter, writeTimeout, coalesceDuration time.Duration,
-	quit <-chan struct{},
+	quit <-chan struct{}, logger StructuredLogger,
+	onPanic func(err error, pending []chan<- writeResult),
 ) *writeCoalescer {
 	wc := &writeCoalescer{
 		writeCh: make(chan writeRequest),
 		c:       conn,
 		quit:    quit,
 		timeout: writeTimeout,
+		logger:  logger,
+		onPanic: onPanic,
 	}
 	go wc.writeFlusher(coalesceDuration)
 	return wc
@@ -1085,8 +1157,12 @@ type writeCoalescer struct {
 
 	timeout time.Duration
 
-	testEnqueuedHook func()
-	testFlushedHook  func()
+	logger  StructuredLogger
+	onPanic func(err error, pending []chan<- writeResult)
+
+	testEnqueuedHook   func()
+	testFlushedHook    func()
+	testFlusherPanicAt func()
 }
 
 type writeRequest struct {
@@ -1142,6 +1218,23 @@ func (w *writeCoalescer) writeFlusherImpl(timerC <-chan time.Time, resetTimer fu
 
 	var buffers net.Buffers
 	var resultChans []chan<- writeResult
+
+	// Inline recover (not recoverGoroutine) so we can capture the
+	// up-to-the-moment value of resultChans for the panic teardown. Go's
+	// recover() only works when called directly by a deferred function.
+	defer func() {
+		if r := recover(); r != nil {
+			handleRecoveredPanic(w.logger, "writeCoalescer.flusher", r, func(err error) {
+				if w.onPanic != nil {
+					w.onPanic(err, resultChans)
+				}
+			})
+		}
+	}()
+
+	if w.testFlusherPanicAt != nil {
+		w.testFlusherPanicAt()
+	}
 
 	for {
 		select {
