@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -841,7 +842,9 @@ func (b *Batch) Iter() *Iter { return b.IterContext(b.context) }
 // IterContext executes a batch operation with the provided context and returns an Iter object
 // that can be used to access properties related to the execution like Iter.Attempts and Iter.Latency
 func (b *Batch) IterContext(ctx context.Context) *Iter {
-	return b.session.executeBatch(b, ctx)
+	iter := b.session.executeBatch(b, ctx)
+	iter.attachLeakDetector(b.session.logger)
+	return iter
 }
 
 func (s *Session) executeBatch(batch *Batch, ctx context.Context) *Iter {
@@ -1407,7 +1410,9 @@ func (q *Query) IterContext(ctx context.Context) *Iter {
 	}
 
 	internalQry := newInternalQuery(q, ctx)
-	return q.session.executeQuery(internalQry)
+	iter := q.session.executeQuery(internalQry)
+	iter.attachLeakDetector(q.session.logger)
+	return iter
 }
 
 func (q *Query) iterInternal(c *Conn, ctx context.Context) *Iter {
@@ -1438,6 +1443,7 @@ func (q *Query) MapScan(m map[string]interface{}) error {
 func (q *Query) MapScanContext(ctx context.Context, m map[string]interface{}) error {
 	iter := q.IterContext(ctx)
 	if err := iter.checkErrAndNotFound(); err != nil {
+		iter.Close()
 		return err
 	}
 	iter.MapScan(m)
@@ -1461,6 +1467,7 @@ func (q *Query) Scan(dest ...interface{}) error {
 func (q *Query) ScanContext(ctx context.Context, dest ...interface{}) error {
 	iter := q.IterContext(ctx)
 	if err := iter.checkErrAndNotFound(); err != nil {
+		iter.Close()
 		return err
 	}
 	iter.Scan(dest...)
@@ -1495,6 +1502,7 @@ func (q *Query) ScanCASContext(ctx context.Context, dest ...interface{}) (applie
 	q.disableSkipMetadata = true
 	iter := q.IterContext(ctx)
 	if err := iter.checkErrAndNotFound(); err != nil {
+		iter.Close()
 		return false, err
 	}
 	if len(iter.Columns()) > 1 {
@@ -1530,10 +1538,12 @@ func (q *Query) MapScanCASContext(ctx context.Context, dest map[string]interface
 	q.disableSkipMetadata = true
 	iter := q.IterContext(ctx)
 	if err := iter.checkErrAndNotFound(); err != nil {
+		iter.Close()
 		return false, err
 	}
 	iter.MapScan(dest)
 	if iter.err != nil {
+		iter.Close()
 		return false, iter.err
 	}
 	// check if [applied] was returned, otherwise it might not be CAS
@@ -1626,6 +1636,29 @@ func newIter(metrics *queryMetrics, keyspace string, routingInfo *queryRoutingIn
 	return &Iter{metrics: metrics, keyspace: keyspace, routingInfo: routingInfo, getKeyspace: getKeyspace}
 }
 
+// attachLeakDetector arms a finalizer that warns and releases the framer
+// if the Iter is garbage-collected without Close() being called. Close()
+// clears the finalizer, so the warning fires only for genuine misuse.
+//
+// The finalizer is set ONLY on the user-facing iter pointer (returned
+// from Query.IterContext / Batch.IterContext). It must NOT be set on
+// the inner iter produced by nextIter.fetch() during paging, because
+// Scan() does *iter = *iter.next.fetch() — a struct copy that shares
+// the framer pointer. A finalizer on the inner iter would fire after
+// the swap and double-release a framer still in use by the outer iter.
+func (iter *Iter) attachLeakDetector(logger StructuredLogger) {
+	if iter == nil || logger == nil || iter.framer == nil {
+		return
+	}
+	runtime.SetFinalizer(iter, func(i *Iter) {
+		if atomic.LoadInt32(&i.closed) != 0 {
+			return
+		}
+		logger.Warning("gocql: Iter was garbage-collected without Close() — possible resource leak; always defer iter.Close() after Iter()/IterContext()")
+		_ = i.Close()
+	})
+}
+
 // Host returns the host which the statement was sent to.
 func (iter *Iter) Host() *HostInfo {
 	return iter.host
@@ -1704,6 +1737,12 @@ func (is *iterScanner) Next() bool {
 
 	if iter.pos >= iter.numRows {
 		if iter.next != nil {
+			// Close the outgoing iter before reassigning is.iter to the
+			// next page. This (a) returns the previous page's framer to
+			// the pool, and (b) clears any leak-detector finalizer on
+			// the user-facing iter so it does not warn after a normal
+			// scanner advance across page boundaries.
+			iter.Close()
 			is.iter = iter.next.fetch()
 			return is.Next()
 		}
@@ -1951,6 +1990,9 @@ func (iter *Iter) Close() error {
 		// last row's values, including possibly large strings or blob
 		// []byte — are not held alive by a long-lived closed Iter.
 		iter.mapScanCache = nil
+		// Clear the leak-detector finalizer (if any). Safe to call even
+		// when no finalizer was registered (e.g. newErrIter path).
+		runtime.SetFinalizer(iter, nil)
 	}
 
 	return iter.err
