@@ -546,7 +546,7 @@ func (f *framer) readFrame(r io.Reader, head *frameHeader) error {
 		// need to free up the connection to be used again
 		_, err := io.CopyN(ioutil.Discard, r, int64(head.length))
 		if err != nil {
-			return fmt.Errorf("error whilst trying to discard frame with invalid length: %v", err)
+			return fmt.Errorf("error whilst trying to discard frame with invalid length: %w", err)
 		}
 		return ErrFrameTooBig
 	}
@@ -561,7 +561,7 @@ func (f *framer) readFrame(r io.Reader, head *frameHeader) error {
 	// assume the underlying reader takes care of timeouts and retries
 	n, err := io.ReadFull(r, f.buf)
 	if err != nil {
-		return fmt.Errorf("unable to read frame body: read %d/%d bytes: %v", n, head.length, err)
+		return fmt.Errorf("unable to read frame body: read %d/%d bytes: %w", n, head.length, err)
 	}
 
 	if f.proto < protoVersion5 && head.flags&flagCompress == flagCompress {

@@ -1709,15 +1709,15 @@ func (durationTypeInfo) Unmarshal(data []byte, value interface{}) error {
 func decVints(data []byte) (int32, int32, int64, error) {
 	month, i, err := decVint(data, 0)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to extract month: %s", err.Error())
+		return 0, 0, 0, fmt.Errorf("failed to extract month: %w", err)
 	}
 	days, i, err := decVint(data, i)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to extract days: %s", err.Error())
+		return 0, 0, 0, fmt.Errorf("failed to extract days: %w", err)
 	}
 	nanos, _, err := decVint(data, i)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to extract nanoseconds: %s", err.Error())
+		return 0, 0, 0, fmt.Errorf("failed to extract nanoseconds: %w", err)
 	}
 	return int32(month), int32(days), nanos, err
 }

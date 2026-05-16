@@ -1110,7 +1110,7 @@ func getKeyspaceMetadata(session *Session, keyspaceName string) (*KeyspaceMetada
 		return nil, err
 	}
 	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("error querying keyspaces schema: %v", err)
+		return nil, fmt.Errorf("error querying keyspaces schema: %w", err)
 	}
 	return keyspaces[keyspaceName], nil
 }
@@ -1135,7 +1135,7 @@ func getAllKeyspaceMetadata(session *Session) (map[string]*KeyspaceMetadata, err
 		return nil, err
 	}
 	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("error querying keyspaces schema: %v", err)
+		return nil, fmt.Errorf("error querying keyspaces schema: %w", err)
 	}
 
 	return keyspaces, nil
@@ -1270,7 +1270,7 @@ func getTableMetadata(session *Session, keyspaceName string) ([]TableMetadata, e
 
 	err := iter.Close()
 	if err != nil && err != ErrNotFound {
-		return nil, fmt.Errorf("error querying table schema: %v", err)
+		return nil, fmt.Errorf("error querying table schema: %w", err)
 	}
 
 	return tables, nil
@@ -1341,7 +1341,7 @@ func getAllTablesMetadata(session *Session) (map[string][]TableMetadata, error) 
 	}
 	err := iter.Close()
 	if err != nil && err != ErrNotFound {
-		return nil, fmt.Errorf("error querying table schema: %v", err)
+		return nil, fmt.Errorf("error querying table schema: %w", err)
 	}
 
 	return tablesByKeyspace, nil
@@ -1622,7 +1622,7 @@ func getColumnMetadata(session *Session, keyspaceName string) ([]ColumnMetadata,
 	}
 
 	if err != nil && err != ErrNotFound {
-		return nil, fmt.Errorf("error querying column schema: %v", err)
+		return nil, fmt.Errorf("error querying column schema: %w", err)
 	}
 
 	return columns, nil
@@ -1645,7 +1645,7 @@ func getAllColumnMetadata(session *Session) (map[string][]ColumnMetadata, error)
 	}
 
 	if err != nil && err != ErrNotFound {
-		return nil, fmt.Errorf("error querying column schema: %v", err)
+		return nil, fmt.Errorf("error querying column schema: %w", err)
 	}
 
 	return columns, nil

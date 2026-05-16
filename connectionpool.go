@@ -77,7 +77,7 @@ func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
 
 		pem, err := ioutil.ReadFile(sslOpts.CaPath)
 		if err != nil {
-			return nil, fmt.Errorf("connectionpool: unable to open CA certs: %v", err)
+			return nil, fmt.Errorf("connectionpool: unable to open CA certs: %w", err)
 		}
 
 		if !tlsConfig.RootCAs.AppendCertsFromPEM(pem) {
@@ -88,7 +88,7 @@ func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
 	if sslOpts.CertPath != "" || sslOpts.KeyPath != "" {
 		mycert, err := tls.LoadX509KeyPair(sslOpts.CertPath, sslOpts.KeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("connectionpool: unable to load X509 key pair: %v", err)
+			return nil, fmt.Errorf("connectionpool: unable to load X509 key pair: %w", err)
 		}
 		tlsConfig.Certificates = append(tlsConfig.Certificates, mycert)
 	}

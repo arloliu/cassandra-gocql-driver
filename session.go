@@ -218,7 +218,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	connCfg, err := connConfig(&s.cfg)
 	if err != nil {
 		// TODO: Return a typed error
-		return nil, fmt.Errorf("gocql: unable to create session: %v", err)
+		return nil, fmt.Errorf("gocql: unable to create session: %w", err)
 	}
 	s.connCfg = connCfg
 
@@ -244,7 +244,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 			return nil, ErrNoConnectionsStarted
 		} else {
 			// TODO(zariel): dont wrap this error in fmt.Errorf, return a typed error
-			return nil, fmt.Errorf("gocql: unable to create session: %v", err)
+			return nil, fmt.Errorf("gocql: unable to create session: %w", err)
 		}
 	}
 
@@ -263,7 +263,7 @@ func (s *Session) init() error {
 		if s.cfg.ProtoVersion == 0 {
 			proto, err := s.control.discoverProtocol(hosts)
 			if err != nil {
-				return fmt.Errorf("unable to discover protocol version: %v", err)
+				return fmt.Errorf("unable to discover protocol version: %w", err)
 			} else if proto == 0 {
 				return errors.New("unable to discovery protocol version")
 			}

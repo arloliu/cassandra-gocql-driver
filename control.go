@@ -298,7 +298,7 @@ func (c *controlConn) connect(hosts []*HostInfo, sessionInit bool) error {
 		conn = nil
 	}
 	if conn == nil {
-		return fmt.Errorf("unable to connect to initial hosts: %v", err)
+		return fmt.Errorf("unable to connect to initial hosts: %w", err)
 	}
 
 	// we could fetch the initial ring here and update initial host data. So that
@@ -346,7 +346,7 @@ func (c *controlConn) setupConn(conn *Conn, sessionInit bool) error {
 	}
 
 	if err := c.registerEvents(conn); err != nil {
-		return fmt.Errorf("register events: %v", err)
+		return fmt.Errorf("register events: %w", err)
 	}
 
 	ch := &connHost{
