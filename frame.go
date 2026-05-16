@@ -1802,7 +1802,7 @@ func (f *framer) parseEventFrame() (frame, error) {
 		// this should work for all versions
 		return f.parseResultSchemaChange()
 	default:
-		panic(fmt.Errorf("gocql: unknown event type: %q", eventType))
+		return nil, fmt.Errorf("gocql: unknown event type: %q", eventType)
 	}
 }
 

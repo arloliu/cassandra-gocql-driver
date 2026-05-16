@@ -180,6 +180,31 @@ func TestReadTrace_TruncatedReturnsError(t *testing.T) {
 	}
 }
 
+// TestParseEventFrame_UnknownTypeReturnsError asserts that a server-sent
+// event frame with an unrecognized event-type string returns an error
+// rather than panicking. The pre-fix behavior was a panic in the
+// per-connection serve() goroutine (via handleEvent), which has no
+// recover() in the driver and would kill the host process.
+func TestParseEventFrame_UnknownTypeReturnsError(t *testing.T) {
+	// Event frame body: a single [string] = short length prefix + ASCII bytes.
+	eventType := "TOTALLY_NEW_EVENT"
+	body := append([]byte{byte(len(eventType) >> 8), byte(len(eventType))}, eventType...)
+
+	f := newTestFramerWithBody(opEvent, body)
+	defer f.release()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("parseFrame panicked on unknown event type: %v", r)
+		}
+	}()
+
+	_, err := f.parseFrame()
+	if err == nil {
+		t.Fatalf("expected error for unknown event type, got nil")
+	}
+}
+
 // TestCheckBoundedCount_NegativeAndOverMax exercises the helper directly so
 // the message format is locked in by a test (callers grep these strings).
 func TestCheckBoundedCount_NegativeAndOverMax(t *testing.T) {
