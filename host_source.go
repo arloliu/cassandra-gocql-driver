@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -928,15 +929,17 @@ type refreshDebouncer struct {
 	quit         chan struct{}
 	done         chan struct{}
 	refreshFn    func() error
+	logger       StructuredLogger
 }
 
-func newRefreshDebouncer(interval time.Duration, refreshFn func() error) *refreshDebouncer {
+func newRefreshDebouncer(interval time.Duration, refreshFn func() error, logger StructuredLogger) *refreshDebouncer {
 	d := &refreshDebouncer{
 		stopped:      false,
 		broadcaster:  nil,
 		refreshNowCh: make(chan struct{}, 1),
 		quit:         make(chan struct{}),
 		done:         make(chan struct{}),
+		logger:       logger,
 		interval:     interval,
 		timer:        time.NewTimer(interval),
 		refreshFn:    refreshFn,
@@ -960,6 +963,16 @@ func (d *refreshDebouncer) debounce() {
 func (d *refreshDebouncer) refreshNow() <-chan error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.stopped {
+		// Debouncer is no longer running (normal stop OR a recovered
+		// flusher panic). Return a pre-resolved listener so the caller
+		// doesn't wait forever; there is no flusher goroutine to
+		// broadcast to it.
+		ch := make(chan error, 1)
+		ch <- errors.New("gocql: refreshDebouncer is stopped")
+		close(ch)
+		return ch
+	}
 	if d.broadcaster == nil {
 		d.broadcaster = newErrorBroadcaster()
 		select {
@@ -973,6 +986,22 @@ func (d *refreshDebouncer) refreshNow() <-chan error {
 
 func (d *refreshDebouncer) flusher() {
 	defer close(d.done)
+	defer recoverGoroutine(d.logger, "refreshDebouncer.flusher", func(err error) {
+		// The flusher is exiting due to a recovered panic. Mark stopped
+		// so future refreshNow() callers fail-fast instead of waiting
+		// forever (the flusher would have broadcast to them on next
+		// refresh, but it's gone). Also broadcast the panic error to any
+		// listener already attached.
+		d.mu.Lock()
+		d.stopped = true
+		curBroadcaster := d.broadcaster
+		d.broadcaster = nil
+		d.mu.Unlock()
+		if curBroadcaster != nil {
+			curBroadcaster.broadcast(err)
+		}
+	})
+
 	for {
 		select {
 		case <-d.refreshNowCh:
@@ -1006,10 +1035,28 @@ func (d *refreshDebouncer) flusher() {
 		d.broadcaster = nil
 		d.mu.Unlock()
 
-		err := d.refreshFn()
-		if curBroadcaster != nil {
-			curBroadcaster.broadcast(err)
-		}
+		// Scope the refresh in an inner func so a panic in refreshFn can
+		// broadcast a panic-error to listeners before propagating up to
+		// the outer recoverGoroutine. Without this, listeners returned
+		// from refreshNow() (host_source.go callers / metadata.go
+		// callers) strand forever. The re-panic with panicWithStack
+		// preserves the original stack for the outer log.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					origStack := debug.Stack()
+					if curBroadcaster != nil {
+						curBroadcaster.broadcast(
+							fmt.Errorf("gocql: refresh panicked: %v", r))
+					}
+					panic(panicWithStack{value: r, stack: origStack})
+				}
+			}()
+			err := d.refreshFn()
+			if curBroadcaster != nil {
+				curBroadcaster.broadcast(err)
+			}
+		}()
 	}
 }
 

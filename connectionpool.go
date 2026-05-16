@@ -196,6 +196,13 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 
 		createCount++
 		go func(host *HostInfo) {
+			// Coordination teardown: parent below waits for exactly
+			// createCount receives with no ctx escape. Send nil
+			// unconditionally so a panic does not hang SetHosts forever.
+			// Receiver is nil-tolerant.
+			defer recoverGoroutine(p.session.logger, "policyConnPool.create.hostPool", func(err error) {
+				pools <- nil
+			})
 			// create a connection pool for the host
 			pools <- newHostConnPool(
 				p.session,
@@ -211,7 +218,9 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 	for createCount > 0 {
 		pool := <-pools
 		createCount--
-		if pool.Size() > 0 {
+		// pool may be nil if the create goroutine panicked (see the
+		// recovery teardown above). Skip nil safely.
+		if pool != nil && pool.Size() > 0 {
 			// add pool only if there a connections available
 			p.hostConnPools[pool.host.HostID()] = pool
 		}
@@ -220,7 +229,10 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 	for addr := range toRemove {
 		pool := p.hostConnPools[addr]
 		delete(p.hostConnPools, addr)
-		go pool.Close()
+		go func(pool *hostConnPool) {
+			defer recoverGoroutine(p.session.logger, "hostConnPool.Close.async", nil)
+			pool.Close()
+		}(pool)
 	}
 }
 
@@ -292,7 +304,10 @@ func (p *policyConnPool) removeHost(hostID string) {
 	delete(p.hostConnPools, hostID)
 	p.mu.Unlock()
 
-	go pool.Close()
+	go func() {
+		defer recoverGoroutine(p.session.logger, "hostConnPool.Close.removeHost", nil)
+		pool.Close()
+	}()
 }
 
 // hostConnPool is a connection pool for a single host.
@@ -351,7 +366,10 @@ func (pool *hostConnPool) Pick() *Conn {
 	size := len(pool.conns)
 	if size < pool.size {
 		// try to fill the pool
-		go pool.fill()
+		go func() {
+			defer recoverGoroutine(pool.logger, "hostConnPool.fill.pick", nil)
+			pool.fill()
+		}()
 
 		if size == 0 {
 			return nil
@@ -458,6 +476,29 @@ func (pool *hostConnPool) fill() {
 	// point until after this routine or its subordinates calls
 	// fillingStopped
 
+	// Synchronous-body panic guard: pool.filling is true; if the
+	// synchronous part below panics before the async branch takes over
+	// the fillingStopped responsibility, the pool is permanently stuck
+	// (later Pick / HandleError see filling=true and skip refilling).
+	// `handedOff` flips once the async goroutine has been spawned, after
+	// which IT owns calling fillingStopped.
+	handedOff := false
+	defer func() {
+		if r := recover(); r != nil {
+			if !handedOff {
+				// Clear the filling claim; swallow fillingStopped panic so
+				// it can't escape this recover.
+				func() {
+					defer func() { _ = recover() }()
+					pool.fillingStopped(fmt.Errorf("gocql: fill panicked: %v", r))
+				}()
+			}
+			// Surface the panic through the standard handler for uniform
+			// logging (stack trace, etc.).
+			handleRecoveredPanic(pool.logger, "hostConnPool.fill", r, nil)
+		}
+	}()
+
 	// fill only the first connection synchronously
 	if startCount == 0 {
 		err := pool.connect()
@@ -469,18 +510,34 @@ func (pool *hostConnPool) fill() {
 			return
 		}
 		// notify the session that this node is connected
-		go pool.session.handleNodeConnected(pool.host)
+		go func() {
+			defer recoverGoroutine(pool.logger, "Session.handleNodeConnected", nil)
+			pool.session.handleNodeConnected(pool.host)
+		}()
 
 		// filled one
 		fillCount--
 	}
 
 	// fill the rest of the pool asynchronously
+	handedOff = true
 	go func() {
+		var stopped bool
+		// Recovery teardown: if connectMany panics, pool.filling stays
+		// true forever and no future fill() can run. Ensure
+		// fillingStopped runs. `stopped` flag prevents double-call when
+		// the body completed normally.
+		defer recoverGoroutine(pool.logger, "hostConnPool.fill.async", func(err error) {
+			if !stopped {
+				pool.fillingStopped(err)
+			}
+		})
+
 		err := pool.connectMany(fillCount)
 
 		// mark the end of filling
 		pool.fillingStopped(err)
+		stopped = true
 
 		if err == nil && startCount > 0 {
 			// notify the session that this node is connected again
@@ -544,7 +601,18 @@ func (pool *hostConnPool) connectMany(count int) error {
 	wg.Add(count)
 	for i := 0; i < count; i++ {
 		go func() {
+			// wg.Done() registered first → runs last (LIFO). On panic,
+			// recoverGoroutine fires first and records the error so the
+			// parent observes the failure instead of false success.
 			defer wg.Done()
+			defer recoverGoroutine(pool.logger, "connectMany.worker", func(err error) {
+				mu.Lock()
+				if connectErr == nil {
+					connectErr = err
+				}
+				mu.Unlock()
+			})
+
 			err := pool.connect()
 			pool.logConnectErr(err)
 			if err != nil {
@@ -640,7 +708,10 @@ func (pool *hostConnPool) HandleError(conn *Conn, err error, closed bool) {
 			pool.conns[i], pool.conns = pool.conns[len(pool.conns)-1], pool.conns[:len(pool.conns)-1]
 
 			// lost a connection, so fill the pool
-			go pool.fill()
+			go func() {
+				defer recoverGoroutine(pool.logger, "hostConnPool.fill.HandleError", nil)
+				pool.fill()
+			}()
 			break
 		}
 	}

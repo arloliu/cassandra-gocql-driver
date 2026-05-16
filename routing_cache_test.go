@@ -30,7 +30,7 @@ func TestRoutingCacheClearedBySchemaRefresh(t *testing.T) {
 	debouncer := newRefreshDebouncer(1*time.Second, func() error {
 		cache.clear()
 		return nil
-	})
+	}, nil)
 	defer debouncer.stop()
 
 	if err := <-debouncer.refreshNow(); err != nil {
@@ -63,7 +63,7 @@ func TestRoutingCacheStaleWindowDuringDebounce(t *testing.T) {
 	debouncer := newRefreshDebouncer(debounceInterval, func() error {
 		cache.clear()
 		return nil
-	})
+	}, nil)
 	defer debouncer.stop()
 
 	// Simulate a schema change event arriving (handleEvent → debounceRefreshSchemaMetadata).

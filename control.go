@@ -53,13 +53,17 @@ type controlConn struct {
 
 	retry RetryPolicy
 
+	// quit is signaled by close() to stop the heartBeat loop. Buffered 1
+	// so close() never blocks even if the heartBeat goroutine has exited
+	// early (e.g. via a recovered panic). The receiver only reads it once
+	// from the heartBeat select.
 	quit chan struct{}
 }
 
 func createControlConn(session *Session) *controlConn {
 	control := &controlConn{
 		session: session,
-		quit:    make(chan struct{}),
+		quit:    make(chan struct{}, 1),
 		retry:   &SimpleRetryPolicy{NumRetries: 3},
 	}
 
@@ -69,6 +73,16 @@ func createControlConn(session *Session) *controlConn {
 }
 
 func (c *controlConn) heartBeat() {
+	// Plain log-and-exit teardown. Do NOT transition state on recovered
+	// panic: controlConnClosing is the terminal Session.Close sentinel
+	// and reconnect() short-circuits when state == Closing, so reusing
+	// that state here would permanently disable reconnection. The
+	// buffered c.quit chan independently guarantees close() does not
+	// block if the heartbeat goroutine has exited via recovery. The
+	// session continues in a degraded state (no heartbeat) until
+	// Session.Close, but reconnects still work.
+	defer recoverGoroutine(c.session.logger, "controlConn.heartBeat", nil)
+
 	if !atomic.CompareAndSwapInt32(&c.state, controlConnStarting, controlConnStarted) {
 		return
 	}
@@ -359,7 +373,10 @@ func (c *controlConn) setupConn(conn *Conn, sessionInit bool) error {
 		// with the fill called by Session.init. Session.init needs to wait for its fill to finish and that
 		// would return immediately if we started the fill here.
 		// TODO(martin-sucha): Trigger pool refill for all hosts, like in reconnectDownedHosts?
-		go c.session.startPoolFill(host)
+		go func() {
+			defer recoverGoroutine(c.session.logger, "Session.startPoolFill", nil)
+			c.session.startPoolFill(host)
+		}()
 	}
 	return nil
 }

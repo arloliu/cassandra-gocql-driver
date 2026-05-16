@@ -249,6 +249,19 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter Ne
 }
 
 func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter NextHost, results chan<- *Iter) {
+	// Coordination teardown: parent at executeQuery selects on <-results
+	// or <-ctx.Done(). If q.do panics, no result is sent and the parent
+	// waits until ctx cancel. Push a panic-error iter so the parent
+	// unblocks immediately.
+	defer recoverGoroutine(q.pool.session.logger, "queryExecutor.run", func(err error) {
+		errIter := newErrIter(err, qry.getQueryMetrics(), qry.Keyspace(),
+			qry.getRoutingInfo(), qry.getKeyspaceFunc())
+		select {
+		case results <- errIter:
+		case <-ctx.Done():
+		}
+	})
+
 	select {
 	case results <- q.do(ctx, qry, hostIter):
 	case <-ctx.Done():

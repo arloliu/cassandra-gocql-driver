@@ -172,14 +172,14 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 
 	s.schemaDescriber = newSchemaDescriber(s, newRefreshDebouncer(schemaRefreshDebounceTime, func() error {
 		return refreshSchemas(s)
-	}))
+	}, s.logger))
 
 	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent, s.logger)
 
 	s.routingMetadataCache = newRoutingKeyInfoLRU(cfg.MaxRoutingKeyInfo)
 
 	s.hostSource = &ringDescriber{session: s}
-	s.ringRefresher = newRefreshDebouncer(ringRefreshDebounceTime, func() error { return refreshRing(s.hostSource) })
+	s.ringRefresher = newRefreshDebouncer(ringRefreshDebounceTime, func() error { return refreshRing(s.hostSource) }, s.logger)
 
 	s.queryObserver = cfg.QueryObserver
 	s.batchObserver = cfg.BatchObserver
@@ -337,12 +337,37 @@ func (s *Session) init() error {
 
 		atomic.AddInt64(&left, 1)
 		go func() {
+			completed := false
+			// Coordination teardown: parent at session.go:374 reads
+			// `for range connectedCh`. The chan closes when `left` hits 0.
+			// If addHost panics, the body's dec is skipped and the close
+			// never fires — parent hangs. Teardown completes the dec and
+			// either closes (if it drove left to 0) or sends a single
+			// struct so the iteration progresses.
+			defer recoverGoroutine(s.logger, "Session.init.addHost", func(err error) {
+				if completed {
+					return
+				}
+				if atomic.AddInt64(&left, -1) == 0 {
+					// safe-close: another goroutine may have raced us
+					defer func() { _ = recover() }()
+					close(connectedCh)
+				} else {
+					select {
+					case connectedCh <- struct{}{}:
+					case <-s.ctx.Done():
+					}
+				}
+			})
+
 			s.pool.addHost(host)
 			connectedCh <- struct{}{}
 
 			// if there are no hosts left, then close the hostCh to unblock the loop
 			// below if its still waiting
-			if atomic.AddInt64(&left, -1) == 0 {
+			shouldClose := atomic.AddInt64(&left, -1) == 0
+			completed = true // mark BEFORE close — a close panic must not double-dec
+			if shouldClose {
 				close(connectedCh)
 			}
 		}()
@@ -439,6 +464,8 @@ func (s *Session) AwaitSchemaAgreement(ctx context.Context) error {
 }
 
 func (s *Session) reconnectDownedHosts(intv time.Duration) {
+	defer recoverGoroutine(s.logger, "Session.reconnectDownedHosts", nil)
+
 	reconnectTicker := time.NewTicker(intv)
 	defer reconnectTicker.Stop()
 
@@ -1970,12 +1997,29 @@ type nextIter struct {
 
 func (n *nextIter) fetchAsync() {
 	n.oncea.Do(func() {
-		go n.fetch()
+		go func() {
+			// n.fetch handles its own panic recovery inside the once.Do.
+			// This outer wrapper is belt-and-braces in case something else
+			// panics in the spawned goroutine.
+			defer recoverGoroutine(n.q.session.logger, "nextIter.fetchAsync", nil)
+			n.fetch()
+		}()
 	})
 }
 
 func (n *nextIter) fetch() *Iter {
 	n.once.Do(func() {
+		// Recover INSIDE the once.Do body. If the page fetch panics,
+		// sync.Once marks itself done after the panic returns from the
+		// once body — any later n.fetch() call would return early
+		// without re-running, leaving n.next == nil and the caller at
+		// session.go:1852 nil-derefs. Teardown sets n.next to a
+		// panic-error iter before the once finalizes.
+		defer recoverGoroutine(n.q.session.logger, "nextIter.fetch", func(err error) {
+			n.next = newErrIter(err, n.q.metrics, n.q.Keyspace(),
+				n.q.routingInfo, n.q.qryOpts.getKeyspace)
+		})
+
 		// if the query was specifically run on a connection then re-use that
 		// connection when fetching the next results
 		if n.q.conn != nil {

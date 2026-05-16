@@ -292,7 +292,7 @@ func TestRefreshDebouncer_MultipleEvents(t *testing.T) {
 	}
 	beforeEvents := time.Now()
 	wg := sync.WaitGroup{}
-	d := newRefreshDebouncer(2*time.Second, fn)
+	d := newRefreshDebouncer(2*time.Second, fn, nil)
 	defer d.stop()
 	for i := 0; i < numberOfEvents; i++ {
 		wg.Add(1)
@@ -337,7 +337,7 @@ func TestRefreshDebouncer_RefreshNow(t *testing.T) {
 	}
 	beforeEvents := time.Now()
 	eventsWg := sync.WaitGroup{}
-	d := newRefreshDebouncer(2*time.Second, fn)
+	d := newRefreshDebouncer(2*time.Second, fn, nil)
 	defer d.stop()
 	for i := 0; i < numberOfEvents; i++ {
 		eventsWg.Add(1)
@@ -403,7 +403,7 @@ func TestRefreshDebouncer_EventsAfterRefreshNow(t *testing.T) {
 	}
 	beforeEvents := time.Now()
 	wg := sync.WaitGroup{}
-	d := newRefreshDebouncer(3*time.Second, fn)
+	d := newRefreshDebouncer(3*time.Second, fn, nil)
 	defer d.stop()
 	for i := 0; i < numberOfEvents; i++ {
 		wg.Add(1)
@@ -465,7 +465,7 @@ func TestRefreshDebouncer_DeadlockOnStop(t *testing.T) {
 			time.Sleep(refreshDuration)
 			return nil
 		}
-		d := newRefreshDebouncer(50*time.Millisecond, fn)
+		d := newRefreshDebouncer(50*time.Millisecond, fn, nil)
 		timeBeforeRefresh := time.Now()
 		_ = d.refreshNow()
 		<-refreshCalledCh
