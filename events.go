@@ -41,6 +41,11 @@ type eventDebouncer struct {
 
 	callback func([]frame)
 	quit     chan struct{}
+	// done is closed when the flusher goroutine exits, allowing stop()
+	// to wait until callback dispatch has actually ceased. Without this,
+	// a Session.Close → stop() could return before a pending timer tick
+	// fired one last callback against already-stopped components.
+	done chan struct{}
 
 	logger StructuredLogger
 }
@@ -49,6 +54,7 @@ func newEventDebouncer(name string, eventHandler func([]frame), logger Structure
 	e := &eventDebouncer{
 		name:     name,
 		quit:     make(chan struct{}),
+		done:     make(chan struct{}),
 		timer:    time.NewTimer(eventDebounceTime),
 		callback: eventHandler,
 		logger:   logger,
@@ -60,11 +66,20 @@ func newEventDebouncer(name string, eventHandler func([]frame), logger Structure
 }
 
 func (e *eventDebouncer) stop() {
-	e.quit <- struct{}{} // sync with flusher
+	// Close-only signal: the flusher's `case <-e.quit` returns whether
+	// quit is closed or sent-to. Using close instead of send+close means
+	// stop() does not deadlock if the flusher exited early (e.g. via a
+	// recovered panic). The <-e.done wait then restores the original
+	// synchronization guarantee — stop() returns only after the flusher
+	// goroutine has actually exited, so a pending timer cannot fire a
+	// late callback against already-stopped components.
 	close(e.quit)
+	<-e.done
 }
 
 func (e *eventDebouncer) flusher() {
+	defer close(e.done)
+	defer recoverGoroutine(e.logger, "eventDebouncer.flusher", nil)
 	for {
 		select {
 		case <-e.timer.C:
@@ -91,7 +106,12 @@ func (e *eventDebouncer) flush() {
 	// if the flush interval is faster than the callback then we will end up calling
 	// the callback multiple times, probably a bad idea. In this case we could drop
 	// frames?
-	go e.callback(e.events)
+	events := e.events
+	logger := e.logger
+	go func() {
+		defer recoverGoroutine(logger, "eventDebouncer.callback", nil)
+		e.callback(events)
+	}()
 	e.events = make([]frame, 0, eventBufferSize)
 }
 
