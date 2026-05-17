@@ -88,7 +88,7 @@
 // [ExponentialReconnectionPolicy] provides gentler backoff with capped intervals:
 //
 //	cluster.ReconnectionPolicy = &gocql.ExponentialReconnectionPolicy{
-//	    MaxRetries:      5,                // 6 total attempts: 0+1+2+4+8+15 = 30s total
+//	    MaxRetries:      5,                // 5 total attempts: approx delays 0.5s, 1s, 2s, 4s = ~7.5s before final attempt (excludes jitter)
 //	    InitialInterval: 1 * time.Second,  // Initial retry interval
 //	    MaxInterval:     15 * time.Second, // Maximum retry interval (prevents excessive delays)
 //	}
@@ -138,52 +138,49 @@
 // Here's a practical example showing how the settings work together:
 //
 //	cluster.ReconnectionPolicy = &gocql.ExponentialReconnectionPolicy{
-//	    MaxRetries:      8,                // 9 total attempts (0s, 1s, 2s, 4s, 8s, 16s, 30s, 30s, 30s)
+//	    MaxRetries:      8,                // 8 total attempts; approx inter-attempt delays: 0.5s, 1s, 2s, 4s, 8s, 16s, 30s (excludes jitter)
 //	    InitialInterval: 1 * time.Second,  // Starts at 1 second
 //	    MaxInterval:     30 * time.Second, // Caps exponential growth at 30 seconds
 //	}
 //
 //	cluster.ReconnectInterval = 60 * time.Second  // Background checks every 60 seconds
 //
-// Timeline Example: With this configuration, when a host loses ALL connections:
+// Timeline Example: With this configuration, when a host loses ALL connections (delays are approximate; getExponentialTime adds bounded jitter):
 //
 //	T=0:00      - Host has 2 connections, both fail
-//	T=0:00      - Immediate reconnection attempt 1: 0s delay
-//	T=0:01      - Immediate reconnection attempt 2: 1s delay
-//	T=0:03      - Immediate reconnection attempt 3: 2s delay
-//	T=0:07      - Immediate reconnection attempt 4: 4s delay
-//	T=0:15      - Immediate reconnection attempt 5: 8s delay
-//	T=0:31      - Immediate reconnection attempt 6: 16s delay
-//	T=1:01      - Immediate reconnection attempt 7: 30s delay (capped by MaxInterval)
-//	T=1:31      - Immediate reconnection attempt 8: 30s delay
-//	T=2:01      - Immediate reconnection attempt 9: 30s delay
-//	T=2:31      - All immediate attempts failed, host marked DOWN
+//	T=0:00      - Immediate reconnection attempt 1
+//	T~0:01      - Immediate reconnection attempt 2 (after ~0.5s delay, rounded)
+//	T~0:02      - Immediate reconnection attempt 3 (after ~1s delay)
+//	T~0:04      - Immediate reconnection attempt 4 (after ~2s delay)
+//	T~0:08      - Immediate reconnection attempt 5 (after ~4s delay)
+//	T~0:16      - Immediate reconnection attempt 6 (after ~8s delay)
+//	T~0:32      - Immediate reconnection attempt 7 (after ~16s delay)
+//	T~1:02      - Immediate reconnection attempt 8 (after ~30s delay, capped by MaxInterval) — final attempt, no further inter-attempt delay
+//	T~1:02      - All immediate attempts failed, host marked DOWN
 //
-//	T=3:31      - Background recovery attempt 1 starts (60s after DOWN)
-//	            ReconnectionPolicy sequence: 0s, 1s, 2s, 4s, 8s, 16s, 30s, 30s, 30s
+//	T~2:02      - Background recovery attempt 1 starts (on the next ReconnectInterval tick after DOWN, up to 60s later)
+//	            ReconnectionPolicy sequence: approx delays 0.5s, 1s, 2s, 4s, 8s, 16s, 30s (~62s total)
 //
-//	T=4:31      - ClusterConfig.ReconnectInterval timer fires, tick buffered (timer channel capacity=1)
-//	T=5:31      - ClusterConfig.ReconnectInterval timer fires again, there is already a tick buffered so ignore
-//	T=5:32      - Background recovery attempt 1 completes (after 2:01), immediately reads buffered tick
-//	T=5:32      - Background recovery attempt 2 starts (buffered timer from T=5:31)
-//	T=6:32      - ClusterConfig.ReconnectInterval timer fires, tick buffered
-//	T=7:32      - ClusterConfig.ReconnectInterval timer fires again, there is already a tick buffered so ignore
-//	T=7:33      - Background recovery attempt 2 completes (after 2:01), immediately reads buffered tick
-//	T=7:33      - Background recovery attempt 3 starts (buffered timer from T=7:32)
+//	T~3:02      - ClusterConfig.ReconnectInterval timer fires, tick buffered (timer channel capacity=1)
+//	T~3:04      - Background recovery attempt 1 completes (after ~1:02), immediately reads buffered tick
+//	T~3:04      - Background recovery attempt 2 starts
+//	T~4:02      - ClusterConfig.ReconnectInterval timer fires, tick buffered
+//	T~4:06      - Background recovery attempt 2 completes (after ~1:02), immediately reads buffered tick
+//	T~4:06      - Background recovery attempt 3 starts
 //
 // Timer Behavior and Predictable Timing:
 //
 // Note: [time.Ticker].C has buffer capacity=1, but Go drops ticks for "slow receivers."
-// The reconnection process is a slow receiver (taking 2+ minutes vs 60s interval).
-// First missed tick gets buffered, subsequent ticks are dropped. When reconnection
-// completes, it immediately reads the buffered tick and starts the next attempt.
+// When the reconnection sequence takes longer than ClusterConfig.ReconnectInterval,
+// the first missed tick gets buffered and any subsequent ticks are dropped. When the
+// reconnection completes, it immediately reads the buffered tick and starts the next attempt.
 // This causes attempts to run back-to-back at the ReconnectionPolicy duration interval
-// (121s) instead of the intended ClusterConfig.ReconnectInterval (60s), but timing remains predictable.
+// (~62s for the example above) instead of the intended ClusterConfig.ReconnectInterval (60s), but timing remains predictable.
 //
-// To avoid this buffering/dropping behavior, ensure ClusterConfig.ReconnectInterval is larger than the
+// To avoid this buffering behavior, ensure ClusterConfig.ReconnectInterval is larger than the
 // total ReconnectionPolicy duration. You can achieve this by either:
 //
-//  1. Increasing ClusterConfig.ReconnectInterval (e.g., 150s > 121s sequence duration)
+//  1. Increasing ClusterConfig.ReconnectInterval (e.g., 90s > ~62s sequence duration)
 //  2. Reducing ReconnectionPolicy duration (e.g., 30s sequence < 60s ClusterConfig.ReconnectInterval)
 //
 // This ensures predictable timing with each recovery attempt starting exactly ClusterConfig.ReconnectInterval apart.
