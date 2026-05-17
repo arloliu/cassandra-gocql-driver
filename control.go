@@ -482,6 +482,16 @@ func (c *controlConn) attemptReconnectToAnyOfHosts(hosts []*HostInfo) (*Conn, er
 	for _, host := range hosts {
 		conn, err = c.session.connect(c.session.ctx, host, c)
 		if err != nil {
+			// Route the dial failure through ConvictionPolicy so the host can
+			// be marked down — same idiom as connectionpool.go:584. Without
+			// this, a node that came back with different resources (e.g. a
+			// Scylla node restarted with more shards) keeps its prior
+			// driver-side metadata until something else triggers a refresh,
+			// which has produced shard-count mismatches and panics. Adapted
+			// from upstream PR #1729 / scylladb/gocql#145.
+			if c.session.cfg.ConvictionPolicy.AddFailure(err, host) {
+				c.session.handleNodeDown(host.ConnectAddress(), host.Port())
+			}
 			c.session.logger.Info("During reconnection, control connection failed to establish a connection to host.",
 				NewLogFieldIP("host_addr", host.ConnectAddress()),
 				NewLogFieldInt("port", host.Port()),

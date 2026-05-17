@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Control-connection reconnect now routes dial failures through
+  `ConvictionPolicy.AddFailure` and marks the host down on conviction,
+  matching the established idiom from `connectionpool.go` (pool-fill
+  failures). Restores behavior removed in upstream commit `56d43d5`
+  when the control-conn refactor inlined `shuffleDial`. Without it, a
+  node returning with different resources (e.g. a Scylla node restarted
+  with more shards) kept its previous driver-side metadata until
+  something else triggered a refresh, producing shard-count mismatch
+  panics. Adapted from upstream PR #1729 (scylladb/gocql#145). The
+  initial control-conn establishment path is unaffected: the ring is
+  empty at that point, so `handleNodeDown` is a no-op on first-time
+  dial failure (no spurious `OnHostDown` listener fires before the
+  corresponding `OnNewHost`).
 - `hostpool.HostPoolHostPolicy.Pick` now returns a one-shot iterator that
   yields a single host and then `nil`, matching the documented `NextHost`
   contract ("Should return nil eventually to prevent endless query
