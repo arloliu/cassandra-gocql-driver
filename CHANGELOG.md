@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.1.2-otter] - 2026-05-17
+## [2.2.0-otter] - 2026-05-17
 
-This release hardens frame parsing and goroutine lifecycle against malformed
-input and unexpected panics, and tightens several long-tail correctness issues
-identified by a targeted audit (`§4`, `§7`–`§10`).
+The default `TokenAwareHostPolicy` replica-selection behavior changes in this
+release (see "Changed"), which is a minor-version bump under SemVer rather
+than a patch. This release also hardens frame parsing and goroutine lifecycle
+against malformed input and unexpected panics, and tightens several long-tail
+correctness issues identified by a targeted audit (`§4`, `§7`–`§10`).
 
 ### Added
 
