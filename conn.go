@@ -2162,6 +2162,21 @@ func (c *Conn) awaitSchemaAgreementWithTimeout(ctx context.Context, timeout time
 				continue
 			}
 
+			// Skip peers we KNOW to be down. A peer that is not yet tracked in
+			// the ring (ok=false) is included as before — its schema_version
+			// must still gate convergence so that a CREATE TABLE/DROP TABLE
+			// doesn't falsely report "agreed" before gossip has propagated
+			// to that peer. Only an explicitly-Down peer (in our ring AND
+			// state != NodeUp) is safe to skip: that's the case upstream PR
+			// #1738 was fixing — a dead node's stale schema_version would
+			// otherwise hold the agreement loop until MaxWaitSchemaAgreement.
+			if peerInfo, ok := c.session.ring.getHost(host.HostID()); ok && peerInfo != nil && !peerInfo.IsUp() {
+				c.logger.Warning("Skipping known-down peer while waiting for schema agreement.",
+					NewLogFieldIP("peer", host.ConnectAddress()),
+					NewLogFieldString("host_id", host.HostID()))
+				continue
+			}
+
 			versions[host.schemaVersion] = struct{}{}
 		}
 
