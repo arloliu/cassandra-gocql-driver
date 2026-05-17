@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `hostpool.HostPoolHostPolicy.Pick` now returns a one-shot iterator that
+  yields a single host and then `nil`, matching the documented `NextHost`
+  contract ("Should return nil eventually to prevent endless query
+  execution"). Previously the closure had no per-call state and kept
+  resampling go-hostpool indefinitely; when composed with
+  `TokenAwareHostPolicy` — whose fallback loop drains the iterator until
+  nil — this caused a 100% CPU spin. Issue #1259 (NWilson's narrowed
+  scope). Callers that want to consider another host call `Pick` again;
+  go-hostpool's stats already capture prior `Mark` outcomes so the
+  follow-up selection reflects degraded scores.
+
 ### Changed
 
 - Reconciled the `DisableInitialHostLookup` ring-refresh semantic. The

@@ -119,7 +119,18 @@ func (r *hostPoolHostPolicy) HostDown(host *gocql.HostInfo) {
 }
 
 func (r *hostPoolHostPolicy) Pick(qry gocql.ExecutableStatement) gocql.NextHost {
+	// The NextHost contract is: callers iterate until they receive nil. Without
+	// a one-shot guard this closure would re-sample the underlying go-hostpool
+	// indefinitely (Get() never returns "exhausted") and burn 100% CPU when
+	// composed with policies that drain to nil — e.g. TokenAwareHostPolicy as
+	// the parent — because the fallback iterator never terminates. See #1259.
+	used := false
 	return func() gocql.SelectedHost {
+		if used {
+			return nil
+		}
+		used = true
+
 		r.mu.RLock()
 		defer r.mu.RUnlock()
 

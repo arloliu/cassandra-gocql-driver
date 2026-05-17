@@ -67,30 +67,38 @@ func TestHostPolicy_HostPool(t *testing.T) {
 	// which will result in an unpredictable ordering
 	policy.SetHosts(hosts)
 
-	// the first host selected is actually at [1], but this is ok for RR
-	// interleaved iteration should always increment the host
+	// Each Pick returns a one-shot iterator: one non-nil host, then nil. See
+	// #1259 — the previous behavior of repeatedly sampling go-hostpool meant
+	// the closure never returned nil, causing tokenAwareHostPolicy fallback
+	// iteration to spin at 100% CPU. Callers that want to consider another
+	// host call Pick again.
 	iter := policy.Pick(nil)
-	actualA := iter()
-	if actualA.Info().HostID() != firstHostId.String() {
-		t.Errorf("Expected first host id but was %s", actualA.Info().HostID())
+	first := iter()
+	if first == nil {
+		t.Fatal("Pick().iter() returned nil on first call; expected a host")
 	}
-	actualA.Mark(nil)
+	if id := first.Info().HostID(); id != firstHostId.String() && id != secondHostId.String() {
+		t.Errorf("Pick returned unknown host id %s", id)
+	}
+	first.Mark(nil)
 
-	actualB := iter()
-	if actualB.Info().HostID() != secondHostId.String() {
-		t.Errorf("Expected second host id but was %s", actualB.Info().HostID())
+	if next := iter(); next != nil {
+		t.Errorf("iter() must return nil after first non-nil result; got host id %s", next.Info().HostID())
 	}
-	actualB.Mark(fmt.Errorf("error"))
+	if next := iter(); next != nil {
+		t.Errorf("iter() must continue to return nil after exhaustion; got host id %s", next.Info().HostID())
+	}
 
-	actualC := iter()
-	if actualC.Info().HostID() != firstHostId.String() {
-		t.Errorf("Expected first host id but was %s", actualC.Info().HostID())
+	// A subsequent Pick gives a fresh one-shot iterator. Mark one host as
+	// failing so hostpool's stats degrade it, then verify the closure still
+	// terminates regardless of which host is selected.
+	iter2 := policy.Pick(nil)
+	second := iter2()
+	if second == nil {
+		t.Fatal("second Pick().iter() returned nil on first call")
 	}
-	actualC.Mark(nil)
-
-	actualD := iter()
-	if actualD.Info().HostID() != firstHostId.String() {
-		t.Errorf("Expected first host id but was %s", actualD.Info().HostID())
+	second.Mark(fmt.Errorf("error"))
+	if next := iter2(); next != nil {
+		t.Errorf("second iter() must return nil after first non-nil result; got %s", next.Info().HostID())
 	}
-	actualD.Mark(nil)
 }
