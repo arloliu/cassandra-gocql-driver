@@ -30,6 +30,83 @@ import (
 	"time"
 )
 
+// TestExecuteBatch_UnprepRetryIsCapped verifies that Conn.executeBatch
+// stops re-preparing after maxUnprepRetries when the server returns
+// ErrCodeUnprepared on every batch attempt.
+//
+// Mirrors TestExecuteQuery_UnprepRetryIsCapped for the batch path. Without
+// the cap, executeBatch would recurse indefinitely on a server-side cache
+// thrash (Cassandra evicting our prepared statement between attempts) and
+// stack-overflow the goroutine.
+//
+// The fake server's opPrepare handler returns id=99 for "always-unprep".
+// Its opBatch handler returns ErrCodeUnprepared with id=99 whenever any
+// statement in the batch carries that id. Each driver retry: evict cache,
+// re-prepare (server gives 99 again), send batch (server says unprepared)
+// — loops forever absent the cap.
+func TestExecuteBatch_UnprepRetryIsCapped(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var prepCount, batchCount uint64
+	srv := newTestServerOpts{
+		addr:     "127.0.0.1:0",
+		protocol: defaultProto,
+		recvHook: func(f *framer) {
+			switch f.header.op {
+			case opPrepare:
+				atomic.AddUint64(&prepCount, 1)
+			case opBatch:
+				atomic.AddUint64(&batchCount, 1)
+			}
+		},
+	}.newServer(t, ctx)
+	defer srv.Stop()
+
+	cluster := testCluster(defaultProto, srv.Address)
+	cluster.Timeout = 5 * time.Second
+	db, err := cluster.CreateSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	b := db.NewBatch(LoggedBatch)
+	// Use Bind with an empty values slice so the batch entry goes through
+	// prepareStatement (binding != nil) but the post-prepare arity check
+	// matches the fake server's always-unprep prepared response, which
+	// declares 0 request columns.
+	b.Bind("insert always-unprep into x (k) values (?)", func(*QueryInfo) ([]interface{}, error) {
+		return nil, nil
+	})
+	err = db.ExecuteBatch(b)
+	if err == nil {
+		t.Fatalf("expected re-prepare cap error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "re-prepare attempts") {
+		t.Errorf("error %q does not mention re-prepare attempts; cap behavior may be missing", err)
+	}
+
+	var serverErr *RequestErrUnprepared
+	if !errors.As(err, &serverErr) {
+		t.Errorf("errors.As(err, *RequestErrUnprepared) = false; %%w not in effect")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	wantPairs := uint64(maxUnprepRetries + 1)
+	gotPrep := atomic.LoadUint64(&prepCount)
+	gotBatch := atomic.LoadUint64(&batchCount)
+	if gotPrep != wantPairs {
+		t.Errorf("prepare count = %d, want %d (cap=%d allows %d retries plus initial)",
+			gotPrep, wantPairs, maxUnprepRetries, maxUnprepRetries)
+	}
+	if gotBatch != wantPairs {
+		t.Errorf("batch count = %d, want %d", gotBatch, wantPairs)
+	}
+}
+
 // TestExecuteQuery_UnprepRetryIsCapped verifies that Conn.executeQuery
 // stops re-preparing after maxUnprepRetries when the server returns
 // ErrCodeUnprepared on every Execute attempt.
