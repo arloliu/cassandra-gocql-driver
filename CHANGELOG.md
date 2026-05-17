@@ -7,55 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Heartbeat OPTIONS round-trips now use a dedicated per-attempt timeout floored
-  at 5 seconds, instead of inheriting `ClusterConfig.Timeout` (`Session.Timeout`).
-  Previously a tight query timeout — common for low-latency reads, e.g.
-  `Session.Timeout = 100ms` — capped every heartbeat at the same 100ms; under
-  GC pauses, brief TCP retransmits, or coordinator hiccups, six consecutive
-  heartbeat timeouts (the `failures > 5` threshold) within seconds could close
-  an otherwise-healthy connection, causing pool-connection-error storms
-  (upstream issue #1919). The new `heartbeatTimeout(connTimeout)` floors at 5
-  seconds (matching the steady-state heartbeat cadence) and respects larger
-  configured timeouts. Builds on PR #1866's ctx-deadline-override behavior.
-  Also adds a short-circuit so a heartbeat exec error that coincides with the
-  parent context being cancelled (connection shutdown) no longer spuriously
-  counts toward the failure threshold.
-
-- `connReader.timeout` is now an `atomic.Int64`. The field is read on every
-  receive-goroutine read and on every heartbeat-goroutine call to
-  `c.r.GetTimeout()`, and the integration test suite mutates it on live
-  connections (`cassandra_test.go`'s `TestQueryContextDeadlineOverridesConnectionTimeout`).
-  The previous unsynchronized access was a `-race` flag hit waiting to surface.
-
-- Query-level `context.WithTimeout` now overrides `ClusterConfig.Timeout` for
-  per-query deadline budgets. Previously a `WithContext(ctx)` query was capped
-  at the smaller of `ctx.Deadline()` and the connection-level timeout, so
-  callers could not lengthen individual queries (TRUNCATE, schema operations)
-  past a short cluster-wide default. Now when `ctx.Deadline()` is set,
-  `execInternal` suppresses the connection-level timeout timer and lets the
-  ctx drive cancellation. Adapted from upstream PR #1866 (CASSGO-61); also
-  resolves long-standing issue #953. Deliberate deviation: we did **not** take
-  upstream's `c.handleTimeout()` calls — that method was correctly removed in
-  upstream `540cb3d` (CASSGO-87) because it spuriously closed connections on
-  every timeout, and we follow that removal.
-
-- `refreshRing` is now a no-op when `DisableInitialHostLookup` is `true`. Previously
-  the flag was honoured only at session init: any subsequent ring refresh (control
-  conn reconnect, topology change event, node UP event for an unknown host) would
-  re-query `system.peers` and overwrite the locally configured hosts. Adapted from
-  upstream PR #1790 (CASSGO-5). Note: we deliberately did **not** take upstream's
-  rename of `DisableInitialHostLookup` → `DisableHostLookup` (semver-major break);
-  the flag name is unchanged.
-
 ## [2.2.0-otter] - 2026-05-17
 
 The default `TokenAwareHostPolicy` replica-selection behavior changes in this
 release (see "Changed"), which is a minor-version bump under SemVer rather
 than a patch. This release also hardens frame parsing and goroutine lifecycle
-against malformed input and unexpected panics, and tightens several long-tail
-correctness issues identified by a targeted audit (`§4`, `§7`–`§10`).
+against malformed input and unexpected panics, tightens several long-tail
+correctness issues identified by a targeted audit (`§4`, `§7`–`§10`), and
+incorporates a curated batch of bug fixes adapted from open upstream PRs
+(CASSGO-5, -61, -62, -122, plus issues #1738, #994, #1736, #953, #1919) that
+are unlikely to land on upstream `trunk` in a maintained timeline. Each
+adaptation is annotated below with its upstream source and any deliberate
+deviation we took (e.g. dropping semver-breaking renames or methods upstream
+itself has already removed).
 
 ### Added
 
@@ -121,6 +85,76 @@ correctness issues identified by a targeted audit (`§4`, `§7`–`§10`).
   intermediate tier. Previously, a `RackAwareRoundRobinPolicy` fallback could
   silently drop tier-2 replicas if no tier-1 replicas were present in a given
   token's replica set.
+- `awaitSchemaAgreement` now skips peers the driver explicitly knows are
+  Down, so a single known-down node no longer keeps the agreement loop
+  spinning until `MaxWaitSchemaAgreement`. Adapted from upstream PR #1738
+  (resolves upstream issues #994 and #1736). Deliberate deviation from
+  the upstream patch: only peers we both track in the ring AND see as
+  not-Up are skipped — peers not yet present in the ring (race during
+  initial pool fill on a fresh cluster) are still counted toward
+  convergence so that a `CREATE TABLE`/`INSERT` pair does not falsely
+  agree before gossip has propagated to every peer.
+- `useSystemSchema` and `hasAggregatesAndFunctions` are now set before
+  `policy.AddHosts` during `session.init`, so policies that consult those
+  flags as part of host addition observe the correct values from the
+  start. Adapted from upstream PR #1797 (skipped a leftover typo-only
+  follow-up that the same PR's later commit had already corrected).
+- Session init fails fast with a descriptive error when `HostFilter`
+  rejects every host returned by the initial peer lookup, instead of
+  silently continuing into `session.init` and surfacing a late
+  `ErrNoConnectionsStarted` after wasted work. Adapted from upstream
+  PR #1867 (CASSGO-62).
+- `networkTopology.replicaMap` no longer panics when `HostFilter`
+  restricts the ring to a single DC and a keyspace has no replicas in
+  that DC. The "DCs with replicas" count is now scoped to DCs the
+  driver actually sees in the ring rather than all DCs in the
+  replication map, eliminating the size-mismatch assertion that fired
+  inside `tokenAwareHostPolicy.updateAllReplicas` (CASSGO-122,
+  upstream issue #1947 / PR #1948). Together with our existing
+  panic-recovery wrappers this becomes defense-in-depth rather than
+  load-bearing: the recovery still catches the panic if anything new
+  triggers it, but the keyspace is no longer silently unroutable.
+- `refreshRing` is now a no-op when `DisableInitialHostLookup` is
+  `true`. Previously the flag was honoured only at session init; any
+  subsequent ring refresh (control-conn reconnect, topology-change
+  event, node UP event for an unknown host) would re-query
+  `system.peers` and overwrite the locally configured hosts —
+  affecting users pinning a single host (AWS Keyspaces, k8s with
+  explicit endpoints). Adapted from upstream PR #1790 (CASSGO-5).
+  Deliberate deviation: we did **not** take upstream's
+  `DisableInitialHostLookup` → `DisableHostLookup` rename (semver-major
+  public API break).
+- Query-level `context.WithTimeout` now overrides `ClusterConfig.Timeout`
+  for per-query deadline budgets. Previously a `WithContext(ctx)` query
+  was capped at the smaller of `ctx.Deadline()` and the connection-level
+  timeout, so callers could not lengthen individual queries (TRUNCATE,
+  schema operations) past a short cluster-wide default. Now when
+  `ctx.Deadline()` is set, `execInternal` suppresses the connection-level
+  timeout timer and lets the ctx drive cancellation. Adapted from
+  upstream PR #1866 (CASSGO-61); also resolves long-standing issue #953.
+  Deliberate deviation: we did **not** take upstream's
+  `c.handleTimeout()` additions — that method was correctly removed in
+  upstream `540cb3d` (CASSGO-87) because it spuriously closed
+  connections on every timeout, and we follow that removal.
+- Heartbeat OPTIONS round-trips now use a dedicated per-attempt timeout
+  floored at 5 seconds, instead of inheriting `ClusterConfig.Timeout`
+  (`Session.Timeout`). Previously a tight query timeout — common for
+  low-latency reads, e.g. `Session.Timeout = 100ms` — capped every
+  heartbeat at the same 100ms; under GC pauses, brief TCP retransmits,
+  or coordinator hiccups, six consecutive heartbeat timeouts (the
+  `failures > 5` threshold) within seconds could close an otherwise-
+  healthy connection, causing pool-connection-error storms (upstream
+  issue #1919). The new `heartbeatTimeout(connTimeout)` floors at 5
+  seconds (matching the steady-state heartbeat cadence) and respects
+  larger configured timeouts. Builds on the ctx-deadline-override
+  behavior above. Also adds a short-circuit so a heartbeat exec error
+  that coincides with the parent context being cancelled (connection
+  shutdown) no longer spuriously counts toward the failure threshold.
+- `connReader.timeout` is now an `atomic.Int64`. The field is read on
+  every receive-goroutine read and on every heartbeat-goroutine call
+  to `c.r.GetTimeout()`, and the integration test suite mutates it on
+  live connections; the previous unsynchronized access was a
+  `-race`-flag hit waiting to surface in CI.
 
 ## [2.1.1-otter] - 2026-05-14
 
