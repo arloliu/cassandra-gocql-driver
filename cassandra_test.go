@@ -150,6 +150,72 @@ func TestDisableInitialHostLookup_RingRefresh(t *testing.T) {
 	}
 }
 
+// TestQueryContextDeadlineOverridesConnectionTimeout verifies that a query
+// whose context carries a deadline is bounded by that deadline rather than by
+// the connection-level timeout. Adapted from upstream PR #1866 (CASSGO-61);
+// also resolves the long-standing #953.
+//
+// Three cases are exercised in sequence on a session whose connection-level
+// timeout has been tightened to 50ns:
+//
+//  A. No ctx deadline -> conn timeout still applies (ErrTimeoutNoResponse).
+//  B. Ctx deadline >> conn timeout -> deadline wins (query succeeds).
+//  C. Already-expired ctx deadline -> execInternal returns ctx.Err() at the
+//     early-return path before arming any timer.
+//
+// Cases B and C use TRUNCATE, which does not go through the prepared-statement
+// path (shouldPrepare returns false for TRUNCATE — see session.go:shouldPrepare).
+// The prepare path uses the connection's own context (not the caller's), so it
+// would always hit the tightened conn timeout regardless of any ctx deadline on
+// the caller side — making the timeout override impossible to observe via a
+// prepared statement.
+func TestQueryContextDeadlineOverridesConnectionTimeout(t *testing.T) {
+	session := createSession(t)
+	defer session.Close()
+
+	if err := createTable(session, "CREATE TABLE gocql_test.ctx_deadline_override(id int, value text, PRIMARY KEY (id))"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity insert with the default conn timeout, before we tighten it.
+	if err := session.Query("INSERT INTO gocql_test.ctx_deadline_override(id, value) VALUES(1, 'baseline')").Exec(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tighten conn timeout on every open connection to 50ns. Any subsequent
+	// query that uses the conn timeout will time out almost immediately.
+	session.executor.pool.mu.Lock()
+	for _, hostPool := range session.executor.pool.hostConnPools {
+		hostPool.mu.Lock()
+		for _, conn := range hostPool.conns {
+			conn.r.SetTimeout(50)
+		}
+		hostPool.mu.Unlock()
+	}
+	session.executor.pool.mu.Unlock()
+
+	// Case A: no ctx deadline -> conn timeout drives cancellation.
+	err := session.Query("INSERT INTO gocql_test.ctx_deadline_override(id, value) VALUES(2, 'no-ctx')").Exec()
+	if err != ErrTimeoutNoResponse {
+		t.Fatalf("case A (no ctx deadline): expected ErrTimeoutNoResponse, got: %v", err)
+	}
+
+	// Case B: ctx deadline much longer than conn timeout -> deadline wins.
+	ctxLong, cancelLong := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelLong()
+	if err := session.Query("TRUNCATE TABLE gocql_test.ctx_deadline_override").WithContext(ctxLong).Exec(); err != nil {
+		t.Fatalf("case B (ctx deadline overrides conn timeout): unexpected error: %v", err)
+	}
+
+	// Case C: already-expired ctx -> immediate ctx.Err() return.
+	ctxExpired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
+	defer cancelExpired()
+	err = session.Query("TRUNCATE TABLE gocql_test.ctx_deadline_override").WithContext(ctxExpired).Exec()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("case C (already-expired ctx): expected context.DeadlineExceeded, got: %v", err)
+	}
+}
+
 // TestInvalidKeyspace checks that an invalid keyspace will return promptly and without a flood of connections
 func TestInvalidKeyspace(t *testing.T) {
 	cluster := createCluster()

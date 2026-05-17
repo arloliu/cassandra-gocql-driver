@@ -1439,7 +1439,11 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 	}
 
 	var timeoutCh <-chan time.Time
-	if timeout := c.r.GetTimeout(); timeout > 0 {
+	// If the caller's context already has a deadline, defer to it rather than
+	// arming the connection-level timeout — otherwise WithContext(ctx-with-deadline)
+	// cannot effectively extend a short Session.Timeout.
+	_, ctxHasDeadline := ctx.Deadline()
+	if timeout := c.r.GetTimeout(); timeout > 0 && !ctxHasDeadline {
 		if call.timer == nil {
 			call.timer = time.NewTimer(0)
 			<-call.timer.C

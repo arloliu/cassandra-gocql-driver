@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Query-level `context.WithTimeout` now overrides `ClusterConfig.Timeout` for
+  per-query deadline budgets. Previously a `WithContext(ctx)` query was capped
+  at the smaller of `ctx.Deadline()` and the connection-level timeout, so
+  callers could not lengthen individual queries (TRUNCATE, schema operations)
+  past a short cluster-wide default. Now when `ctx.Deadline()` is set,
+  `execInternal` suppresses the connection-level timeout timer and lets the
+  ctx drive cancellation. Adapted from upstream PR #1866 (CASSGO-61); also
+  resolves long-standing issue #953. Deliberate deviation: we did **not** take
+  upstream's `c.handleTimeout()` calls — that method was correctly removed in
+  upstream `540cb3d` (CASSGO-87) because it spuriously closed connections on
+  every timeout, and we follow that removal.
+
 - `refreshRing` is now a no-op when `DisableInitialHostLookup` is `true`. Previously
   the flag was honoured only at session init: any subsequent ring refresh (control
   conn reconnect, topology change event, node UP event for an unknown host) would

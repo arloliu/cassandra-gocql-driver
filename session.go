@@ -1246,6 +1246,17 @@ func (q *Query) RoutingKey(routingKey []byte) *Query {
 // The provided context controls the entire lifetime of executing a
 // query, queries will be canceled and return once the context is
 // canceled.
+//
+// If ctx carries a [context.Context.Deadline], that deadline overrides the
+// connection-level [ClusterConfig.Timeout] for this query — the query is
+// not capped at the connection timeout. Use this to grant individual
+// queries (TRUNCATE, schema operations, large batch reads) more time
+// than the default while keeping the cluster timeout low for normal
+// reads:
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	err := session.Query("TRUNCATE TABLE big_table").WithContext(ctx).Exec()
 func (q *Query) WithContext(ctx context.Context) *Query {
 	q2 := *q
 	q2.context = ctx
