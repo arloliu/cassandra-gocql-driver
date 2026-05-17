@@ -381,8 +381,10 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 	}
 
 	dcsWithReplicas := 0
-	for _, dc := range n.dcs {
-		if dc > 0 {
+	for dc, rf := range n.dcs {
+		// Count only DCs the driver actually sees in the ring (filtered DCs are
+		// excluded by HostFilter) AND that have a non-zero replication factor.
+		if _, knownDc := dcRacks[dc]; knownDc && rf > 0 {
 			dcsWithReplicas++
 		}
 	}

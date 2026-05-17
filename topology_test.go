@@ -31,6 +31,8 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestPlacementStrategy_SimpleStrategy(t *testing.T) {
@@ -223,4 +225,35 @@ func TestPlacementStrategy_NetworkStrategy(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Regression test for upstream issue #1947 / CASSGO-122 (adapted from PR #1948).
+// When the token ring only contains hosts from a DC that has RF=0/unspecified
+// for a keyspace, networkTopology.replicaMap must not panic; it should return
+// an empty replica map.
+func TestPlacementStrategy_NetworkStrategy_DoNotPanicWhenNoReplicasInRing(t *testing.T) {
+	strat := newNetworkTopology(map[string]int{
+		"dc1": 3, // replicated only in dc1
+	})
+
+	// Hosts in ring only from dc2, so no replicas should be returned.
+	hosts := []*HostInfo{
+		{hostId: "dc2:rack1:0", dataCenter: "dc2", rack: "rack1"},
+		{hostId: "dc2:rack2:1", dataCenter: "dc2", rack: "rack2"},
+		{hostId: "dc2:rack3:2", dataCenter: "dc2", rack: "rack3"},
+	}
+
+	tokens := make([]hostToken, 0, len(hosts))
+	for _, h := range hosts {
+		tokens = append(tokens, hostToken{
+			token: orderedToken(h.hostId),
+			host:  h,
+		})
+	}
+	sort.Sort(&tokenRing{tokens: tokens})
+
+	require.NotPanics(t, func() {
+		replicas := strat.replicaMap(&tokenRing{hosts: hosts, tokens: tokens})
+		require.Empty(t, replicas, "expected no replicas, got %d", len(replicas))
+	})
 }
