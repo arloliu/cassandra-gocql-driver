@@ -292,6 +292,9 @@ func (s *Session) init() error {
 					filteredHosts = append(filteredHosts, host)
 				}
 			}
+			if len(filteredHosts) < 1 {
+				return errors.New("gocql: HostFilter rejected every host during initial host lookup")
+			}
 
 			hosts = filteredHosts
 			s.logger.Info("Refreshed ring.", NewLogFieldString("ring", ringString(hosts)))
