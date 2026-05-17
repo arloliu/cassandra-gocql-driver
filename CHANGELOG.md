@@ -7,15 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.2-otter] - 2026-05-17
+
+This release hardens frame parsing and goroutine lifecycle against malformed
+input and unexpected panics, and tightens several long-tail correctness issues
+identified by a targeted audit (`§4`, `§7`–`§10`).
+
+### Added
+
+- `recoverGoroutine` helper that wraps long-lived driver goroutines so a panic
+  in one (event dispatch, pool fill, control connection, refresh loops, etc.)
+  is logged and contained instead of taking down the host process.
+- `runtime.SetFinalizer`-based leak detector on `Iter`. When an iterator is
+  garbage-collected without `Close()` being called, the driver logs a warning
+  identifying the call site so leaks are diagnosable instead of silent.
+
 ### Changed
 
-- `TokenAwareHostPolicy` now rotates the starting replica across queries by default, spreading coordinator load across the live local replicas instead of concentrating it on the primary replica for each token. The `ShuffleReplicas` option becomes redundant (kept for backwards compatibility); use `DoNotShuffleReplicas` to opt back into the previous deterministic ring-order behavior.
-- The startup warning previously emitted when `TokenAwareHostPolicy` was constructed without an explicit shuffle decision has been removed; the new default is the recommended behavior.
-- Replica selection on the per-query hot path no longer takes a global `sync.Mutex`. The previous implementation serialized every concurrent query on a shared `*rand.Rand`; replicas are now rotated via a lock-free atomic counter, which improves `Pick` throughput by ~2.3x at GOMAXPROCS=32 with RF=5.
+- `TokenAwareHostPolicy` now rotates the starting replica across queries by
+  default, spreading coordinator load across the live local replicas instead
+  of concentrating it on the primary replica for each token. The
+  `ShuffleReplicas` option becomes redundant (kept for backwards
+  compatibility); use `DoNotShuffleReplicas` to opt back into the previous
+  deterministic ring-order behavior.
+- The startup warning previously emitted when `TokenAwareHostPolicy` was
+  constructed without an explicit shuffle decision has been removed; the new
+  default is the recommended behavior.
+- `MapScan`/`SliceMap` cache reusable plumbing (column-name lookup, type
+  decoders) so the hot path skips repeated reflection work on iterators that
+  return many rows. Routing-info lookup uses a lock-free read path. Aggregate
+  decode-time speedup of ~10–20% on wide-row scans in microbenchmarks.
+- Connection-lifecycle, pool-fill, session-refresh, and control-connection
+  goroutines now route through `recoverGoroutine`. A panic in one of these
+  no longer crashes the application; instead the goroutine is logged with a
+  stack trace and the affected connection/pool is torn down cleanly.
 
 ### Fixed
 
-- Remote-tier iteration in `TokenAwareHostPolicy` with `NonLocalReplicasFallback` no longer halts permanently the first time it encounters an empty intermediate tier. Previously, a `RackAwareRoundRobinPolicy` fallback could silently drop tier-2 replicas if no tier-1 replicas were present in a given token's replica set.
+- UDT, Tuple, and Collection unmarshal paths are hardened against malformed
+  frames: invalid length prefixes (negative non-null sentinels, lengths
+  exceeding the remaining buffer) now return descriptive errors instead of
+  panicking with `slice bounds out of range`. Bounds peer-controlled element
+  counts in frame parsers so a hostile or corrupt frame cannot drive
+  unbounded allocations (`audit §6`).
+- Unknown server event types now return an error from the framer instead of
+  panicking the event dispatch goroutine.
+- `eventDebouncer` stop/flusher race: the debouncer can now be stopped safely
+  while a flush is in flight, and a panic inside the flush callback no longer
+  leaks goroutines or wedges subsequent stops.
+- Heartbeat parse errors and unsolicited server-error frames no longer fail
+  the connection. Previously, a malformed or unexpected frame on an idle
+  connection could trigger a full reconnect; the driver now logs and drops
+  the frame and keeps the connection healthy (`audit §8`).
+- `RequestErrUnprepared` retry recursion is capped. A pathological loop
+  where a re-prepared statement is again reported unprepared no longer
+  recurses unboundedly; the driver bounds retries and surfaces the error
+  (`audit §4`).
+- `hostConnPool.connect` now honors `ReconnectionPolicy.MaxRetries`. Previously
+  the pool could keep attempting to reconnect past the configured cap when a
+  host was persistently unreachable (`audit §7`).
+- Internal `fmt.Errorf` sites now use `%w` to wrap underlying causes so
+  `errors.Is` / `errors.As` work across driver boundaries (`audit §9`).
+- `copyBytes(nil)` preserves `nil` instead of returning an empty
+  (non-nil) `[]byte`. This restores the documented distinction between a
+  null CQL value and a present-but-empty value when round-tripping through
+  user buffers.
+- Remote-tier iteration in `TokenAwareHostPolicy` with `NonLocalReplicasFallback`
+  no longer halts permanently the first time it encounters an empty
+  intermediate tier. Previously, a `RackAwareRoundRobinPolicy` fallback could
+  silently drop tier-2 replicas if no tier-1 replicas were present in a given
+  token's replica set.
+
+## [2.1.1-otter] - 2026-05-14
+
+Performance-focused downstream release on top of upstream `v2.1.1`.
+
+### Changed
+
+- Replica selection on the per-query hot path no longer takes a global
+  `sync.Mutex`. The previous implementation serialized every concurrent query
+  on a shared `*rand.Rand`; replicas are now rotated via a lock-free atomic
+  counter, which improves `Pick` throughput by ~2.3x at GOMAXPROCS=32 with
+  RF=5.
+- Prepared-statement LRU cache migrated from a mutex-guarded map to
+  [otter](https://github.com/maypok86/otter), eliminating contention on the
+  prepare/execute path under concurrent load.
+- Routing-metadata cache migrated to otter and queried via a lock-free read
+  path.
+- In-flight call tracking map replaced with a lock-free atomic pointer array,
+  removing the previous sharded-map contention.
+- Batch execution deduplicates statement-prepare work so repeated identical
+  statements within a batch are prepared once; the dedup cache stays active
+  for already-cached statements past the previous threshold.
+- Framer improvements: `sync.Pool`-based framer reuse, a compression scratch
+  buffer to avoid per-frame allocations, default framer buffer size raised
+  from 128 to 256 bytes, compression skipped for frames below 512 bytes
+  (round-trip overhead outweighs the savings), and CRC32 checksum computed
+  without intermediate allocations.
+
+### Fixed
+
+- Shutdown deadlock in `closeWithError` when concurrent close paths raced.
+- Test suite adapted for testify v1.11.1's stricter `NotSame` pointer
+  requirement.
 
 ## [2.1.1]
 
