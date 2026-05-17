@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -485,10 +486,11 @@ func (h *HostInfo) String() string {
 
 // Polls system.peers at a specific interval to find new hosts
 type ringDescriber struct {
-	session         *Session
-	mu              sync.Mutex
-	prevHosts       []*HostInfo
-	prevPartitioner string
+	session          *Session
+	mu               sync.Mutex
+	prevHosts        []*HostInfo
+	prevPartitioner  string
+	firstRingRefresh int32
 }
 
 // Returns true if we are using system_schema.keyspaces instead of system.schema_keyspaces
@@ -854,9 +856,6 @@ func (s *Session) refreshRing() error {
 }
 
 func refreshRing(r *ringDescriber) error {
-	if r.session.cfg.DisableInitialHostLookup {
-		return nil
-	}
 	hosts, partitioner, err := r.GetHosts()
 	if err != nil {
 		return err
@@ -864,6 +863,31 @@ func refreshRing(r *ringDescriber) error {
 
 	prevHosts := r.session.ring.currentHosts()
 	hostStateListener := r.session.hostListeners
+
+	// With DisableInitialHostLookup, hosts were assigned random UUIDs at session
+	// init (session.go ~311) because system.peers was not consulted. On the very
+	// first ring refresh we drop those placeholder-id hosts so the loop below can
+	// re-add them under their real host_id and refill the pools. Matched by
+	// ConnectAddress; only existing entries are touched — no new admissions
+	// happen here. See issue #1721 / upstream PR #1722.
+	if r.session.cfg.DisableInitialHostLookup && atomic.CompareAndSwapInt32(&r.firstRingRefresh, 0, 1) {
+		addrToNewHostID := make(map[string]string, len(hosts))
+		for _, h := range hosts {
+			addrToNewHostID[h.ConnectAddress().String()] = h.HostID()
+		}
+		for _, prevHost := range prevHosts {
+			newHostID, ok := addrToNewHostID[prevHost.ConnectAddress().String()]
+			if !ok {
+				continue
+			}
+			r.session.logger.Info("Re-keying host after initial DisableInitialHostLookup refresh.",
+				NewLogFieldIP("host_addr", prevHost.ConnectAddress()),
+				NewLogFieldString("old_host_id", prevHost.HostID()),
+				NewLogFieldString("new_host_id", newHostID))
+			r.session.removeHost(prevHost)
+			delete(prevHosts, prevHost.HostID())
+		}
+	}
 
 	for _, h := range hosts {
 		if r.session.cfg.filterHost(h) {

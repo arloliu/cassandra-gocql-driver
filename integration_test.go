@@ -106,6 +106,48 @@ func TestRingDiscovery(t *testing.T) {
 	}
 }
 
+// TestRingDiscoveryWithDisableInitialHostLookup verifies that when DisableInitialHostLookup is set,
+// the first ring refresh reconciles the random placeholder UUIDs assigned at session init
+// (session.go ~311) with the real host_ids reported by the cluster. Adapted from upstream
+// PR #1722 / issue #1721.
+func TestRingDiscoveryWithDisableInitialHostLookup(t *testing.T) {
+	clusterHosts := getClusterHosts()
+	fn := func(c *ClusterConfig) {
+		c.DisableInitialHostLookup = true
+		c.ReconnectInterval = 0
+		// When running locally against a Docker-Compose cluster, peer addresses
+		// returned by system.peers are often not externally resolvable. Avoid
+		// long reconnect retries.
+		c.ReconnectionPolicy = &ConstantReconnectionPolicy{
+			MaxRetries: 1,
+			Interval:   1 * time.Millisecond,
+		}
+	}
+	cluster := createCluster(fn)
+	cluster.Hosts = clusterHosts[:1]
+
+	session := createSessionFromClusterWithoutSchemaAgreement(cluster, t)
+	defer session.Close()
+
+	oldHostAddrToID := make(map[string]string)
+	for _, h := range session.ring.allHosts() {
+		oldHostAddrToID[h.ConnectAddressAndPort()] = h.HostID()
+	}
+
+	if err := session.refreshRing(); err != nil {
+		t.Fatalf("failed to refresh ring: %v", err)
+	}
+
+	for _, h := range session.ring.allHosts() {
+		if oldID, ok := oldHostAddrToID[h.ConnectAddressAndPort()]; ok {
+			if oldID == h.HostID() {
+				t.Errorf("expected host_id %q to be replaced after refresh; addr=%s",
+					oldID, h.ConnectAddressAndPort())
+			}
+		}
+	}
+}
+
 // TestHostFilterDiscovery ensures that host filtering works even when we discover hosts
 func TestHostFilterDiscovery(t *testing.T) {
 	clusterHosts := getClusterHosts()

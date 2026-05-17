@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reconciled the `DisableInitialHostLookup` ring-refresh semantic. The
+  2.2.0-otter adaptation of upstream PR #1790 (CASSGO-5) made `refreshRing`
+  a blanket no-op when the flag was set; that overshot the intent of the
+  flag and blocked the host_id reconciliation needed by issue #1721 (random
+  placeholder UUIDs assigned in `session.go` survived for the lifetime of
+  the session, breaking downstream host_id-keyed operations). Replaced with
+  upstream PR #1722's narrower fix: on the **first** ring refresh, hosts
+  already in the ring are removed (matched by `ConnectAddress`) so the
+  normal refresh path re-adds them under their real host_id and refills
+  the pools; subsequent refreshes run unchanged. Configured hosts whose
+  `ConnectAddress` is not reported by `system.peers` are removed from the
+  ring on this first refresh. Users who relied on the blanket no-op
+  behavior to protect "configured hosts only" topologies (e.g. AWS
+  Keyspaces, k8s with pinned endpoints) should use a `HostFilter` to
+  enforce that invariant explicitly.
+
 ## [2.2.0-otter] - 2026-05-17
 
 The default `TokenAwareHostPolicy` replica-selection behavior changes in this
