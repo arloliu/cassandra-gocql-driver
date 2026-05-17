@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Heartbeat OPTIONS round-trips now use a dedicated per-attempt timeout floored
+  at 5 seconds, instead of inheriting `ClusterConfig.Timeout` (`Session.Timeout`).
+  Previously a tight query timeout — common for low-latency reads, e.g.
+  `Session.Timeout = 100ms` — capped every heartbeat at the same 100ms; under
+  GC pauses, brief TCP retransmits, or coordinator hiccups, six consecutive
+  heartbeat timeouts (the `failures > 5` threshold) within seconds could close
+  an otherwise-healthy connection, causing pool-connection-error storms
+  (upstream issue #1919). The new `heartbeatTimeout(connTimeout)` floors at 5
+  seconds (matching the steady-state heartbeat cadence) and respects larger
+  configured timeouts. Builds on PR #1866's ctx-deadline-override behavior.
+  Also adds a short-circuit so a heartbeat exec error that coincides with the
+  parent context being cancelled (connection shutdown) no longer spuriously
+  counts toward the failure threshold.
+
+- `connReader.timeout` is now an `atomic.Int64`. The field is read on every
+  receive-goroutine read and on every heartbeat-goroutine call to
+  `c.r.GetTimeout()`, and the integration test suite mutates it on live
+  connections (`cassandra_test.go`'s `TestQueryContextDeadlineOverridesConnectionTimeout`).
+  The previous unsynchronized access was a `-race` flag hit waiting to surface.
+
 - Query-level `context.WithTimeout` now overrides `ClusterConfig.Timeout` for
   per-query deadline budgets. Previously a `WithContext(ctx)` query was capped
   at the smaller of `ctx.Deadline()` and the connection-level timeout, so

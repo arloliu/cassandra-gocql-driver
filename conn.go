@@ -700,6 +700,25 @@ func (p *protocolError) Error() string {
 	return fmt.Sprintf("gocql: received unexpected frame on stream %d: %v", p.frame.Header().stream, p.frame)
 }
 
+// heartbeatMinTimeout is the floor for per-OPTIONS heartbeat exec timeouts.
+// Heartbeats run on a 5-second cadence after the first success, so capping the
+// round-trip at a sub-second Session.Timeout (common for low-latency reads)
+// would trip the failure threshold under any GC pause / TCP retransmit / brief
+// coordinator hiccup and close otherwise-healthy connections (upstream #1919).
+// 5 seconds matches the steady-state heartbeat interval.
+const heartbeatMinTimeout = 5 * time.Second
+
+// heartbeatTimeout returns the per-attempt timeout for the heartbeat OPTIONS
+// frame. It floors at heartbeatMinTimeout so short Session.Timeout values
+// cannot cause heartbeat-driven connection storms; operators who deliberately
+// configure a longer timeout (e.g. 30s for cross-region links) keep it.
+func heartbeatTimeout(connTimeout time.Duration) time.Duration {
+	if connTimeout > heartbeatMinTimeout {
+		return connTimeout
+	}
+	return heartbeatMinTimeout
+}
+
 func (c *Conn) heartBeat(ctx context.Context) {
 	defer recoverGoroutine(c.logger, "Conn.heartBeat", func(err error) {
 		c.closeWithError(err)
@@ -729,8 +748,16 @@ func (c *Conn) heartBeat(ctx context.Context) {
 		case <-timer.C:
 		}
 
-		framer, err := c.exec(context.Background(), &writeOptionsFrame{}, nil)
+		hbCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout(c.r.GetTimeout()))
+		framer, err := c.exec(hbCtx, &writeOptionsFrame{}, nil)
+		cancel()
 		if err != nil {
+			// If the parent ctx was cancelled while c.exec was in flight, the
+			// error is shutdown noise rather than evidence of a sick connection;
+			// don't count it toward the failure threshold.
+			if ctx.Err() != nil {
+				return
+			}
 			// c.exec failures are write/network errors. These DO indicate
 			// the connection may be unhealthy; count toward the threshold.
 			failures++
@@ -1004,19 +1031,26 @@ type ConnReader interface {
 
 // connReader implements ConnReader.
 // It retries to read data up to 5 times or returns error.
+//
+// timeout is accessed concurrently: Read runs on the receive goroutine,
+// GetTimeout runs on the heartbeat goroutine, and SetTimeout is called both
+// at connection-init time and by the integration test suite on live
+// connections. atomic.Int64 keeps the field race-free without taking a lock
+// on every read.
 type connReader struct {
 	conn    net.Conn
 	r       *bufio.Reader
-	timeout time.Duration
+	timeout atomic.Int64
 }
 
 func (c *connReader) Read(p []byte) (n int, err error) {
 	const maxAttempts = 5
 
+	timeout := time.Duration(c.timeout.Load())
 	for i := 0; i < maxAttempts; i++ {
 		var nn int
-		if c.timeout > 0 {
-			c.conn.SetReadDeadline(time.Now().Add(c.timeout))
+		if timeout > 0 {
+			c.conn.SetReadDeadline(time.Now().Add(timeout))
 		}
 
 		nn, err = io.ReadFull(c.r, p[n:])
@@ -1062,11 +1096,11 @@ func (c *connReader) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *connReader) SetTimeout(timeout time.Duration) {
-	c.timeout = timeout
+	c.timeout.Store(int64(timeout))
 }
 
 func (c *connReader) GetTimeout() time.Duration {
-	return c.timeout
+	return time.Duration(c.timeout.Load())
 }
 
 type callReq struct {
