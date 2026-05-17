@@ -17,11 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node returning with different resources (e.g. a Scylla node restarted
   with more shards) kept its previous driver-side metadata until
   something else triggered a refresh, producing shard-count mismatch
-  panics. Adapted from upstream PR #1729 (scylladb/gocql#145). The
-  initial control-conn establishment path is unaffected: the ring is
-  empty at that point, so `handleNodeDown` is a no-op on first-time
-  dial failure (no spurious `OnHostDown` listener fires before the
-  corresponding `OnNewHost`).
+  panics. Adapted from upstream PR #1729 (scylladb/gocql#145).
+  Scope note: the modified function `attemptReconnectToAnyOfHosts`
+  is reached only from `controlConn.reconnect` (heartbeat failure,
+  `HandleError`, `withConnHost` with nil conn) — all post-init paths.
+  The initial control-conn establishment uses `controlConn.connect`'s
+  inline dial loop and is unchanged. A narrow race exists in the ~1s
+  window between control-conn establishment and `session.init`
+  completing its host-add loop: a heartbeat-triggered reconnect that
+  hits this code can call `handleNodeDown` for the control host
+  (already in the ring via `setupConn`) before
+  `s.pool.addHost`/`s.policy.AddHost` complete for the other hosts.
+  The race is structurally safe — `pool.removeHost` and
+  `policy.HostDown` are no-ops on absent hosts (connectionpool.go:299;
+  policies.go:104) and there is no documented `OnNewHost`/`OnHostDown`
+  ordering contract (session init never fires `OnNewHost`; that event
+  is emitted only from `refreshRing`). If the control conn is truly
+  dead at this point, session.init fails cleanly via the existing
+  `ErrNoConnectionsStarted` path.
 - `hostpool.HostPoolHostPolicy.Pick` now returns a one-shot iterator that
   yields a single host and then `nil`, matching the documented `NextHost`
   contract ("Should return nil eventually to prevent endless query
