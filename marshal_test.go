@@ -1255,7 +1255,7 @@ var unmarshalTests = []struct {
 			l := []int{1, 2}
 			return &l
 		}(),
-		UnmarshalError("unmarshal list: unexpected eof"),
+		UnmarshalError("unmarshal list: declared element count 2 exceeds remaining buffer (6 bytes)"),
 	},
 	{
 		CollectionType{
@@ -1265,7 +1265,7 @@ var unmarshalTests = []struct {
 		},
 		[]byte("\x00\x00\x00\x01\x00\x00\x00\x03fo"),
 		map[string]int{"foo": 1},
-		UnmarshalError("unmarshal map: unexpected eof"),
+		UnmarshalError("unmarshal map: declared entry count 1 exceeds remaining buffer (6 bytes)"),
 	},
 	{
 		CollectionType{

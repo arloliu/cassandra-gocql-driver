@@ -1990,6 +1990,17 @@ func (c CollectionType) unmarshalListSet(data []byte, value interface{}) error {
 			return err
 		}
 		data = data[p:]
+		if n < 0 {
+			return unmarshalErrorf("unmarshal list: invalid negative collection size %d", n)
+		}
+		// Reject peer-supplied counts that exceed the remaining buffer.
+		// Each element carries at minimum its 4-byte length prefix (4 bytes),
+		// so n elements require at least 4n bytes. Checking n > len(data)/4
+		// catches structurally-impossible counts before MakeSlice allocation
+		// while letting plausible-but-truncated counts reach the inner eof check.
+		if n > len(data)/4 {
+			return unmarshalErrorf("unmarshal list: declared element count %d exceeds remaining buffer (%d bytes)", n, len(data))
+		}
 		if k == reflect.Array {
 			if rv.Len() != n {
 				return unmarshalErrorf("unmarshal list: array with wrong size")
@@ -2006,7 +2017,10 @@ func (c CollectionType) unmarshalListSet(data []byte, value interface{}) error {
 				return err
 			}
 			data = data[p:]
-			// In case m < 0, the value is null, and unmarshalData should be nil.
+			if m < -1 {
+				return unmarshalErrorf("unmarshal list: invalid negative length prefix %d (only -1 is valid for NULL)", m)
+			}
+			// m == -1: NULL element, unmarshalData stays nil.
 			var unmarshalData []byte
 			if m >= 0 {
 				if len(data) < m {
@@ -2161,22 +2175,33 @@ func (c CollectionType) unmarshalMap(data []byte, value interface{}) error {
 	if err != nil {
 		return err
 	}
+	data = data[p:]
 	if n < 0 {
-		return unmarshalErrorf("negative map size %d", n)
+		return unmarshalErrorf("unmarshal map: invalid negative map size %d", n)
+	}
+	// Reject peer-supplied counts that exceed the remaining buffer.
+	// Each entry carries at minimum 8 bytes (two 4-byte length prefixes),
+	// so n entries require at least 8n bytes. Checking n > len(data)/8
+	// catches structurally-impossible counts before MakeMapWithSize allocation
+	// while letting plausible-but-truncated counts reach the inner eof check.
+	if n > len(data)/8 {
+		return unmarshalErrorf("unmarshal map: declared entry count %d exceeds remaining buffer (%d bytes)", n, len(data))
 	}
 	rv.Set(reflect.MakeMapWithSize(t, n))
 	if rv.Kind() == reflect.Interface {
 		rv = rv.Elem()
 	}
-	data = data[p:]
 	for i := 0; i < n; i++ {
 		m, p, err := readCollectionSize(data)
 		if err != nil {
 			return err
 		}
 		data = data[p:]
+		if m < -1 {
+			return unmarshalErrorf("unmarshal map: invalid negative key length prefix %d (only -1 is valid for NULL)", m)
+		}
 		key := reflect.New(t.Key())
-		// In case m < 0, the key is null, and unmarshalData should be nil.
+		// m == -1: NULL key, unmarshalData stays nil.
 		var unmarshalData []byte
 		if m >= 0 {
 			if len(data) < m {
@@ -2194,9 +2219,12 @@ func (c CollectionType) unmarshalMap(data []byte, value interface{}) error {
 			return err
 		}
 		data = data[p:]
+		if m < -1 {
+			return unmarshalErrorf("unmarshal map: invalid negative value length prefix %d (only -1 is valid for NULL)", m)
+		}
 		val := reflect.New(t.Elem())
 
-		// In case m < 0, the value is null, and unmarshalData should be nil.
+		// m == -1: NULL value, unmarshalData stays nil.
 		unmarshalData = nil
 		if m >= 0 {
 			if len(data) < m {
