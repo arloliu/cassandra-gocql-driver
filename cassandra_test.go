@@ -108,6 +108,48 @@ func TestUseStatementError(t *testing.T) {
 	}
 }
 
+// TestDisableInitialHostLookup_RingRefresh verifies that a periodic ring refresh
+// is a no-op when DisableInitialHostLookup is set. Adapted from upstream PR #1790
+// (CASSGO-5). We mutate broadcast_address on the local ring to a sentinel value,
+// trigger refreshRing, and assert the sentinel survives — proving the refresh did
+// not re-query system.peers and overwrite the ring.
+//
+// Implementation note: we capture the sentinel IP as a value, not via the
+// *HostInfo pointer. Today HostInfo.update only assigns broadcastAddress when
+// the existing field is nil, so a refresh would not overwrite the sentinel
+// anyway, but storing a pointer would make this test fragile to future changes
+// in the refresh path. A copy of the IP bytes is the conservative idiom.
+func TestDisableInitialHostLookup_RingRefresh(t *testing.T) {
+	cluster := createCluster()
+	cluster.DisableInitialHostLookup = true
+	cluster.NumConns = 1
+	session := createSessionFromCluster(cluster, t)
+	defer session.Close()
+
+	sentinel := net.ParseIP("10.10.10.10")
+	preRefreshIPs := make(map[string]net.IP)
+	for key, host := range session.ring.hosts {
+		host.broadcastAddress = sentinel
+		// copy the sentinel value so we are not aliasing host.broadcastAddress
+		preRefreshIPs[key] = append(net.IP(nil), sentinel...)
+	}
+
+	if err := session.refreshRing(); err != nil {
+		t.Fatal(err)
+	}
+
+	for key, host := range session.ring.hosts {
+		expected, ok := preRefreshIPs[key]
+		if !ok {
+			t.Fatalf("ring gained a new host with key %s: refreshRing must not add hosts when DisableInitialHostLookup is set", key)
+		}
+		if !host.broadcastAddress.Equal(expected) {
+			t.Fatalf("broadcastAddress for key %s changed from %s to %s: refreshRing ran when it should have been a no-op",
+				key, expected, host.broadcastAddress)
+		}
+	}
+}
+
 // TestInvalidKeyspace checks that an invalid keyspace will return promptly and without a flood of connections
 func TestInvalidKeyspace(t *testing.T) {
 	cluster := createCluster()

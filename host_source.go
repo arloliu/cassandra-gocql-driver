@@ -854,6 +854,9 @@ func (s *Session) refreshRing() error {
 }
 
 func refreshRing(r *ringDescriber) error {
+	if r.session.cfg.DisableInitialHostLookup {
+		return nil
+	}
 	hosts, partitioner, err := r.GetHosts()
 	if err != nil {
 		return err

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `refreshRing` is now a no-op when `DisableInitialHostLookup` is `true`. Previously
+  the flag was honoured only at session init: any subsequent ring refresh (control
+  conn reconnect, topology change event, node UP event for an unknown host) would
+  re-query `system.peers` and overwrite the locally configured hosts. Adapted from
+  upstream PR #1790 (CASSGO-5). Note: we deliberately did **not** take upstream's
+  rename of `DisableInitialHostLookup` → `DisableHostLookup` (semver-major break);
+  the flag name is unchanged.
+
 ## [2.2.0-otter] - 2026-05-17
 
 The default `TokenAwareHostPolicy` replica-selection behavior changes in this
