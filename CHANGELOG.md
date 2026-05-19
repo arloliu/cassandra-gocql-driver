@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1-otter] - 2026-05-19
+
+### Added
+
+- `make test-cassandra` target that runs the `cassandra`-tagged unit suite
+  (frame/marshal/topology tests that pull in Cassandra-specific fixtures
+  but do not require a live cluster), separating it from the integration
+  targets that need a running node.
+
 ### Fixed
 
 - Control-connection reconnect now routes dial failures through
