@@ -614,9 +614,23 @@ func newLocalHostCluster(t *testing.T, contactPoint, serverAddress string, tune 
 	if tune != nil {
 		tune(cluster, serverAddress)
 	}
+	// NewSession refuses a policy that requires the metadata cache when the cache is disabled,
+	// as it is above. The tests that pass a token-aware policy here look at its membership
+	// and its token ring, which host events build without schema metadata,
+	// so the fixture lets that policy run without the cache.
+	if ta, ok := cluster.PoolConfig.HostSelectionPolicy.(*tokenAwareHostPolicy); ok {
+		cluster.PoolConfig.HostSelectionPolicy = cacheOptionalTokenAware{ta}
+	}
 
 	return cluster
 }
+
+// cacheOptionalTokenAware is a token-aware policy that reports it can run without the metadata cache.
+// Every other method, the unexported ones included, is the wrapped policy's.
+type cacheOptionalTokenAware struct{ *tokenAwareHostPolicy }
+
+// MetadataRequired reports that the wrapped policy can run without the metadata cache.
+func (cacheOptionalTokenAware) MetadataRequired() bool { return false }
 
 // offsetLastOctet returns addr with its last octet incremented.
 //

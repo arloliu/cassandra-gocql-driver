@@ -37,6 +37,14 @@ import (
 	"time"
 )
 
+var (
+	_ MetadataRequiredPolicy = (*roundRobinHostPolicy)(nil)
+	_ MetadataRequiredPolicy = (*tokenAwareHostPolicy)(nil)
+	_ MetadataRequiredPolicy = (*dcAwareRR)(nil)
+	_ MetadataRequiredPolicy = (*rackAwareRR)(nil)
+	_ MetadataRequiredPolicy = (*singleHostReadyPolicy)(nil)
+)
+
 // cowHostList implements a copy on write host list, its equivalent type is []*HostInfo
 type cowHostList struct {
 	list atomic.Value
@@ -458,6 +466,15 @@ type schemaRefreshNotifier interface {
 	schemaRefreshed(meta *schemaMeta)
 }
 
+// MetadataRequiredPolicy is an optional interface that can be implemented by HostSelectionPolicy.
+// If implemented, the policy will be queried to determine if metadata is required for the policy to work.
+// If metadata is required and MetadataCacheMode is not set to at least KeyspaceOnly, it will result in an error during session creation.
+//
+// All built-in policies implement this interface.
+type MetadataRequiredPolicy interface {
+	MetadataRequired() bool
+}
+
 // SelectedHost is an interface returned when picking a host from a host
 // selection policy.
 type SelectedHost interface {
@@ -514,6 +531,10 @@ func (r *roundRobinHostPolicy) HostDown(host *HostInfo) {
 	r.RemoveHost(host)
 }
 
+func (r *roundRobinHostPolicy) MetadataRequired() bool {
+	return false
+}
+
 // ShuffleReplicas returns an option function that enables rotation of the
 // starting replica across queries (the default since the rotation-by-default
 // change). Retained for backwards compatibility -- new code can rely on the
@@ -551,6 +572,9 @@ func NonLocalReplicasFallback() func(policy *tokenAwareHostPolicy) {
 // ShuffledTokenAwareHostPolicy is now equivalent to TokenAwareHostPolicy --
 // replica rotation is enabled by default. Retained for backwards compatibility.
 //
+// Note: TokenAwareHostPolicy requires the metadata cache to be enabled.
+// See [ClusterConfig.Metadata] for more details.
+//
 // Deprecated: use TokenAwareHostPolicy directly.
 func ShuffledTokenAwareHostPolicy(fallback HostSelectionPolicy, opts ...func(*tokenAwareHostPolicy)) HostSelectionPolicy {
 	return TokenAwareHostPolicy(fallback, opts...)
@@ -564,6 +588,9 @@ func ShuffledTokenAwareHostPolicy(fallback HostSelectionPolicy, opts ...func(*to
 // local replicas so each replica receives roughly equal coordinator traffic.
 // Pass DoNotShuffleReplicas to disable rotation and traverse replicas in their
 // natural ring order instead.
+//
+// Note: TokenAwareHostPolicy requires the metadata cache to be enabled.
+// See [ClusterConfig.Metadata] for more details.
 func TokenAwareHostPolicy(fallback HostSelectionPolicy, opts ...func(*tokenAwareHostPolicy)) HostSelectionPolicy {
 	p := &tokenAwareHostPolicy{
 		fallback:        fallback,
@@ -980,6 +1007,11 @@ func (t *tokenAwareHostPolicy) Pick(qry ExecutableStatement) NextHost {
 	}
 }
 
+// Always require metadata for token-aware host selection.
+func (t *tokenAwareHostPolicy) MetadataRequired() bool {
+	return true
+}
+
 type dcAwareRR struct {
 	local           string
 	localHosts      cowHostList
@@ -1020,6 +1052,10 @@ func (d *dcAwareRR) RemoveHost(host *HostInfo) {
 
 func (d *dcAwareRR) HostUp(host *HostInfo)   { d.AddHost(host) }
 func (d *dcAwareRR) HostDown(host *HostInfo) { d.RemoveHost(host) }
+
+func (d *dcAwareRR) MetadataRequired() bool {
+	return false
+}
 
 // This function is supposed to be called in a fashion
 // roundRobbin(offset, hostsPriority1, hostsPriority2, hostsPriority3 ... )
@@ -1142,6 +1178,10 @@ func (d *rackAwareRR) Pick(q ExecutableStatement) NextHost {
 	return roundRobbin(int(nextStartOffset), d.hosts[0].get(), d.hosts[1].get(), d.hosts[2].get())
 }
 
+func (d *rackAwareRR) MetadataRequired() bool {
+	return false
+}
+
 // ReadyPolicy defines a policy for when a HostSelectionPolicy can be used. After
 // each host connects during session initialization, the Ready method will be
 // called. If you only need a single Host to be up you can wrap a
@@ -1185,6 +1225,13 @@ func (s *singleHostReadyPolicy) Ready() bool {
 		return rdy.Ready()
 	}
 	return true
+}
+
+// Requires metadata if the wrapped policy requires it.
+// If the wrapped policy does not implement MetadataRequiredPolicy, returns false.
+func (s *singleHostReadyPolicy) MetadataRequired() bool {
+	fallback, ok := s.HostSelectionPolicy.(MetadataRequiredPolicy)
+	return ok && fallback.MetadataRequired()
 }
 
 // ConvictionPolicy decides whether a host that failed should be marked DOWN.

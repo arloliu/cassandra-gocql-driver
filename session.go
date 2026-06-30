@@ -210,6 +210,14 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		return nil, fmt.Errorf("the default SerialConsistency level is not allowed to be anything else but SERIAL or LOCAL_SERIAL. Recived value: %v", cfg.SerialConsistency)
 	}
 
+	if cfg.PoolConfig.HostSelectionPolicy == nil {
+		cfg.PoolConfig.HostSelectionPolicy = RoundRobinHostPolicy()
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
 	// TODO: we should take a context in here at some point
 	ctx, cancel := context.WithCancel(context.TODO())
 
@@ -321,9 +329,6 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent, s.triggerRingRefresh, s.logger)
 	s.ringRefresher = newRefreshDebouncer(ringRefreshDebounceTime, s.runRingRefresh, s.logger)
 
-	if cfg.PoolConfig.HostSelectionPolicy == nil {
-		cfg.PoolConfig.HostSelectionPolicy = RoundRobinHostPolicy()
-	}
 	s.pool = cfg.PoolConfig.buildPool(s)
 	s.policy = cfg.PoolConfig.HostSelectionPolicy
 
@@ -3883,16 +3888,17 @@ func (e Error) Error() string {
 }
 
 var (
-	ErrNotFound             = errors.New("not found")
-	ErrUnavailable          = errors.New("unavailable")
-	ErrUnsupported          = errors.New("feature not supported")
-	ErrTooManyStmts         = errors.New("too many statements")
-	ErrUseStmt              = errors.New("use statements aren't supported. Please see https://github.com/apache/cassandra-gocql-driver for explanation.")
-	ErrSessionClosed        = errors.New("session has been closed")
-	ErrNoConnections        = errors.New("gocql: no hosts available in the pool")
-	ErrNoKeyspace           = errors.New("no keyspace provided")
-	ErrKeyspaceDoesNotExist = errors.New("keyspace does not exist")
-	ErrNoMetadata           = errors.New("no metadata available")
+	ErrNotFound              = errors.New("not found")
+	ErrUnavailable           = errors.New("unavailable")
+	ErrUnsupported           = errors.New("feature not supported")
+	ErrTooManyStmts          = errors.New("too many statements")
+	ErrUseStmt               = errors.New("use statements aren't supported. Please see https://github.com/apache/cassandra-gocql-driver for explanation.")
+	ErrSessionClosed         = errors.New("session has been closed")
+	ErrNoConnections         = errors.New("gocql: no hosts available in the pool")
+	ErrNoKeyspace            = errors.New("no keyspace provided")
+	ErrKeyspaceDoesNotExist  = errors.New("keyspace does not exist")
+	ErrNoMetadata            = errors.New("no metadata available")
+	ErrMetadataCacheRequired = errors.New("metadata cache must be enabled for the selected host selection policy")
 )
 
 // ErrProtocol represents a protocol-level error.
