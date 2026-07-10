@@ -426,9 +426,18 @@ var framerPool = sync.Pool{
 	},
 }
 
-// maxPooledBufSize is the maximum buffer size to keep in the pool.
-// Larger buffers are discarded to prevent memory bloat from occasional large frames.
-const maxPooledBufSize = 64 * 1024
+// maxPooledBufSize is the largest framer buffer retained in the pool on release;
+// bigger buffers are dropped so a rare huge frame can't pin memory in a pooled
+// framer.
+//
+// readFrame sizes the buffer to the actual frame body (make([]byte, head.length)),
+// so this cap gates *retention*, not buffer size: a pooled framer holds a
+// real-sized buffer up to this bound, never a padded one. At 64 KiB the previous
+// cap discarded essentially every result/batch frame (production read frames
+// average ~1 MiB), forcing a fresh allocation on every large frame and making
+// readFrame one of the top allocators. 2 MiB retains typical frames for reuse
+// while still bounding worst-case retention per framer.
+const maxPooledBufSize = 2 * 1024 * 1024
 
 func newFramer(compressor Compressor, version byte, r *RegisteredTypes) *framer {
 	buf := make([]byte, defaultBufSize)

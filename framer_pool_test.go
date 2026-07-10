@@ -170,30 +170,58 @@ func TestFramerPool_LargeBufferDiscarded(t *testing.T) {
 	f := getFramer(nil, protoVersion4, GlobalTypes)
 	require.NotNil(t, f)
 
-	originalCap := cap(f.readBuffer)
+	// Simulate a large frame by expanding the buffer beyond maxPooledBufSize.
+	f.readBuffer = make([]byte, maxPooledBufSize+1024)
+	f.buf = f.readBuffer[:0]
+	require.Greater(t, cap(f.readBuffer), maxPooledBufSize)
 
-	// Simulate a large frame by expanding the buffer beyond maxPooledBufSize
-	largeSize := maxPooledBufSize + 1024
-	f.readBuffer = make([]byte, largeSize)
+	// release() must drop the oversized buffer. Assert on the still-referenced framer
+	// (deterministic) rather than whatever sync.Pool hands back next.
+	f.release()
+	assert.Equal(t, defaultBufSize, cap(f.readBuffer),
+		"oversized readBuffer should be discarded and reset to the default size on release")
+}
+
+// TestFramerPool_TypicalLargeFrameRetained verifies that megabyte-scale frame
+// buffers — representative of production result/batch frames, and far above the
+// old 64 KiB cap — are retained on release for reuse rather than discarded.
+// Regression guard for the readFrame reallocation churn (B2).
+func TestFramerPool_TypicalLargeFrameRetained(t *testing.T) {
+	f := getFramer(nil, protoVersion4, GlobalTypes)
+	require.NotNil(t, f)
+
+	const frameSize = 1 << 20 // 1 MiB, ~ the production read-path average
+	require.LessOrEqual(t, frameSize, maxPooledBufSize,
+		"a typical ~1 MiB frame must fit within the pooled cap")
+
+	f.readBuffer = make([]byte, frameSize)
 	f.buf = f.readBuffer[:0]
 
-	assert.True(t, cap(f.readBuffer) > maxPooledBufSize)
-
-	// Release the framer - this should discard the large buffer
+	// release() must keep the buffer (not reset it to defaultBufSize) so the
+	// next large frame reuses it instead of allocating.
 	f.release()
+	assert.Equal(t, frameSize, cap(f.readBuffer),
+		"megabyte-scale frame buffer should be retained for reuse")
+}
 
-	// Get a new framer
-	f2 := getFramer(nil, protoVersion4, GlobalTypes)
-	require.NotNil(t, f2)
+// BenchmarkFramerReadFrameReuse exercises the get -> readFrame -> release cycle
+// with a frame body larger than the old 64 KiB cap. With retention (B2) the
+// pooled buffer is reused, so steady-state allocations come only from the
+// bytes.Reader, not the frame body; before B2 every iteration reallocated the
+// whole body.
+func BenchmarkFramerReadFrameReuse(b *testing.B) {
+	const bodyLen = 256 * 1024
+	body := make([]byte, bodyLen)
+	head := frameHeader{version: protoVersion4 | 0x80, op: opReady, length: bodyLen}
 
-	// The buffer should be a new default-sized buffer, not the large one
-	assert.LessOrEqual(t, cap(f2.readBuffer), maxPooledBufSize,
-		"large buffer should have been discarded")
-	// New buffer should be approximately the default size
-	assert.GreaterOrEqual(t, cap(f2.readBuffer), originalCap-100,
-		"new buffer should be around default size")
-
-	f2.release()
+	b.ReportAllocs()
+	for b.Loop() {
+		f := getFramer(nil, protoVersion4, GlobalTypes)
+		if err := f.readFrame(bytes.NewReader(body), &head); err != nil {
+			b.Fatal(err)
+		}
+		f.release()
+	}
 }
 
 // TestFramerPool_ConcurrentAccess verifies that concurrent get/release
@@ -450,26 +478,13 @@ func TestFramerPool_LargeCompressBufDiscarded(t *testing.T) {
 	f := getFramer(nil, protoVersion4, GlobalTypes)
 	require.NotNil(t, f)
 
-	// Set a very large compress buffer
-	largeSize := maxPooledBufSize + 1024
-	f.compressBuf = make([]byte, largeSize)
+	// Set a compress buffer beyond the retention cap.
+	f.compressBuf = make([]byte, maxPooledBufSize+1024)
+	require.Greater(t, cap(f.compressBuf), maxPooledBufSize)
 
-	assert.True(t, cap(f.compressBuf) > maxPooledBufSize)
-
-	// Release - should discard the large buffer
+	// release() sets an oversized compressBuf to nil. Assert on the released framer.
 	f.release()
-
-	// Get a new framer
-	f2 := getFramer(nil, protoVersion4, GlobalTypes)
-	require.NotNil(t, f2)
-
-	// compressBuf should be nil (discarded) or a smaller buffer
-	if f2.compressBuf != nil {
-		assert.LessOrEqual(t, cap(f2.compressBuf), maxPooledBufSize,
-			"large compressBuf should have been discarded")
-	}
-
-	f2.release()
+	assert.Nil(t, f.compressBuf, "oversized compressBuf should be discarded (set to nil) on release")
 }
 
 func TestFramerPool_ReadFrame_CompressedButNoCompressor(t *testing.T) {
@@ -498,20 +513,14 @@ func TestFramerPool_ReadBufferBoundary_NotDiscardedAtMax(t *testing.T) {
 	f := getFramer(nil, protoVersion4, GlobalTypes)
 	require.NotNil(t, f)
 
-	// Exactly at max should not be discarded per current policy (> maxPooledBufSize).
+	// release() only discards buffers with cap > maxPooledBufSize, so a buffer exactly
+	// at the cap must be retained. Assert on the released framer directly.
 	f.readBuffer = make([]byte, maxPooledBufSize)
 	f.buf = f.readBuffer[:0]
-	capAtMax := cap(f.readBuffer)
 
 	f.release()
-
-	f2 := getFramer(nil, protoVersion4, GlobalTypes)
-	require.NotNil(t, f2)
-	// Only assert if we got the same instance; otherwise pool behavior is non-deterministic.
-	if f2 == f {
-		assert.Equal(t, capAtMax, cap(f2.readBuffer), "readBuffer at exactly maxPooledBufSize should be kept")
-	}
-	f2.release()
+	assert.Equal(t, maxPooledBufSize, cap(f.readBuffer),
+		"readBuffer at exactly maxPooledBufSize should be retained")
 }
 
 func TestIter_Warnings_SurvivesCloseAndPoolReuse(t *testing.T) {
