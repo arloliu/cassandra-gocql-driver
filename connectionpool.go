@@ -144,6 +144,7 @@ func connConfig(cfg *ClusterConfig) (*ConnConfig, error) {
 
 	return &ConnConfig{
 		ProtoVersion:   cfg.ProtoVersion,
+		MaxStreams:     cfg.MaxStreams,
 		CQLVersion:     cfg.CQLVersion,
 		Timeout:        cfg.Timeout,
 		WriteTimeout:   cfg.WriteTimeout,

@@ -150,6 +150,21 @@ type ClusterConfig struct {
 	// Default: 2
 	NumConns int
 
+	// MaxStreams caps the number of concurrent request streams per connection.
+	// It also sizes the per-connection request table (callMap), so lowering it
+	// reduces per-connection memory: the table costs 8 bytes per stream, so the
+	// default of 2048 uses 16 KB per connection versus 256 KB at the protocol
+	// maximum of 32768.
+	//
+	// Real per-connection concurrency is typically a few hundred streams, so the
+	// default is ample. Values are capped to the protocol maximum (128 for
+	// protocol v1/v2, 32768 for v3+) and rounded up to a multiple of 64.
+	//   0:  use the internal default (2048 for protocol v3+)
+	//   <0: use the full protocol maximum
+	//   >0: use this value (capped and rounded as above)
+	// Default: 0
+	MaxStreams int
+
 	// Default consistency level.
 	// Default: Quorum
 	Consistency Consistency

@@ -43,19 +43,57 @@ type IDGenerator struct {
 	offset  uint32
 }
 
-func New(protocol int) *IDGenerator {
-	maxStreams := 128
+// defaultMaxStreams caps the per-connection stream table for protocol v3+ when
+// ClusterConfig.MaxStreams is left at its zero value. The CQL protocol permits up
+// to 32768 concurrent streams per connection, but real per-connection concurrency
+// is far lower; capping here shrinks the per-connection callMap from 256 KB to
+// 16 KB (see gocql.newCallMap). Set ClusterConfig.MaxStreams to a negative value
+// to restore the full protocol maximum.
+const defaultMaxStreams = 2048
+
+// protocolMaxStreams returns the largest stream count the given native protocol
+// version supports: 128 for v1/v2, 32768 for v3+.
+func protocolMaxStreams(protocol int) int {
 	if protocol > 2 {
-		maxStreams = 32768
+		return 32768
+	}
+	return 128
+}
+
+// New builds a stream-ID generator for the given native protocol version.
+//
+// maxStreams selects the per-connection stream ceiling (and thus the size of the
+// callMap allocated per connection):
+//   - 0  : use defaultMaxStreams, capped to the protocol maximum
+//   - <0 : use the protocol maximum (128 for v1/v2, 32768 for v3+)
+//   - >0 : use maxStreams, capped to the protocol maximum, floored at bucketBits,
+//     and rounded up to a multiple of bucketBits
+func New(protocol, maxStreams int) *IDGenerator {
+	protoMax := protocolMaxStreams(protocol)
+
+	var n int
+	switch {
+	case maxStreams < 0:
+		n = protoMax
+	case maxStreams == 0:
+		n = min(defaultMaxStreams, protoMax)
+	default:
+		n = min(maxStreams, protoMax)
 	}
 
-	buckets := maxStreams / 64
+	// The bucket math requires NumStreams to be a positive multiple of bucketBits.
+	if n < bucketBits {
+		n = bucketBits
+	}
+	n = (n + bucketBits - 1) &^ (bucketBits - 1) // round up to a multiple of bucketBits
+
+	buckets := n / bucketBits
 	// reserve stream 0
 	streams := make([]uint64, buckets)
 	streams[0] = 1 << 63
 
 	return &IDGenerator{
-		NumStreams: maxStreams,
+		NumStreams: n,
 		streams:    streams,
 		numBuckets: uint32(buckets),
 		offset:     uint32(buckets) - 1,

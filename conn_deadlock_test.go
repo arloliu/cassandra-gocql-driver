@@ -49,8 +49,8 @@ func TestConn_CloseWithErrorNoDeadlock(t *testing.T) {
 
 	// Create a minimal Conn with just the fields needed for closeWithError
 	conn := &Conn{
-		streams: streams.New(protoVersion4),
-		calls:   newCallMap(streams.New(protoVersion4).NumStreams),
+		streams: streams.New(protoVersion4, -1),
+		calls:   newCallMap(streams.New(protoVersion4, -1).NumStreams),
 		ctx:     ctx,
 		cancel:  cancel,
 		r:       &mockConnReader{},
@@ -117,8 +117,8 @@ func TestConn_AddCallCloseRace(t *testing.T) {
 	defer cancel()
 
 	conn := &Conn{
-		streams: streams.New(protoVersion4),
-		calls:   newCallMap(streams.New(protoVersion4).NumStreams),
+		streams: streams.New(protoVersion4, -1),
+		calls:   newCallMap(streams.New(protoVersion4, -1).NumStreams),
 		ctx:     ctx,
 		cancel:  cancel,
 		r:       &mockConnReader{},

@@ -13,8 +13,10 @@ import "sync/atomic"
 // This makes the entire request-tracking hot path lock-free, removing the
 // last mutex from the per-request critical section.
 //
-// Memory: one pointer (8 bytes) per stream slot. For proto v4 (32768 streams)
-// this is 256 KB per connection. For proto v1/v2 (128 streams) this is 1 KB.
+// Memory: one pointer (8 bytes) per stream slot. The slot count comes from
+// ClusterConfig.MaxStreams (see streams.New): the default of 2048 for proto v3+
+// is 16 KB per connection, the protocol maximum of 32768 is 256 KB, and proto
+// v1/v2 (128 slots) is 1 KB.
 //
 // Close is rare; its O(numStreams) scan is acceptable.
 type callMap struct {

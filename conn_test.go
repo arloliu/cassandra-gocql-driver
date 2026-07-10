@@ -724,7 +724,7 @@ func TestStream0(t *testing.T) {
 		r: &connReader{
 			r: bufio.NewReader(&buf),
 		},
-		streams: streams.New(protoVersion4),
+		streams: streams.New(protoVersion4, -1),
 		session: &Session{
 			types: GlobalTypes,
 		},
@@ -1605,6 +1605,44 @@ func (srv *TestServer) readFrame(reader io.Reader) (*framer, error) {
 	return framer, nil
 }
 
+// TestConnProcessFrameRejectsStreamAtNumStreams is a regression test for the
+// off-by-one receive guard exposed by capping MaxStreams (A4). A response whose
+// stream id equals NumStreams is wire-representable once the table is smaller than
+// the 16-bit stream space, and must be rejected with a bounds error rather than
+// indexing one past the NumStreams-length callMap (which would panic). NumStreams-1
+// is the accepted boundary.
+func TestConnProcessFrameRejectsStreamAtNumStreams(t *testing.T) {
+	gen := streams.New(protoVersion5, 128) // capped table; NumStreams == 128
+	require.Equal(t, 128, gen.NumStreams)
+
+	c := &Conn{
+		r:       &connReader{}, // GetTimeout() == 0, so no read deadline is set
+		streams: gen,
+		calls:   newCallMap(gen.NumStreams),
+		logger:  &defaultLogger{},
+	}
+
+	header := func(stream uint16) []byte {
+		return []byte{
+			byte(protoVersion5) | 0x80,             // response frame
+			0x00,                                   // flags
+			byte(stream >> 8), byte(stream & 0xff), // stream id (big-endian)
+			byte(opResult),         // op (irrelevant to the guard)
+			0x00, 0x00, 0x00, 0x00, // length 0
+		}
+	}
+
+	// stream == NumStreams must be rejected before any callMap access (no panic/OOB).
+	err := c.processFrame(t.Context(), bytes.NewReader(header(uint16(gen.NumStreams))))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "beyond call expected bounds")
+
+	// stream == NumStreams-1 is the accepted boundary: no registered handler, so the
+	// frame is discarded without error and without panic.
+	err = c.processFrame(t.Context(), bytes.NewReader(header(uint16(gen.NumStreams-1))))
+	require.NoError(t, err)
+}
+
 func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 	server, client, err := tcpConnPair()
 	require.NoError(t, err)
@@ -1617,7 +1655,7 @@ func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 		calls:      newCallMap(64),
 		version:    protoVersion5,
 		addr:       server.RemoteAddr().String(),
-		streams:    streams.New(protoVersion5),
+		streams:    streams.New(protoVersion5, -1),
 		isSchemaV2: true,
 		w: &deadlineContextWriter{
 			w:         server,

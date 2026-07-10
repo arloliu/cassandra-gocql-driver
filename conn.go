@@ -137,6 +137,7 @@ type SslOptions struct {
 // ConnConfig contains configuration options for establishing connections to Cassandra nodes.
 type ConnConfig struct {
 	ProtoVersion   int
+	MaxStreams     int
 	CQLVersion     string
 	Timeout        time.Duration
 	WriteTimeout   time.Duration
@@ -262,7 +263,7 @@ func (s *Session) dialWithoutObserver(ctx context.Context, host *HostInfo, cfg *
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	streamGen := streams.New(cfg.ProtoVersion)
+	streamGen := streams.New(cfg.ProtoVersion, cfg.MaxStreams)
 	c := &Conn{
 		r: &connReader{
 			conn: dialedHost.Conn,
@@ -841,7 +842,7 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 		})
 	}
 
-	if head.stream > c.streams.NumStreams {
+	if head.stream >= c.streams.NumStreams {
 		return fmt.Errorf("gocql: frame header stream is beyond call expected bounds: %d", head.stream)
 	} else if head.stream == -1 {
 		// TODO: handle cassandra event frames, we shouldnt get any currently

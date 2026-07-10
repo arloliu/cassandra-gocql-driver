@@ -32,7 +32,7 @@ import (
 )
 
 func TestUsesAllStreams(t *testing.T) {
-	streams := New(1)
+	streams := New(1, 0)
 
 	got := make(map[int]struct{})
 
@@ -71,7 +71,7 @@ func TestUsesAllStreams(t *testing.T) {
 }
 
 func TestFullStreams(t *testing.T) {
-	streams := New(1)
+	streams := New(1, 0)
 	for i := range streams.streams {
 		streams.streams[i] = math.MaxUint64
 	}
@@ -83,7 +83,7 @@ func TestFullStreams(t *testing.T) {
 }
 
 func TestClearStreams(t *testing.T) {
-	streams := New(1)
+	streams := New(1, 0)
 	for i := range streams.streams {
 		streams.streams[i] = math.MaxUint64
 	}
@@ -101,7 +101,7 @@ func TestClearStreams(t *testing.T) {
 }
 
 func TestDoubleClear(t *testing.T) {
-	streams := New(1)
+	streams := New(1, 0)
 	stream, ok := streams.GetStream()
 	if !ok {
 		t.Fatal("did not get stream")
@@ -115,8 +115,110 @@ func TestDoubleClear(t *testing.T) {
 	}
 }
 
+func TestNewMaxStreams(t *testing.T) {
+	tests := []struct {
+		name             string
+		proto, maxStream int
+		want             int
+	}{
+		{"v5 default caps at 2048", 5, 0, 2048},
+		{"v5 negative restores proto max", 5, -1, 32768},
+		{"v4 default caps at 2048", 4, 0, 2048},
+		{"v3 default caps at 2048", 3, 0, 2048},
+		{"v5 explicit value", 5, 4096, 4096},
+		{"v5 rounds up to bucket multiple", 5, 100, 128},
+		{"v5 floors at bucketBits", 5, 10, 64},
+		{"v5 caps positive at proto max", 5, 100000, 32768},
+		{"v2 default capped at 128", 2, 0, 128},
+		{"v2 negative capped at 128", 2, -1, 128},
+		{"v1 explicit capped at 128", 1, 2048, 128},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := New(tt.proto, tt.maxStream)
+			if g.NumStreams != tt.want {
+				t.Errorf("New(%d, %d).NumStreams = %d, want %d", tt.proto, tt.maxStream, g.NumStreams, tt.want)
+			}
+			if g.NumStreams%bucketBits != 0 {
+				t.Errorf("NumStreams %d is not a multiple of %d", g.NumStreams, bucketBits)
+			}
+			if int(g.numBuckets) != g.NumStreams/bucketBits {
+				t.Errorf("numBuckets %d inconsistent with NumStreams %d", g.numBuckets, g.NumStreams)
+			}
+			if g.streams[0] != 1<<63 {
+				t.Errorf("stream 0 must be reserved, got bucket[0]=%x", g.streams[0])
+			}
+		})
+	}
+}
+
+// TestNewMaxStreamsAllocation verifies a capped table hands out exactly
+// NumStreams-1 streams (stream 0 is reserved) and no duplicates.
+func TestNewMaxStreamsAllocation(t *testing.T) {
+	g := New(5, 128)
+
+	seen := make(map[int]struct{})
+	for {
+		stream, ok := g.GetStream()
+		if !ok {
+			break
+		}
+		if stream <= 0 || stream >= g.NumStreams {
+			t.Fatalf("stream %d out of range [1,%d)", stream, g.NumStreams)
+		}
+		if _, dup := seen[stream]; dup {
+			t.Fatalf("duplicate stream handed out: %d", stream)
+		}
+		seen[stream] = struct{}{}
+	}
+
+	if len(seen) != g.NumStreams-1 {
+		t.Errorf("allocated %d streams, want %d", len(seen), g.NumStreams-1)
+	}
+}
+
+// TestNewDefaultExhaustClearReuse exercises the v3+ default (2048) table end to
+// end: it must expose exactly NumStreams-1 usable streams, refuse allocation once
+// saturated, and hand a freed stream back out after Clear.
+func TestNewDefaultExhaustClearReuse(t *testing.T) {
+	g := New(5, 0) // default -> 2048 for proto v3+
+	if g.NumStreams != 2048 {
+		t.Fatalf("default NumStreams = %d, want 2048", g.NumStreams)
+	}
+
+	allocated := 0
+	for {
+		if _, ok := g.GetStream(); !ok {
+			break
+		}
+		allocated++
+	}
+	if allocated != g.NumStreams-1 {
+		t.Fatalf("exhausted %d streams, want %d (stream 0 reserved)", allocated, g.NumStreams-1)
+	}
+
+	// Saturated: the next allocation must fail.
+	if _, ok := g.GetStream(); ok {
+		t.Fatal("expected GetStream to fail on a saturated table")
+	}
+
+	// Free a stream and confirm it becomes allocatable again.
+	const freed = 100
+	if !g.Clear(freed) {
+		t.Fatalf("Clear(%d) reported the stream was not in use", freed)
+	}
+	got, ok := g.GetStream()
+	if !ok {
+		t.Fatal("expected GetStream to succeed after Clear")
+	}
+	if got != freed {
+		t.Fatalf("reacquired stream %d, want the freed stream %d", got, freed)
+	}
+}
+
 func BenchmarkConcurrentUse(b *testing.B) {
-	streams := New(2)
+	streams := New(2, 0)
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {

@@ -44,7 +44,7 @@ func BenchmarkHostConnPool_Pick(b *testing.B) {
 			// Setup connections with mocked streams
 			for i := 0; i < size; i++ {
 				conn := &Conn{
-					streams: streams.New(4), // Protocol 4
+					streams: streams.New(4, -1), // Protocol 4
 				}
 				pool.conns[i] = conn
 			}
@@ -84,8 +84,9 @@ func BenchmarkConn_Contention(b *testing.B) {
 	b.Run("atomic_map_plus_conn_mu/allocator", BenchmarkConnCalls_AtomicPlusConnMu_Allocator)
 }
 
-// benchCallMapSize is the atomic array size for benchmarks.
-// Matches proto v4 max streams (32768) — the same value used by dialWithoutObserver.
+// benchCallMapSize is the atomic array size for benchmarks. It uses the protocol
+// maximum (32768) to exercise the worst case; the production default is smaller
+// (ClusterConfig.MaxStreams, 2048 for proto v3+).
 const benchCallMapSize = 32768
 
 // The following top-level benchmarks exist so profiling can target one case
@@ -198,7 +199,7 @@ func benchmarkCallsWorkerStream(b *testing.B, calls callTracker) {
 
 func benchmarkCallsWithAllocator(b *testing.B, calls callTracker) {
 	conn := &Conn{
-		streams: streams.New(4),
+		streams: streams.New(4, -1),
 	}
 
 	b.ReportAllocs()
