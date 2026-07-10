@@ -439,6 +439,61 @@ var framerPool = sync.Pool{
 // while still bounding worst-case retention per framer.
 const maxPooledBufSize = 2 * 1024 * 1024
 
+// defaultSegmentBufSize is the initial capacity of a pooled segment payload
+// buffer; it grows to the segment size on demand.
+const defaultSegmentBufSize = 1 << 12 // 4 KiB
+
+// segmentBufferPool pools proto-v5 segment payload buffers for the uncompressed
+// read path (readUncompressedSegment). A segment payload is at most
+// maxSegmentPayloadSize (0x1FFFF, ~128 KiB) by protocol, so — unlike framerPool —
+// there is no oversized buffer to discard on release. readUncompressedSegment
+// hands the buffer to its caller, which returns it via releaseSegmentBuffer once
+// the payload has been copied out; retention is therefore bounded by recent peak
+// concurrent in-flight segments (like framerPool), not by connection count.
+var segmentBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, defaultSegmentBufSize)
+		return &b
+	},
+}
+
+// segmentBufferPut is the production pool sink, created once at package init so
+// releaseSegmentBuffer forwards to the pool without allocating per release
+// (storing a *[]byte into the any parameter does not allocate). It is passed to
+// releaseSegmentBufferInto.
+var segmentBufferPut = func(bp *[]byte) { segmentBufferPool.Put(bp) }
+
+// getSegmentBuffer returns a pooled buffer of length n (capacity >= n), reusing
+// the backing array when it is large enough and growing it otherwise.
+func getSegmentBuffer(n int) *[]byte {
+	bp := segmentBufferPool.Get().(*[]byte)
+	if cap(*bp) < n {
+		*bp = make([]byte, n)
+	} else {
+		*bp = (*bp)[:n]
+	}
+	return bp
+}
+
+// releaseSegmentBuffer returns a segment payload buffer to the pool. It is
+// nil-safe: the compressed read path never acquires a pooled buffer and passes
+// nil, and storing a typed-nil *[]byte would panic on the next getSegmentBuffer
+// dereference.
+func releaseSegmentBuffer(bp *[]byte) {
+	releaseSegmentBufferInto(segmentBufferPut, bp)
+}
+
+// releaseSegmentBufferInto is the nil-filtering core of releaseSegmentBuffer,
+// with the pool sink injected so the nil guard can be verified deterministically
+// (a real sync.Pool.Get is non-deterministic under -race, so a pool-round-trip
+// test could not reliably catch removal of the guard).
+func releaseSegmentBufferInto(put func(*[]byte), bp *[]byte) {
+	if bp == nil {
+		return
+	}
+	put(bp)
+}
+
 func newFramer(compressor Compressor, version byte, r *RegisteredTypes) *framer {
 	buf := make([]byte, defaultBufSize)
 	f := &framer{
@@ -2573,7 +2628,13 @@ const (
 	crc32Size = 4
 )
 
-func readUncompressedSegment(r io.Reader) ([]byte, bool, error) {
+// readUncompressedSegment reads one proto-v5 uncompressed segment. On success it
+// returns the payload together with the pooled buffer backing it (bufPtr); the
+// caller MUST return that buffer via releaseSegmentBuffer once the payload has
+// been copied out (every consumer copies it, so the buffer is reusable
+// afterward). On error the pooled buffer, if any, is released internally and
+// bufPtr is nil, so the caller owns release only on success.
+func readUncompressedSegment(r io.Reader) (payload []byte, bufPtr *[]byte, isSelfContained bool, err error) {
 	const (
 		headerSize = 3
 	)
@@ -2582,39 +2643,44 @@ func readUncompressedSegment(r io.Reader) ([]byte, bool, error) {
 
 	// Read the frame header
 	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return nil, false, fmt.Errorf("gocql: failed to read uncompressed frame, err: %w", err)
+		return nil, nil, false, fmt.Errorf("gocql: failed to read uncompressed frame, err: %w", err)
 	}
 
 	// Compute and verify the header CRC24
 	computedHeaderCRC24 := Crc24(header[:headerSize])
 	readHeaderCRC24 := uint32(header[3]) | uint32(header[4])<<8 | uint32(header[5])<<16
 	if computedHeaderCRC24 != readHeaderCRC24 {
-		return nil, false, fmt.Errorf("gocql: crc24 mismatch in frame header, computed: %d, got: %d", computedHeaderCRC24, readHeaderCRC24)
+		return nil, nil, false, fmt.Errorf("gocql: crc24 mismatch in frame header, computed: %d, got: %d", computedHeaderCRC24, readHeaderCRC24)
 	}
 
 	// Extract the payload length and self-contained flag
 	headerInt := uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16
 	payloadLen := int(headerInt & maxSegmentPayloadSize)
-	isSelfContained := (headerInt & (1 << 17)) != 0
+	isSelfContained = (headerInt & (1 << 17)) != 0
 
-	// Read the payload
-	payload := make([]byte, payloadLen)
+	// Read the payload into a pooled buffer. io.ReadFull overwrites exactly
+	// payloadLen bytes, so any stale capacity beyond that is never observed.
+	bufPtr = getSegmentBuffer(payloadLen)
+	payload = *bufPtr
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, false, fmt.Errorf("gocql: failed to read uncompressed frame payload, err: %w", err)
+		releaseSegmentBuffer(bufPtr)
+		return nil, nil, false, fmt.Errorf("gocql: failed to read uncompressed frame payload, err: %w", err)
 	}
 
 	// Read and verify the payload CRC32
 	if _, err := io.ReadFull(r, header[:crc32Size]); err != nil {
-		return nil, false, fmt.Errorf("gocql: failed to read payload crc32, err: %w", err)
+		releaseSegmentBuffer(bufPtr)
+		return nil, nil, false, fmt.Errorf("gocql: failed to read payload crc32, err: %w", err)
 	}
 
 	computedPayloadCRC32 := Crc32(payload)
 	readPayloadCRC32 := binary.LittleEndian.Uint32(header[:crc32Size])
 	if computedPayloadCRC32 != readPayloadCRC32 {
-		return nil, false, fmt.Errorf("gocql: payload crc32 mismatch, computed: %d, got: %d", computedPayloadCRC32, readPayloadCRC32)
+		releaseSegmentBuffer(bufPtr)
+		return nil, nil, false, fmt.Errorf("gocql: payload crc32 mismatch, computed: %d, got: %d", computedPayloadCRC32, readPayloadCRC32)
 	}
 
-	return payload, isSelfContained, nil
+	return payload, bufPtr, isSelfContained, nil
 }
 
 func newUncompressedSegment(payload []byte, isSelfContained bool) ([]byte, error) {

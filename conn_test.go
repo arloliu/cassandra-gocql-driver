@@ -1193,7 +1193,11 @@ func (srv *TestServer) serve() {
 				var reader io.Reader = conn
 
 				if useProtoV5 && startupCompleted {
-					frame, _, err := readUncompressedSegment(conn)
+					// Test server: discard the pooled buffer pointer and skip
+					// releasing it. srv.readFrame copies the payload out, but
+					// releasing before that copy could hand the buffer to another
+					// caller mid-read; not pooling here is harmless in tests.
+					frame, _, _, err := readUncompressedSegment(conn)
 					if err != nil {
 						if errors.Is(err, io.EOF) {
 							return
@@ -1737,4 +1741,104 @@ func TestConnProcessAllFramesInSingleSegment(t *testing.T) {
 	case err := <-errCh:
 		require.NoError(t, err)
 	}
+}
+
+// TestConnRecvSegmentNonSelfContained drives recvSegment's non-self-contained
+// branch: one frame is hand-split across two uncompressed segments, so recvSegment
+// reads the head segment and recvPartialFrames reassembles the remainder. This is
+// the path where the pooled segment payload buffers (B1) are released after being
+// copied into the accumulation buffer, so a lifetime bug there would corrupt the
+// reassembled frame delivered to call.resp. The body assertion runs in the test
+// goroutine (not an unjoined helper), so a corrupted reassembly fails the test.
+func TestConnRecvSegmentNonSelfContained(t *testing.T) {
+	server, client, err := tcpConnPair()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		server.Close()
+		client.Close()
+	})
+
+	c := &Conn{
+		r: &connReader{
+			conn: server,
+			r:    bufio.NewReader(server),
+		},
+		calls:      newCallMap(64),
+		version:    protoVersion5,
+		addr:       server.RemoteAddr().String(),
+		streams:    streams.New(protoVersion5, -1),
+		isSchemaV2: true,
+		w: &deadlineContextWriter{
+			w:         server,
+			timeout:   time.Second * 10,
+			semaphore: make(chan struct{}, 1),
+			quit:      make(chan struct{}),
+		},
+		writeTimeout: time.Second * 10,
+		session:      &Session{types: GlobalTypes},
+		logger:       &defaultLogger{},
+	}
+
+	call := &callReq{
+		timeout:  make(chan struct{}),
+		streamID: 1,
+		resp:     make(chan callResp),
+	}
+	c.calls.tryStore(1, call)
+
+	req := writeQueryFrame{
+		statement: "SELECT * FROM system.local",
+		params: queryParams{
+			consistency: Quorum,
+			keyspace:    "gocql_test",
+		},
+	}
+
+	framer := newFramer(nil, protoVersion5, GlobalTypes)
+	err = req.buildFrame(framer, 1)
+	require.NoError(t, err)
+
+	// Split the frame so the first piece carries the full 9-byte header (so
+	// recvSegment can read head.length) plus a few body bytes, and the second
+	// piece carries the rest. Both segments are marked not self-contained.
+	const split = frameHeadSize + 3
+	require.Greater(t, len(framer.buf), split, "frame must span more than one segment")
+
+	seg1, err := newUncompressedSegment(framer.buf[:split], false)
+	require.NoError(t, err)
+	seg2, err := newUncompressedSegment(framer.buf[split:], false)
+	require.NoError(t, err)
+
+	writeErr := make(chan error, 1)
+	go func() {
+		if _, werr := client.Write(seg1); werr != nil {
+			writeErr <- werr
+			return
+		}
+		_, werr := client.Write(seg2)
+		writeErr <- werr
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.recvSegment(ctx)
+	}()
+
+	// Receive and assert synchronously so test completion depends on the body
+	// check. recvSegment blocks on this send until we receive, then returns.
+	select {
+	case <-ctx.Done():
+		t.Fatal("Timed out waiting for reassembled frame")
+	case resp := <-call.resp:
+		require.NoError(t, resp.err)
+		// resp.framer holds the reassembled body (header already parsed).
+		require.Equal(t, framer.buf[frameHeadSize:], resp.framer.buf)
+		resp.framer.release()
+	}
+
+	require.NoError(t, <-errCh)
+	require.NoError(t, <-writeErr)
 }

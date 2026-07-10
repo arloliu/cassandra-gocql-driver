@@ -368,17 +368,93 @@ func Test_readUncompressedFrame(t *testing.T) {
 				frame = tt.modifyFrame(frame)
 			}
 
-			readFrame, isSelfContained, err := readUncompressedSegment(bytes.NewReader(frame))
+			readFrame, bufPtr, isSelfContained, err := readUncompressedSegment(bytes.NewReader(frame))
 
 			if tt.expectedErr != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tt.expectedErr)
+				// On error the pooled buffer is released internally and no
+				// ownership escapes to the caller.
+				assert.Nil(t, bufPtr)
 			} else {
 				require.NoError(t, err)
 				assert.True(t, isSelfContained)
 				assert.Equal(t, framer.buf, readFrame)
+				releaseSegmentBuffer(bufPtr)
 			}
 		})
+	}
+}
+
+// TestSegmentBuffer covers getSegmentBuffer sizing/growth: a buffer is resliced
+// to exactly the requested length and the backing array grows when the request
+// exceeds current capacity.
+func TestSegmentBuffer(t *testing.T) {
+	// getSegmentBuffer returns a buffer of exactly the requested length.
+	bp := getSegmentBuffer(100)
+	require.NotNil(t, bp)
+	assert.Len(t, *bp, 100)
+	assert.GreaterOrEqual(t, cap(*bp), 100)
+	releaseSegmentBuffer(bp)
+
+	// A larger request grows the backing array to fit.
+	big := getSegmentBuffer(maxSegmentPayloadSize)
+	assert.Len(t, *big, maxSegmentPayloadSize)
+	assert.GreaterOrEqual(t, cap(*big), maxSegmentPayloadSize)
+	releaseSegmentBuffer(big)
+
+	// The production wrapper must not panic on nil (end-to-end smoke over the real
+	// pool); the deterministic guard is TestReleaseSegmentBufferFiltersNil.
+	assert.NotPanics(t, func() { releaseSegmentBuffer(nil) })
+}
+
+// TestReleaseSegmentBufferFiltersNil deterministically verifies the nil guard:
+// a nil buffer must NOT reach the pool (a typed-nil *[]byte would panic a later
+// getSegmentBuffer dereference), and a real buffer must be forwarded exactly
+// once. It drives releaseSegmentBufferInto with a counting sink, so the check is
+// independent of non-deterministic sync.Pool.Get behavior under -race and races
+// on no shared state. Removing the nil guard makes the first assertion fail.
+func TestReleaseSegmentBufferFiltersNil(t *testing.T) {
+	var puts []*[]byte
+	sink := func(bp *[]byte) { puts = append(puts, bp) }
+
+	releaseSegmentBufferInto(sink, nil)
+	require.Empty(t, puts, "nil must be filtered before reaching the pool")
+
+	b := make([]byte, 8)
+	releaseSegmentBufferInto(sink, &b)
+	require.Len(t, puts, 1)
+	assert.Same(t, &b, puts[0])
+}
+
+// BenchmarkReadUncompressedSegment proves the payload buffer is pooled: with a
+// reused bytes.Reader (so the reader itself is not measured), a steady-state
+// read+release should not allocate a fresh payload per segment. Run outside the
+// -race gate (sync.Pool drops puts under -race), so this is the allocation
+// regression proof, not a -race assertion.
+func BenchmarkReadUncompressedSegment(b *testing.B) {
+	framer := newFramer(nil, protoVersion5, GlobalTypes)
+	req := writeQueryFrame{
+		statement: "SELECT * FROM system.local",
+		params:    queryParams{consistency: Quorum, keyspace: "gocql_test"},
+	}
+	if err := req.buildFrame(framer, 128); err != nil {
+		b.Fatal(err)
+	}
+	seg, err := newUncompressedSegment(framer.buf, true)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	r := bytes.NewReader(nil)
+	b.ReportAllocs()
+	for b.Loop() {
+		r.Reset(seg)
+		_, bufPtr, _, err := readUncompressedSegment(r)
+		if err != nil {
+			b.Fatal(err)
+		}
+		releaseSegmentBuffer(bufPtr)
 	}
 }
 

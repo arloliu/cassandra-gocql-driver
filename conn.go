@@ -935,6 +935,7 @@ func (c *Conn) releaseStream(call *callReq) {
 func (c *Conn) recvSegment(ctx context.Context) error {
 	var (
 		frame           []byte
+		payloadBuf      *[]byte // pooled buffer backing frame; nil on the compressed path
 		isSelfContained bool
 		err             error
 	)
@@ -943,11 +944,17 @@ func (c *Conn) recvSegment(ctx context.Context) error {
 	if c.compressor != nil {
 		frame, isSelfContained, err = readCompressedSegment(c.r, c.compressor)
 	} else {
-		frame, isSelfContained, err = readUncompressedSegment(c.r)
+		frame, payloadBuf, isSelfContained, err = readUncompressedSegment(c.r)
 	}
 	if err != nil {
 		return err
 	}
+	// Every consumer below copies the payload out (readFrame/readHeader/buf.Write),
+	// so the buffer can be returned once this segment is fully processed. A single
+	// deferred release covers all exit paths; holding it through recvPartialFrames/
+	// processFrame in the non-self-contained case is harmless (frame is already
+	// copied into buf). releaseSegmentBuffer is nil-safe for the compressed path.
+	defer releaseSegmentBuffer(payloadBuf)
 
 	if isSelfContained {
 		return c.processAllFramesInSegment(ctx, bytes.NewReader(frame))
@@ -984,26 +991,32 @@ func (c *Conn) recvPartialFrames(dst *bytes.Buffer, bytesToRead int) error {
 	)
 
 	for read != bytesToRead {
+		var payloadBuf *[]byte // pooled buffer backing frame; nil on the compressed path
+
 		// Read frame based on compression
 		if c.compressor != nil {
 			frame, isSelfContained, err = readCompressedSegment(c.r, c.compressor)
 		} else {
-			frame, isSelfContained, err = readUncompressedSegment(c.r)
+			frame, payloadBuf, isSelfContained, err = readUncompressedSegment(c.r)
 		}
 		if err != nil {
 			return fmt.Errorf("gocql: failed to read non self-contained frame: %w", err)
 		}
 
 		if isSelfContained {
+			releaseSegmentBuffer(payloadBuf)
 			return fmt.Errorf("gocql: received self-contained segment, but expected not")
 		}
 
 		if totalLength := dst.Len() + len(frame); totalLength > dst.Cap() {
+			releaseSegmentBuffer(payloadBuf)
 			return fmt.Errorf("gocql: expected partial frame of length %d, got %d", dst.Cap(), totalLength)
 		}
 
-		// Write the frame to the destination writer
+		// Write (copy) the frame to the destination buffer, then release the
+		// pooled payload buffer — it is no longer referenced after the copy.
 		n, _ := dst.Write(frame)
+		releaseSegmentBuffer(payloadBuf)
 		read += n
 	}
 
