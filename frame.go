@@ -2755,8 +2755,10 @@ func (f *framer) prepareModernLayout() error {
 
 // appendUncompressedSegment builds one proto-v5 uncompressed segment (6-byte header,
 // payload, 4-byte CRC32) for payload into dst, reusing dst's capacity. dst must be
-// empty (len 0); it is the allocation-free write-side counterpart to
-// newUncompressedSegment for the self-contained single-segment case.
+// empty (len 0) and must not overlap payload (the header is written before payload is
+// copied and CRC32'd). It is the single encoder for uncompressed segments:
+// newUncompressedSegment is a nil-dst (always-allocating) wrapper, and the write path
+// passes a reusable buffer for the self-contained single-segment case.
 func appendUncompressedSegment(dst, payload []byte, isSelfContained bool) ([]byte, error) {
 	const (
 		headerSize       = 6
@@ -2856,47 +2858,11 @@ func readUncompressedSegment(r io.Reader) (payload []byte, bufPtr *[]byte, isSel
 	return payload, bufPtr, isSelfContained, nil
 }
 
+// newUncompressedSegment builds one proto-v5 uncompressed segment in a freshly
+// allocated buffer. It is a thin always-allocating wrapper over the shared encoder so
+// there is a single authority for this corruption-sensitive wire format.
 func newUncompressedSegment(payload []byte, isSelfContained bool) ([]byte, error) {
-	const (
-		headerSize       = 6
-		selfContainedBit = 1 << 17
-	)
-
-	payloadLen := len(payload)
-	if payloadLen > maxSegmentPayloadSize {
-		return nil, fmt.Errorf("gocql: payload length (%d) exceeds maximum size of %d", payloadLen, maxSegmentPayloadSize)
-	}
-
-	// Create the segment
-	segmentSize := headerSize + payloadLen + crc32Size
-	segment := make([]byte, segmentSize)
-
-	// First 3 bytes: payload length and self-contained flag
-	headerInt := uint32(payloadLen)
-	if isSelfContained {
-		headerInt |= selfContainedBit // Set the self-contained flag
-	}
-
-	// Encode the first 3 bytes as a single little-endian integer
-	segment[0] = byte(headerInt)
-	segment[1] = byte(headerInt >> 8)
-	segment[2] = byte(headerInt >> 16)
-
-	// Calculate CRC24 for the first 3 bytes of the header
-	crc := Crc24(segment[:3])
-
-	// Encode CRC24 into the next 3 bytes of the header
-	segment[3] = byte(crc)
-	segment[4] = byte(crc >> 8)
-	segment[5] = byte(crc >> 16)
-
-	copy(segment[headerSize:], payload) // Copy the payload to the segment
-
-	// Calculate CRC32 for the payload
-	payloadCRC32 := Crc32(payload)
-	binary.LittleEndian.PutUint32(segment[headerSize+payloadLen:], payloadCRC32)
-
-	return segment, nil
+	return appendUncompressedSegment(nil, payload, isSelfContained)
 }
 
 func newCompressedSegment(uncompressedPayload []byte, isSelfContained bool, compressor Compressor) ([]byte, error) {
