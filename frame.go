@@ -2809,7 +2809,13 @@ const (
 // been copied out (every consumer copies it, so the buffer is reusable
 // afterward). On error the pooled buffer, if any, is released internally and
 // bufPtr is nil, so the caller owns release only on success.
-func readUncompressedSegment(r io.Reader) (payload []byte, bufPtr *[]byte, isSelfContained bool, err error) {
+// onSegmentHeader, when non-nil, is invoked once the segment header has been
+// read and validated, immediately before the payload read. recvSegment uses it
+// to restore the read deadline it disabled while idle-waiting for the next
+// segment to begin, so that a peer stalling mid-payload cannot hang the receive
+// loop indefinitely. Callers that read a segment with a deadline already in
+// force (continuation segments, tests) pass nil.
+func readUncompressedSegment(r io.Reader, onSegmentHeader func()) (payload []byte, bufPtr *[]byte, isSelfContained bool, err error) {
 	const (
 		headerSize = 3
 	)
@@ -2832,6 +2838,11 @@ func readUncompressedSegment(r io.Reader) (payload []byte, bufPtr *[]byte, isSel
 	headerInt := uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16
 	payloadLen := int(headerInt & maxSegmentPayloadSize)
 	isSelfContained = (headerInt & (1 << 17)) != 0
+
+	// The segment has begun arriving; re-arm the read deadline for the payload.
+	if onSegmentHeader != nil {
+		onSegmentHeader()
+	}
 
 	// Read the payload into a pooled buffer. io.ReadFull overwrites exactly
 	// payloadLen bytes, so any stale capacity beyond that is never observed.
@@ -2930,7 +2941,10 @@ func newCompressedSegment(uncompressedPayload []byte, isSelfContained bool, comp
 	return buf.Bytes(), nil
 }
 
-func readCompressedSegment(r io.Reader, compressor Compressor) ([]byte, bool, error) {
+// onSegmentHeader has the same contract as in readUncompressedSegment: it is
+// invoked once the segment header is read and validated, before the payload
+// read, so recvSegment can re-arm the read deadline it disabled while idle.
+func readCompressedSegment(r io.Reader, compressor Compressor, onSegmentHeader func()) ([]byte, bool, error) {
 	const headerSize = 5
 	var (
 		headerBuf [headerSize + crc24Size]byte
@@ -2955,6 +2969,11 @@ func readCompressedSegment(r io.Reader, compressor Compressor) ([]byte, bool, er
 
 	// Self-contained flag
 	selfContained := (headerBuf[4] & 0b100) != 0
+
+	// The segment has begun arriving; re-arm the read deadline for the payload.
+	if onSegmentHeader != nil {
+		onSegmentHeader()
+	}
 
 	compressedPayload := make([]byte, compressedLen)
 	if _, err = io.ReadFull(r, compressedPayload); err != nil {

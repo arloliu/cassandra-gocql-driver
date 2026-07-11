@@ -22,34 +22,40 @@
 package gocql
 
 import (
+	"bufio"
 	"context"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
-// idleReconnectStartupCount stands up the fake server, opens a single pool
-// connection with a small Session.Timeout, lets it sit idle well past several
-// timeout windows, and returns how many STARTUP frames the server saw.
+// assertNoIdleReconnect opens a single pool connection with a small
+// Session.Timeout, then confirms the connection does not reconnect while idle.
 //
-// Each (re)connect sends exactly one STARTUP, so the count is a direct,
-// log-independent measure of reconnect churn: a healthy idle connection yields
-// exactly 1, while the inherited v2.0.0 read-deadline regression (upstream
-// CASSGO-125 / 590aabe) makes the connection trip its read deadline while
-// waiting for the next frame and reconnect repeatedly, inflating the count.
-func idleReconnectStartupCount(t *testing.T, proto protoVersion) int64 {
+// It is event-driven: the server's recvHook publishes onto startupCh for every
+// STARTUP frame (one per (re)connect), so the test reacts the instant a
+// reconnect happens instead of sleeping and sampling. A healthy idle connection
+// produces exactly one STARTUP (the initial connect) and none thereafter; the
+// inherited v2.0.0 read-deadline regression (upstream CASSGO-125 / 590aabe)
+// would trip the read deadline while waiting for the next frame and reconnect,
+// publishing more STARTUP frames.
+func assertNoIdleReconnect(t *testing.T, proto protoVersion) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var startups atomic.Int64
+	startupCh := make(chan struct{}, 16)
 	srv := newTestServerOpts{
 		addr:     "127.0.0.1:0",
 		protocol: uint8(proto),
 		recvHook: func(f *framer) {
 			if f.header.op == opStartup {
-				startups.Add(1)
+				select {
+				case startupCh <- struct{}{}:
+				default:
+				}
 			}
 		},
 	}.newServer(t, ctx)
@@ -59,41 +65,166 @@ func idleReconnectStartupCount(t *testing.T, proto protoVersion) int64 {
 	cluster.Timeout = 200 * time.Millisecond
 	cluster.NumConns = 1
 	db, err := cluster.CreateSession()
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
+	require.NoError(t, err, "CreateSession")
 	defer db.Close()
 
-	// Idle far longer than Session.Timeout so the read deadline, if it is
-	// (wrongly) armed on idle frame reads, has many chances to fire.
-	time.Sleep(1500 * time.Millisecond)
-
-	// Snapshot the reconnect churn accumulated purely from idling, before the
-	// query below (which would itself reconnect if the connection had died).
-	idleStartups := startups.Load()
-
-	// The connection that survived the idle period must still be usable: a query
-	// after the long idle must succeed. This also fails loudly if the idle read
-	// left the connection wedged (e.g. the read timeout stuck at 0 or unrestored).
-	if err := db.Query("void").Exec(); err != nil {
-		t.Fatalf("query after idle failed (connection wedged or dead): %v", err)
+	// Drain the initial connection's STARTUP.
+	select {
+	case <-startupCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial connection never sent STARTUP")
 	}
 
-	return idleStartups
+	// Watch for a second STARTUP over a window many Session.Timeouts long. With
+	// the bug the idle read deadline fires roughly every Session.Timeout, closing
+	// and re-establishing the connection; this select fails the moment that
+	// happens rather than after a fixed sleep.
+	const watch = 1500 * time.Millisecond
+	select {
+	case <-startupCh:
+		t.Fatalf("idle connection reconnected: a second STARTUP arrived within %v (read deadline firing on idle frame/segment reads)", watch)
+	case <-time.After(watch):
+		// No reconnect observed.
+	}
+
+	// The surviving connection must still be usable, and no reconnect may race
+	// this query (startupCh is still being collected).
+	require.NoError(t, db.Query("void").Exec(), "query after idle")
+	select {
+	case <-startupCh:
+		t.Fatal("connection reconnected around the post-idle query")
+	default:
+	}
 }
 
 // TestIdleConnectionDoesNotReconnectV4 exercises the pre-v5 processFrame read
-// path. Regression guard for the "repeated Pool connection error" churn.
+// path.
 func TestIdleConnectionDoesNotReconnectV4(t *testing.T) {
-	if got := idleReconnectStartupCount(t, protoVersion4); got != 1 {
-		t.Fatalf("idle connection reconnected: saw %d STARTUP frames, want 1 (read deadline is firing on idle frame reads)", got)
-	}
+	assertNoIdleReconnect(t, protoVersion4)
 }
 
 // TestIdleConnectionDoesNotReconnectV5 exercises the proto-v5 recvSegment read
 // path (the path otter-cache uses in production).
 func TestIdleConnectionDoesNotReconnectV5(t *testing.T) {
-	if got := idleReconnectStartupCount(t, protoVersion5); got != 1 {
-		t.Fatalf("idle connection reconnected: saw %d STARTUP frames, want 1 (read deadline is firing on idle segment reads)", got)
+	assertNoIdleReconnect(t, protoVersion5)
+}
+
+// uncompressedSegmentHeader builds a wire-valid 6-byte proto-v5 uncompressed
+// segment header (3 length/flag bytes + CRC24) advertising the given payload
+// length, without any payload.
+func uncompressedSegmentHeader(payloadLen int, selfContained bool) []byte {
+	headerInt := uint32(payloadLen) & maxSegmentPayloadSize
+	if selfContained {
+		headerInt |= 1 << 17
+	}
+	h := make([]byte, 6)
+	h[0] = byte(headerInt)
+	h[1] = byte(headerInt >> 8)
+	h[2] = byte(headerInt >> 16)
+	crc := Crc24(h[:3])
+	h[3] = byte(crc)
+	h[4] = byte(crc >> 8)
+	h[5] = byte(crc >> 16)
+	return h
+}
+
+// TestReadUncompressedSegmentBoundsPayloadAfterHeader is the regression guard
+// for the proto-v5 half of the CASSGO-125 fix: recvSegment disables the read
+// deadline only while idle-waiting for a segment to begin, then re-arms it via
+// onSegmentHeader before the payload read. A peer that sends a valid segment
+// header and then stalls mid-payload must therefore hit the deadline instead of
+// hanging the receive loop.
+//
+// Without the onSegmentHeader restore the payload read would run with no
+// deadline and this test would block until its own timeout fires.
+func TestReadUncompressedSegmentBoundsPayloadAfterHeader(t *testing.T) {
+	server, client, err := tcpConnPair()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		server.Close()
+		client.Close()
+	})
+
+	cr := &connReader{conn: client, r: bufio.NewReader(client)}
+	// Idle: no read deadline while waiting for the segment to begin.
+	cr.SetTimeout(0)
+
+	// The peer sends a valid header advertising a 100-byte payload, then stalls
+	// (never writes the payload).
+	go func() {
+		_, _ = server.Write(uncompressedSegmentHeader(100, true))
+	}()
+
+	const payloadDeadline = 100 * time.Millisecond
+	restored := make(chan struct{})
+	onSegmentHeader := func() {
+		cr.SetTimeout(payloadDeadline)
+		close(restored)
+	}
+
+	type readResult struct {
+		bufPtr *[]byte
+		err    error
+	}
+	done := make(chan readResult, 1)
+	start := time.Now()
+	go func() {
+		_, bufPtr, _, err := readUncompressedSegment(cr, onSegmentHeader)
+		done <- readResult{bufPtr, err}
+	}()
+
+	select {
+	case res := <-done:
+		if res.bufPtr != nil {
+			releaseSegmentBuffer(res.bufPtr)
+		}
+		require.Error(t, res.err, "stalled payload read must fail on the re-armed deadline, not succeed")
+		require.Less(t, time.Since(start), 2*time.Second, "payload read must be bounded by the re-armed deadline")
+	case <-time.After(3 * time.Second):
+		t.Fatal("readUncompressedSegment blocked past the re-armed deadline: the payload read is not bounded (onSegmentHeader restore missing?)")
+	}
+
+	select {
+	case <-restored:
+	default:
+		t.Fatal("onSegmentHeader was not invoked after the segment header was read")
+	}
+}
+
+// TestRecvSegmentBoundsPayloadAfterHeader is the end-to-end guard for the same
+// property through the production wiring: it drives Conn.recvSegment (not the
+// reader directly), so it fails if recvSegment ever stops passing its re-arming
+// callback to the segment reader. The peer sends a valid uncompressed segment
+// header then stalls; recvSegment must return a deadline error rather than
+// blocking the receive loop.
+func TestRecvSegmentBoundsPayloadAfterHeader(t *testing.T) {
+	server, client, err := tcpConnPair()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		server.Close()
+		client.Close()
+	})
+
+	c := &Conn{
+		r:       &connReader{conn: client, r: bufio.NewReader(client)},
+		version: protoVersion5,
+	}
+	// A non-zero read timeout drives recvSegment's toggle-and-restore path.
+	c.r.SetTimeout(150 * time.Millisecond)
+
+	go func() {
+		_, _ = server.Write(uncompressedSegmentHeader(100, true))
+	}()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- c.recvSegment(context.Background()) }()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "recvSegment must fail on the re-armed deadline when the peer stalls mid-payload")
+		require.Less(t, time.Since(start), 2*time.Second, "recvSegment must be bounded by the re-armed read deadline")
+	case <-time.After(3 * time.Second):
+		t.Fatal("recvSegment blocked past the re-armed deadline: a proto-v5 idle-then-stall connection hangs the receive loop (recvSegment not passing its onSegmentHeader callback?)")
 	}
 }

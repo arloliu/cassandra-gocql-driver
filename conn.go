@@ -989,21 +989,27 @@ func (c *Conn) recvSegment(ctx context.Context) error {
 
 	// Wait for the next segment without a read deadline: an idle proto-v5
 	// connection must not trip the deadline between frames (CASSGO-125). The
-	// continuation segments read in recvPartialFrames are mid-frame and keep the
-	// timeout. See processFrame for why the timeout is toggled rather than the
-	// deadline cleared directly.
+	// deadline is re-armed by onSegmentHeader as soon as the segment header has
+	// been read, so only the idle wait is unbounded — the payload and CRC (and
+	// the continuation segments in recvPartialFrames) stay bounded, mirroring the
+	// header/body split in processFrame. See processFrame for why the timeout is
+	// toggled rather than the deadline cleared directly.
 	readTimeout := c.r.GetTimeout()
+	var onSegmentHeader func()
 	if readTimeout > 0 {
 		c.r.SetTimeout(0)
+		onSegmentHeader = func() { c.r.SetTimeout(readTimeout) }
 	}
 
 	// Read frame based on compression
 	if c.compressor != nil {
-		frame, isSelfContained, err = readCompressedSegment(c.r, c.compressor)
+		frame, isSelfContained, err = readCompressedSegment(c.r, c.compressor, onSegmentHeader)
 	} else {
-		frame, payloadBuf, isSelfContained, err = readUncompressedSegment(c.r)
+		frame, payloadBuf, isSelfContained, err = readUncompressedSegment(c.r, onSegmentHeader)
 	}
 
+	// Safety net: restore the timeout if the reader returned before reading the
+	// header (e.g. the idle read hit EOF), so onSegmentHeader never fired.
 	if readTimeout > 0 {
 		c.r.SetTimeout(readTimeout)
 	}
@@ -1054,11 +1060,12 @@ func (c *Conn) recvPartialFrames(dst *bytes.Buffer, bytesToRead int) error {
 	for read != bytesToRead {
 		var payloadBuf *[]byte // pooled buffer backing frame; nil on the compressed path
 
-		// Read frame based on compression
+		// Continuation segments are mid-frame: a read deadline is already in force
+		// (recvSegment restored it after the first segment header), so pass nil.
 		if c.compressor != nil {
-			frame, isSelfContained, err = readCompressedSegment(c.r, c.compressor)
+			frame, isSelfContained, err = readCompressedSegment(c.r, c.compressor, nil)
 		} else {
-			frame, payloadBuf, isSelfContained, err = readUncompressedSegment(c.r)
+			frame, payloadBuf, isSelfContained, err = readUncompressedSegment(c.r, nil)
 		}
 		if err != nil {
 			return fmt.Errorf("gocql: failed to read non self-contained frame: %w", err)

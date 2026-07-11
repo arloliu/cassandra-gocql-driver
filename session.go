@@ -2641,6 +2641,8 @@ var (
 // ErrProtocol represents a protocol-level error.
 type ErrProtocol struct{ error }
 
+// Unwrap returns the wrapped underlying error so that errors.As and errors.Is
+// can inspect the cause carried by an ErrProtocol.
 func (e ErrProtocol) Unwrap() error {
 	return e.error
 }

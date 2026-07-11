@@ -1204,7 +1204,7 @@ func (srv *TestServer) serve() {
 					// releasing it. srv.readFrame copies the payload out, but
 					// releasing before that copy could hand the buffer to another
 					// caller mid-read; not pooling here is harmless in tests.
-					frame, _, _, err := readUncompressedSegment(conn)
+					frame, _, _, err := readUncompressedSegment(conn, nil)
 					if err != nil {
 						if errors.Is(err, io.EOF) {
 							return

@@ -41,7 +41,7 @@ func reassembleUncompressedSegments(t *testing.T, buf []byte) (body []byte, segm
 	t.Helper()
 	r := bytes.NewReader(buf)
 	for r.Len() > 0 {
-		payload, bufPtr, _, err := readUncompressedSegment(r)
+		payload, bufPtr, _, err := readUncompressedSegment(r, nil)
 		require.NoError(t, err)
 		body = append(body, payload...)
 		releaseSegmentBuffer(bufPtr)
@@ -89,7 +89,7 @@ func TestAppendUncompressedSegment(t *testing.T) {
 
 			// Round-trip through the independent reader (verifies header bit + both CRCs).
 			if sc {
-				readback, bufPtr, isSelfContained, err := readUncompressedSegment(bytes.NewReader(got))
+				readback, bufPtr, isSelfContained, err := readUncompressedSegment(bytes.NewReader(got), nil)
 				require.NoError(t, err)
 				assert.True(t, isSelfContained)
 				assert.Equal(t, payload, readback, "round-trip n=%d", n)
@@ -148,7 +148,7 @@ func TestPrepareModernLayoutSelfContainedRoundTrip(t *testing.T) {
 
 	require.NoError(t, f.prepareModernLayout())
 
-	payload, bufPtr, isSelfContained, err := readUncompressedSegment(bytes.NewReader(f.buf))
+	payload, bufPtr, isSelfContained, err := readUncompressedSegment(bytes.NewReader(f.buf), nil)
 	require.NoError(t, err)
 	assert.True(t, isSelfContained)
 	assert.Equal(t, body, payload)
@@ -263,7 +263,7 @@ func TestPrepareModernLayoutCompressedSelfContained(t *testing.T) {
 			require.NoError(t, f.prepareModernLayout())
 			assert.Equal(t, wantSeg, f.buf, "compressed self-contained segment must match reference")
 
-			readback, isSelfContained, err := readCompressedSegment(bytes.NewReader(f.buf), tc.comp)
+			readback, isSelfContained, err := readCompressedSegment(bytes.NewReader(f.buf), tc.comp, nil)
 			require.NoError(t, err)
 			assert.True(t, isSelfContained)
 			assert.Equal(t, body, readback)

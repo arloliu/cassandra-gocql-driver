@@ -368,7 +368,7 @@ func Test_readUncompressedFrame(t *testing.T) {
 				frame = tt.modifyFrame(frame)
 			}
 
-			readFrame, bufPtr, isSelfContained, err := readUncompressedSegment(bytes.NewReader(frame))
+			readFrame, bufPtr, isSelfContained, err := readUncompressedSegment(bytes.NewReader(frame), nil)
 
 			if tt.expectedErr != "" {
 				require.Error(t, err)
@@ -450,7 +450,7 @@ func BenchmarkReadUncompressedSegment(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		r.Reset(seg)
-		_, bufPtr, _, err := readUncompressedSegment(r)
+		_, bufPtr, _, err := readUncompressedSegment(r, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -555,7 +555,7 @@ func Test_readCompressedFrame(t *testing.T) {
 				frame = tt.modifyFrameFn(frame)
 			}
 
-			readFrame, selfContained, err := readCompressedSegment(bytes.NewReader(frame), tt.compressor)
+			readFrame, selfContained, err := readCompressedSegment(bytes.NewReader(frame), tt.compressor, nil)
 
 			switch {
 			case tt.expectedErrorMsg != "":
