@@ -2004,12 +2004,31 @@ func (c *Conn) executeBatch(ctx context.Context, b *internalBatch) *Iter {
 	return c.executeBatchWithUnprepRetries(ctx, b, 0)
 }
 
+// batchFastPathStmt reports whether every entry in the batch is the same prepared
+// statement — the write-heavy hot case (e.g. one INSERT over many rows). Such a
+// batch needs a single prepare and no per-statement dedup/eviction map, so the
+// batch collections can be pooled. It returns the shared statement text. An empty
+// batch, any raw (non-prepared) entry, or any differing statement falls back to
+// the general path.
+func batchFastPathStmt(entries []BatchEntry) (string, bool) {
+	if len(entries) == 0 {
+		return "", false
+	}
+	stmt := entries[0].Stmt
+	for i := range entries {
+		e := &entries[i]
+		if e.Stmt != stmt || (len(e.Args) == 0 && e.binding == nil) {
+			return "", false
+		}
+	}
+	return stmt, true
+}
+
 func (c *Conn) executeBatchWithUnprepRetries(ctx context.Context, b *internalBatch, unprepAttempt int) *Iter {
 	iter := newIter(b.metrics, b.Keyspace(), b.routingInfo, nil)
 	n := len(b.batchOpts.entries)
 	req := &writeBatchFrame{
 		typ:                   b.batchOpts.bType,
-		statements:            make([]batchStatment, n),
 		consistency:           b.GetConsistency(),
 		serialConsistency:     b.batchOpts.serialCons,
 		defaultTimestamp:      b.batchOpts.defaultTimestamp,
@@ -2027,44 +2046,46 @@ func (c *Conn) executeBatchWithUnprepRetries(ctx context.Context, b *internalBat
 		usedKeyspace = b.batchOpts.keyspace
 	}
 
-	stmts := make(map[string]string, len(b.batchOpts.entries))
+	// stmts maps preparedID -> statement text for the general path's
+	// unprepared-retry eviction. For the single-statement fast path fastID/fastStmt
+	// play the same role without a map.
+	fastStmt, fastPath := batchFastPathStmt(b.batchOpts.entries)
+	var (
+		stmts    map[string]string
+		fastID   []byte
+		stmtsBuf *[]batchStatment
+		flat     *[]queryValues
+	)
 
-	// Local cache to deduplicate prepareStatement calls for repeated statements
-	// within a single batch execution. Capped at batchDedupThreshold entries to
-	// bound memory and map overhead for batches with many distinct statements.
-	//
-	// Crucially, the cache is always consulted even after it stops growing: a
-	// statement already stored continues to get cache hits regardless of how many
-	// unique statements appear later. Only new unique statements beyond the cap
-	// fall through to the global prepared-statement cache.
-	const batchDedupThreshold = 16
-	type batchPrepKey struct {
-		keyspace  string
-		statement string
-	}
-	localCache := make(map[batchPrepKey]*preparedStatment, min(n, batchDedupThreshold))
+	if fastPath {
+		// Return the pooled collections on every build error/panic path. They are
+		// niled after c.exec (the normal release point), where these releases
+		// become no-ops, so there is no double Put.
+		defer func() {
+			// Release the statement slice first: clearing it drops the values
+			// sub-slice references into flat before flat is pooled.
+			releaseBatchStmts(stmtsBuf)
+			releaseQueryValues(flat)
+		}()
 
-	for i := 0; i < n; i++ {
-		entry := &b.batchOpts.entries[i]
-		batchStmt := &req.statements[i]
+		info, err := c.prepareStatement(ctx, fastStmt, b.batchOpts.trace, usedKeyspace)
+		if err != nil {
+			iter.err = err
+			return iter
+		}
+		fastID = info.id
+		k := info.request.actualColCount
 
-		if len(entry.Args) > 0 || entry.binding != nil {
-			var info *preparedStatment
-			var err error
+		// One prepare, uniform column count: pool the statement slice and a single
+		// flat values buffer sub-sliced per row (no dedup/eviction maps). Pre-sizing
+		// flat to n*k keeps each sub-slice stable (no mid-loop regrow).
+		stmtsBuf = getBatchStmts(n)
+		flat = getQueryValues(n * k)
+		req.statements = *stmtsBuf
 
-			key := batchPrepKey{keyspace: usedKeyspace, statement: entry.Stmt}
-			var ok bool
-			info, ok = localCache[key]
-			if !ok {
-				info, err = c.prepareStatement(ctx, entry.Stmt, b.batchOpts.trace, usedKeyspace)
-				if err != nil {
-					iter.err = err
-					return iter
-				}
-				if len(localCache) < batchDedupThreshold {
-					localCache[key] = info
-				}
-			}
+		for i := 0; i < n; i++ {
+			entry := &b.batchOpts.entries[i]
+			batchStmt := &req.statements[i]
 
 			var values []interface{}
 			if entry.binding == nil {
@@ -2082,31 +2103,117 @@ func (c *Conn) executeBatchWithUnprepRetries(ctx context.Context, b *internalBat
 				}
 			}
 
-			if len(values) != info.request.actualColCount {
-				iter.err = fmt.Errorf("gocql: batch statement %d expected %d values send got %d", i, info.request.actualColCount, len(values))
+			if len(values) != k {
+				iter.err = fmt.Errorf("gocql: batch statement %d expected %d values send got %d", i, k, len(values))
 				return iter
 			}
 
 			batchStmt.preparedID = info.id
-			stmts[string(info.id)] = entry.Stmt
+			batchStmt.values = (*flat)[i*k : i*k+k]
 
-			batchStmt.values = make([]queryValues, info.request.actualColCount)
-
-			for j := 0; j < info.request.actualColCount; j++ {
+			for j := 0; j < k; j++ {
 				v := &batchStmt.values[j]
-				value := values[j]
 				typ := info.request.columns[j].TypeInfo
-				if err := marshalQueryValue(typ, value, v); err != nil {
+				if err := marshalQueryValue(typ, values[j], v); err != nil {
 					iter.err = err
 					return iter
 				}
 			}
-		} else {
-			batchStmt.statement = entry.Stmt
+		}
+	} else {
+		req.statements = make([]batchStatment, n)
+		stmts = make(map[string]string, len(b.batchOpts.entries))
+
+		// Local cache to deduplicate prepareStatement calls for repeated statements
+		// within a single batch execution. Capped at batchDedupThreshold entries to
+		// bound memory and map overhead for batches with many distinct statements.
+		//
+		// Crucially, the cache is always consulted even after it stops growing: a
+		// statement already stored continues to get cache hits regardless of how many
+		// unique statements appear later. Only new unique statements beyond the cap
+		// fall through to the global prepared-statement cache.
+		const batchDedupThreshold = 16
+		type batchPrepKey struct {
+			keyspace  string
+			statement string
+		}
+		localCache := make(map[batchPrepKey]*preparedStatment, min(n, batchDedupThreshold))
+
+		for i := 0; i < n; i++ {
+			entry := &b.batchOpts.entries[i]
+			batchStmt := &req.statements[i]
+
+			if len(entry.Args) > 0 || entry.binding != nil {
+				var info *preparedStatment
+				var err error
+
+				key := batchPrepKey{keyspace: usedKeyspace, statement: entry.Stmt}
+				var ok bool
+				info, ok = localCache[key]
+				if !ok {
+					info, err = c.prepareStatement(ctx, entry.Stmt, b.batchOpts.trace, usedKeyspace)
+					if err != nil {
+						iter.err = err
+						return iter
+					}
+					if len(localCache) < batchDedupThreshold {
+						localCache[key] = info
+					}
+				}
+
+				var values []interface{}
+				if entry.binding == nil {
+					values = entry.Args
+				} else {
+					values, err = entry.binding(&QueryInfo{
+						Id:          info.id,
+						Args:        info.request.columns,
+						Rval:        info.response.columns,
+						PKeyColumns: info.request.pkeyColumns,
+					})
+					if err != nil {
+						iter.err = err
+						return iter
+					}
+				}
+
+				if len(values) != info.request.actualColCount {
+					iter.err = fmt.Errorf("gocql: batch statement %d expected %d values send got %d", i, info.request.actualColCount, len(values))
+					return iter
+				}
+
+				batchStmt.preparedID = info.id
+				stmts[string(info.id)] = entry.Stmt
+
+				batchStmt.values = make([]queryValues, info.request.actualColCount)
+
+				for j := 0; j < info.request.actualColCount; j++ {
+					v := &batchStmt.values[j]
+					value := values[j]
+					typ := info.request.columns[j].TypeInfo
+					if err := marshalQueryValue(typ, value, v); err != nil {
+						iter.err = err
+						return iter
+					}
+				}
+			} else {
+				batchStmt.statement = entry.Stmt
+			}
 		}
 	}
 
 	framer, err := c.exec(ctx, req, b.batchOpts.trace)
+	if fastPath {
+		// req was serialized synchronously by buildFrame inside c.exec, so the
+		// pooled collections are dead now — return them before response handling
+		// and before any unprepared-retry recursion. Niling makes the deferred
+		// safety-net release a no-op.
+		releaseBatchStmts(stmtsBuf)
+		stmtsBuf = nil
+		releaseQueryValues(flat)
+		flat = nil
+		req.statements = nil
+	}
 	if err != nil {
 		iter.err = err
 		return iter
@@ -2138,8 +2245,14 @@ func (c *Conn) executeBatchWithUnprepRetries(ctx context.Context, b *internalBat
 				unprepAttempt+1, x)
 			return iter
 		}
-		stmt, found := stmts[string(x.StatementId)]
-		if found {
+		if fastPath {
+			// One statement/preparedID in the batch; evict it if the server
+			// rejected that id.
+			if bytes.Equal(x.StatementId, fastID) {
+				key := c.session.stmtsLRU.keyFor(c.host.HostID(), usedKeyspace, fastStmt)
+				c.session.stmtsLRU.evictPreparedID(key, x.StatementId)
+			}
+		} else if stmt, found := stmts[string(x.StatementId)]; found {
 			key := c.session.stmtsLRU.keyFor(c.host.HostID(), usedKeyspace, stmt)
 			c.session.stmtsLRU.evictPreparedID(key, x.StatementId)
 		}

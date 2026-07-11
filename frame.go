@@ -494,6 +494,102 @@ func releaseSegmentBufferInto(put func(*[]byte), bp *[]byte) {
 	put(bp)
 }
 
+// Batch collection pools (B4). The single-prepared-statement fast path in
+// executeBatchWithUnprepRetries builds, per batch, a []batchStatment and one
+// flat []queryValues that writeBatchFrame serializes synchronously (copying
+// every field into the framer buffer); both are dead once c.exec returns and are
+// returned to these pools for reuse.
+//
+// maxPooled* cap retention so a one-off huge batch cannot pin memory in the
+// global pool (mirrors framerPool's maxPooledBufSize). At ~64 B and ~48 B per
+// element these ceilings retain a few hundred KB.
+const (
+	maxPooledBatchStmts  = 4096
+	maxPooledQueryValues = 16384
+)
+
+var (
+	batchStmtPool   = sync.Pool{New: func() any { s := make([]batchStatment, 0); return &s }}
+	queryValuesPool = sync.Pool{New: func() any { s := make([]queryValues, 0); return &s }}
+
+	// Injected pool sinks (created once at init, no per-release allocation) so
+	// the nil/cap guards in releaseBatch*Into can be verified deterministically
+	// without a nondeterministic sync.Pool round-trip (see B1's segmentBufferPut).
+	batchStmtPut   = func(sp *[]batchStatment) { batchStmtPool.Put(sp) }
+	queryValuesPut = func(sp *[]queryValues) { queryValuesPool.Put(sp) }
+)
+
+// resetBatchStmts reslices s to length n and zeroes those n elements so a pooled
+// slice behaves exactly like make([]batchStatment, n). The build loop only
+// conditionally sets fields (preparedID/values for prepared entries, statement
+// for raw ones), so stale data in a reused slice would corrupt the wire frame.
+func resetBatchStmts(s []batchStatment, n int) []batchStatment {
+	if cap(s) < n {
+		return make([]batchStatment, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
+}
+
+// resetQueryValues is resetBatchStmts for []queryValues: marshalQueryValue only
+// conditionally sets value/name/isUnset, so every reused element must be zeroed.
+func resetQueryValues(s []queryValues, n int) []queryValues {
+	if cap(s) < n {
+		return make([]queryValues, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
+}
+
+func getBatchStmts(n int) *[]batchStatment {
+	sp := batchStmtPool.Get().(*[]batchStatment)
+	*sp = resetBatchStmts(*sp, n)
+	return sp
+}
+
+func getQueryValues(n int) *[]queryValues {
+	sp := queryValuesPool.Get().(*[]queryValues)
+	*sp = resetQueryValues(*sp, n)
+	return sp
+}
+
+func releaseBatchStmts(sp *[]batchStatment) {
+	releaseBatchStmtsInto(batchStmtPut, sp)
+}
+
+// releaseBatchStmtsInto is the nil/cap-filtering core of releaseBatchStmts, with
+// the pool sink injected for deterministic testing: nil handles and oversized
+// backing arrays are dropped rather than returned to the pool.
+func releaseBatchStmtsInto(put func(*[]batchStatment), sp *[]batchStatment) {
+	if sp == nil || cap(*sp) > maxPooledBatchStmts {
+		return
+	}
+	// Clear before pooling: each element's values sub-slice references the flat
+	// []queryValues backing, so a retained statement slice would keep that backing
+	// reachable — defeating maxPooledQueryValues when the flat buffer was dropped
+	// for being over-cap. Clearing also drops the preparedID reference. (Clear-on-
+	// acquire remains the wire-correctness defense.)
+	clear(*sp)
+	put(sp)
+}
+
+func releaseQueryValues(sp *[]queryValues) {
+	releaseQueryValuesInto(queryValuesPut, sp)
+}
+
+func releaseQueryValuesInto(put func(*[]queryValues), sp *[]queryValues) {
+	if sp == nil || cap(*sp) > maxPooledQueryValues {
+		return
+	}
+	// Clear before pooling so the retained slice does not pin marshaled payloads:
+	// blob marshaling returns the caller's []byte directly, so a stale value could
+	// keep a large caller buffer reachable for the lifetime of the pooled item.
+	clear(*sp)
+	put(sp)
+}
+
 func newFramer(compressor Compressor, version byte, r *RegisteredTypes) *framer {
 	buf := make([]byte, defaultBufSize)
 	f := &framer{

@@ -1223,3 +1223,195 @@ func TestParseErrorFrameAllGenericCodes(t *testing.T) {
 		})
 	}
 }
+
+// TestResetBatchCollections is the linchpin B4 correctness guard: pooled batch
+// collections must be fully zeroed on reuse, because marshalQueryValue and the
+// batch build loop only conditionally set fields (a stale isUnset/name/preparedID
+// would corrupt the wire frame). Driven on deliberately dirtied backing slices —
+// no sync.Pool round-trip — so it is deterministic under -race.
+func TestResetBatchCollections(t *testing.T) {
+	// resetQueryValues zeroes the reused region (cap >= n path).
+	dirtyQV := make([]queryValues, 4)
+	for i := range dirtyQV {
+		dirtyQV[i] = queryValues{value: []byte{1, 2, 3}, name: "stale", isUnset: true}
+	}
+	gotQV := resetQueryValues(dirtyQV, 3)
+	require.Len(t, gotQV, 3)
+	for i := range gotQV {
+		assert.Equal(t, queryValues{}, gotQV[i], "queryValues[%d] not zeroed", i)
+	}
+
+	// resetBatchStmts likewise.
+	dirtyBS := make([]batchStatment, 4)
+	for i := range dirtyBS {
+		dirtyBS[i] = batchStatment{preparedID: []byte{9}, statement: "stale", values: []queryValues{{value: []byte{1}}}}
+	}
+	gotBS := resetBatchStmts(dirtyBS, 3)
+	require.Len(t, gotBS, 3)
+	for i := range gotBS {
+		assert.Equal(t, batchStatment{}, gotBS[i], "batchStatment[%d] not zeroed", i)
+	}
+
+	// Growth beyond cap allocates a fresh, zeroed slice.
+	grown := resetQueryValues(make([]queryValues, 0, 1), 4)
+	require.Len(t, grown, 4)
+	for i := range grown {
+		assert.Equal(t, queryValues{}, grown[i])
+	}
+}
+
+// TestReleaseBatchCollectionsCap verifies the retention cap and nil-safety of the
+// release helpers via an injected counting sink (deterministic; no sync.Pool
+// round-trip): nil and oversized backing arrays are dropped, only within-cap
+// slices are returned to the pool.
+func TestReleaseBatchCollectionsCap(t *testing.T) {
+	// queryValues: nil and over-cap are dropped; the within-cap slice is pooled and
+	// must be cleared first so it does not pin the marshaled value payloads.
+	var (
+		qvPuts int
+		qvGot  *[]queryValues
+	)
+	qvSink := func(sp *[]queryValues) { qvPuts++; qvGot = sp }
+	releaseQueryValuesInto(qvSink, nil) // dropped
+	within := make([]queryValues, 3, maxPooledQueryValues)
+	within[0] = queryValues{value: []byte{1}, name: "x", isUnset: true}
+	within[1] = queryValues{value: []byte{2}}
+	within[2] = queryValues{value: []byte{3}}
+	releaseQueryValuesInto(qvSink, &within)             // cap == ceiling -> retained
+	over := make([]queryValues, maxPooledQueryValues+1) // cap > ceiling -> dropped
+	releaseQueryValuesInto(qvSink, &over)
+	require.Equal(t, 1, qvPuts, "only the within-cap queryValues slice should be pooled")
+	require.NotNil(t, qvGot)
+	for i := range *qvGot {
+		assert.Equal(t, queryValues{}, (*qvGot)[i], "pooled queryValues[%d] must be cleared", i)
+	}
+
+	// batchStatment: the pooled slice must be cleared so its values sub-slices no
+	// longer reference (pin) the flat []queryValues backing.
+	var (
+		bsPuts int
+		bsGot  *[]batchStatment
+	)
+	bsSink := func(sp *[]batchStatment) { bsPuts++; bsGot = sp }
+	releaseBatchStmtsInto(bsSink, nil)
+	flat := make([]queryValues, 6)
+	withinBS := make([]batchStatment, 3, maxPooledBatchStmts)
+	for i := range withinBS {
+		withinBS[i] = batchStatment{preparedID: []byte{byte(i)}, values: flat[i*2 : i*2+2]}
+	}
+	releaseBatchStmtsInto(bsSink, &withinBS)
+	overBS := make([]batchStatment, maxPooledBatchStmts+1)
+	releaseBatchStmtsInto(bsSink, &overBS)
+	require.Equal(t, 1, bsPuts, "only the within-cap batchStatment slice should be pooled")
+	require.NotNil(t, bsGot)
+	for i := range *bsGot {
+		assert.Equal(t, batchStatment{}, (*bsGot)[i], "pooled batchStatment[%d] must be cleared (no flat/prepared pin)", i)
+	}
+}
+
+// TestBatchFastPathByteParity proves the fast-path collections (dirty backing ->
+// reset -> flat sub-slices) serialize to byte-identical wire output as the
+// make-based path. If clear-on-acquire regressed, a stale isUnset/name would
+// change the bytes.
+func TestBatchFastPathByteParity(t *testing.T) {
+	const n, k = 3, 2
+	rows := [][][]byte{
+		{{0x01}, {0x02, 0x03}},
+		{{0x04}, {0x05}},
+		{{0x06, 0x07}, {0x08}},
+	}
+	preparedID := []byte{0xaa, 0xbb}
+
+	// Reference: make-based build.
+	ref := &writeBatchFrame{typ: LoggedBatch, consistency: Quorum, statements: make([]batchStatment, n)}
+	for i := range ref.statements {
+		bs := &ref.statements[i]
+		bs.preparedID = preparedID
+		bs.values = make([]queryValues, k)
+		for j := 0; j < k; j++ {
+			bs.values[j].value = rows[i][j]
+		}
+	}
+
+	// Fast-path style from deliberately dirty backing (cap >= size so reset takes
+	// the clear path, not the realloc path).
+	dirtyStmts := make([]batchStatment, n)
+	for i := range dirtyStmts {
+		dirtyStmts[i] = batchStatment{preparedID: []byte{0xff}, statement: "junk", values: []queryValues{{isUnset: true}}}
+	}
+	dirtyFlat := make([]queryValues, n*k)
+	for i := range dirtyFlat {
+		dirtyFlat[i] = queryValues{value: []byte{0x99}, name: "junk", isUnset: true}
+	}
+	stmtsBuf := resetBatchStmts(dirtyStmts, n)
+	flat := resetQueryValues(dirtyFlat, n*k)
+	fast := &writeBatchFrame{typ: LoggedBatch, consistency: Quorum, statements: stmtsBuf}
+	for i := 0; i < n; i++ {
+		bs := &fast.statements[i]
+		bs.preparedID = preparedID
+		bs.values = flat[i*k : i*k+k]
+		for j := 0; j < k; j++ {
+			bs.values[j].value = rows[i][j]
+		}
+	}
+
+	assert.Equal(t, serializeBatchFrame(t, ref), serializeBatchFrame(t, fast))
+}
+
+func serializeBatchFrame(t *testing.T, req *writeBatchFrame) []byte {
+	t.Helper()
+	f := newFramer(nil, protoVersion5, GlobalTypes)
+	require.NoError(t, f.writeBatchFrame(0, req, nil))
+	return append([]byte(nil), f.buf...)
+}
+
+// BenchmarkBatchCollections compares the per-batch collection allocations the B4
+// fast path replaces (make([]batchStatment) + make([]queryValues) per statement)
+// against the pooled flat buffer. Run outside -race (sync.Pool drops puts under
+// -race). Expect the pooled variant to steady-state near zero allocs/op.
+func BenchmarkBatchCollections(b *testing.B) {
+	const n, k = 100, 3
+	b.Run("make", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			stmts := make([]batchStatment, n)
+			for i := range stmts {
+				stmts[i].values = make([]queryValues, k)
+			}
+			_ = stmts
+		}
+	})
+	b.Run("pooled", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			sp := getBatchStmts(n)
+			flat := getQueryValues(n * k)
+			stmts := *sp
+			for i := range stmts {
+				stmts[i].values = (*flat)[i*k : i*k+k]
+			}
+			releaseQueryValues(flat)
+			releaseBatchStmts(sp)
+		}
+	})
+	// general approximates the mixed/general path's per-batch collections (the
+	// statement slice, per-statement values, and the stmts/localCache maps) that
+	// the fast path avoids. It is the baseline the fast path is measured against
+	// and guards against a regression that pushes the general path's allocations
+	// higher; the general path itself is unchanged by B4.
+	b.Run("general", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			stmts := make([]batchStatment, n)
+			stmtsMap := make(map[string]string, n)
+			localCache := make(map[string]*preparedStatment, 16)
+			for i := range stmts {
+				stmts[i].values = make([]queryValues, k)
+				id := string(rune(i))
+				stmtsMap[id] = "stmt"
+				localCache[id] = nil
+			}
+			_, _, _ = stmts, stmtsMap, localCache
+		}
+	})
+}

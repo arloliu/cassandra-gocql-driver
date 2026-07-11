@@ -1876,3 +1876,31 @@ func TestChooseCompression(t *testing.T) {
 		})
 	}
 }
+
+// TestBatchFastPathStmt verifies the B4 fast-path gate: it engages only when every
+// batch entry is the same prepared statement (all with args or a binding), which
+// is what lets the collections be pooled with a single prepare and no dedup map.
+func TestBatchFastPathStmt(t *testing.T) {
+	bind := func(*QueryInfo) ([]interface{}, error) { return nil, nil }
+	cases := []struct {
+		name     string
+		entries  []BatchEntry
+		wantStmt string
+		wantOK   bool
+	}{
+		{"empty batch", nil, "", false},
+		{"single prepared (args)", []BatchEntry{{Stmt: "A", Args: []interface{}{1}}}, "A", true},
+		{"all same prepared (args)", []BatchEntry{{Stmt: "A", Args: []interface{}{1}}, {Stmt: "A", Args: []interface{}{2}}}, "A", true},
+		{"same stmt via binding", []BatchEntry{{Stmt: "A", binding: bind}, {Stmt: "A", Args: []interface{}{2}}}, "A", true},
+		{"differing statements", []BatchEntry{{Stmt: "A", Args: []interface{}{1}}, {Stmt: "B", Args: []interface{}{2}}}, "", false},
+		{"raw entry mixed in", []BatchEntry{{Stmt: "A", Args: []interface{}{1}}, {Stmt: "A"}}, "", false},
+		{"all raw", []BatchEntry{{Stmt: "A"}}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, ok := batchFastPathStmt(tc.entries)
+			require.Equal(t, tc.wantOK, ok)
+			require.Equal(t, tc.wantStmt, stmt)
+		})
+	}
+}
