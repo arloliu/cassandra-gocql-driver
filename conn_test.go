@@ -720,9 +720,16 @@ func TestStream0(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A real net.Conn is required because connReader.Read now clears the read
+	// deadline (SetReadDeadline) when its timeout is 0, so conn must be non-nil.
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
 	conn := &Conn{
 		r: &connReader{
-			r: bufio.NewReader(&buf),
+			r:    bufio.NewReader(&buf),
+			conn: clientConn,
 		},
 		streams: streams.New(protoVersion4, -1),
 		session: &Session{

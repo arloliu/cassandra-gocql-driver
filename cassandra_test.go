@@ -116,10 +116,10 @@ func TestUseStatementError(t *testing.T) {
 // Three cases are exercised in sequence on a session whose connection-level
 // timeout has been tightened to 50ns:
 //
-//  A. No ctx deadline -> conn timeout still applies (ErrTimeoutNoResponse).
-//  B. Ctx deadline >> conn timeout -> deadline wins (query succeeds).
-//  C. Already-expired ctx deadline -> execInternal returns ctx.Err() at the
-//     early-return path before arming any timer.
+//	A. No ctx deadline -> conn timeout still applies (ErrTimeoutNoResponse).
+//	B. Ctx deadline >> conn timeout -> deadline wins (query succeeds).
+//	C. Already-expired ctx deadline -> execInternal returns ctx.Err() at the
+//	   early-return path before arming any timer.
 //
 // Cases B and C use TRUNCATE, which does not go through the prepared-statement
 // path (shouldPrepare returns false for TRUNCATE — see session.go:shouldPrepare).
@@ -140,13 +140,16 @@ func TestQueryContextDeadlineOverridesConnectionTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Tighten conn timeout on every open connection to 50ns. Any subsequent
-	// query that uses the conn timeout will time out almost immediately.
+	// Tighten the request timeout on every open connection to 50ns. Any
+	// subsequent query that relies on the connection's request timeout will time
+	// out almost immediately. Since CASSGO-125 the request timeout drives request
+	// cancellation independently of the idle-read deadline, so we set
+	// requestTimeout directly (setting the read timeout no longer bounds requests).
 	session.executor.pool.mu.Lock()
 	for _, hostPool := range session.executor.pool.hostConnPools {
 		hostPool.mu.Lock()
 		for _, conn := range hostPool.conns {
-			conn.r.SetTimeout(50)
+			conn.requestTimeout.Store(50)
 		}
 		hostPool.mu.Unlock()
 	}

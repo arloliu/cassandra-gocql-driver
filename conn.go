@@ -172,7 +172,16 @@ type Conn struct {
 	r ConnReader
 	w contextWriter
 
-	writeTimeout   time.Duration
+	writeTimeout time.Duration
+	// requestTimeout bounds request round-trips: the execInternal call timer,
+	// heartbeat OPTIONS, and startup handshake. It is deliberately decoupled
+	// from the connReader read deadline. Idle frame/segment reads disable the
+	// read deadline (SetTimeout(0)) so an idle connection does not trip it and
+	// reconnect; that transient zero must not disarm request timers (CASSGO-125).
+	// Stored as atomic.Int64 (nanoseconds) because it is written at init and by
+	// the integration suite on live connections, and read by the heartbeat and
+	// request goroutines — the same access pattern as connReader.timeout.
+	requestTimeout atomic.Int64
 	cfg            *ConnConfig
 	frameObserver  FrameHeaderObserver
 	streamObserver StreamObserver
@@ -319,11 +328,13 @@ func (c *Conn) init(ctx context.Context, dialedHost *DialedHost) error {
 	}
 
 	c.r.SetTimeout(c.cfg.ConnectTimeout)
+	c.requestTimeout.Store(int64(c.cfg.ConnectTimeout))
 	if err := startup.setupConn(ctx); err != nil {
 		return err
 	}
 
 	c.r.SetTimeout(c.cfg.Timeout)
+	c.requestTimeout.Store(int64(c.cfg.Timeout))
 
 	// dont coalesce startup frames
 	if c.session.cfg.WriteCoalesceWaitTime > 0 && !c.cfg.disableCoalesce && !dialedHost.DisableCoalesce {
@@ -362,8 +373,8 @@ type startupCoordinator struct {
 
 func (s *startupCoordinator) setupConn(ctx context.Context) error {
 	var cancel context.CancelFunc
-	if s.conn.r.GetTimeout() > 0 {
-		ctx, cancel = context.WithTimeout(ctx, s.conn.r.GetTimeout())
+	if requestTimeout := time.Duration(s.conn.requestTimeout.Load()); requestTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, requestTimeout)
 	} else {
 		ctx, cancel = context.WithCancel(ctx)
 	}
@@ -773,7 +784,7 @@ func (c *Conn) heartBeat(ctx context.Context) {
 		case <-timer.C:
 		}
 
-		hbCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout(c.r.GetTimeout()))
+		hbCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout(time.Duration(c.requestTimeout.Load())))
 		framer, err := c.exec(hbCtx, &writeOptionsFrame{}, nil)
 		cancel()
 		if err != nil {
@@ -839,10 +850,16 @@ func (c *Conn) recv(ctx context.Context, startupCompleted bool) error {
 func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 	// not safe for concurrent reads
 
-	// read a full header, ignore timeouts, as this is being ran in a loop
+	// Read the header without a read deadline: this loops waiting for the next
+	// response, so an idle connection must not trip the deadline here (CASSGO-125).
+	// Setting the connReader timeout to 0 (rather than clearing the deadline
+	// directly) is what actually disarms it — connReader.Read re-arms the deadline
+	// on every read while its timeout is non-zero. The timeout is restored for the
+	// body read below.
 	// TODO: TCP level deadlines? or just query level deadlines?
-	if c.r.GetTimeout() > 0 {
-		c.r.SetReadDeadline(time.Time{})
+	readTimeout := c.r.GetTimeout()
+	if readTimeout > 0 {
+		c.r.SetTimeout(0)
 	}
 
 	headStartTime := time.Now()
@@ -851,6 +868,12 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 	headEndTime := time.Now()
 	if err != nil {
 		return err
+	}
+
+	// Restore the read timeout for the frame body, which is actively arriving
+	// once its header has been read and should be bounded.
+	if readTimeout > 0 {
+		c.r.SetTimeout(readTimeout)
 	}
 
 	if c.frameObserver != nil {
@@ -964,11 +987,25 @@ func (c *Conn) recvSegment(ctx context.Context) error {
 		err             error
 	)
 
+	// Wait for the next segment without a read deadline: an idle proto-v5
+	// connection must not trip the deadline between frames (CASSGO-125). The
+	// continuation segments read in recvPartialFrames are mid-frame and keep the
+	// timeout. See processFrame for why the timeout is toggled rather than the
+	// deadline cleared directly.
+	readTimeout := c.r.GetTimeout()
+	if readTimeout > 0 {
+		c.r.SetTimeout(0)
+	}
+
 	// Read frame based on compression
 	if c.compressor != nil {
 		frame, isSelfContained, err = readCompressedSegment(c.r, c.compressor)
 	} else {
 		frame, payloadBuf, isSelfContained, err = readUncompressedSegment(c.r)
+	}
+
+	if readTimeout > 0 {
+		c.r.SetTimeout(readTimeout)
 	}
 	if err != nil {
 		return err
@@ -1089,6 +1126,12 @@ func (c *connReader) Read(p []byte) (n int, err error) {
 		var nn int
 		if timeout > 0 {
 			c.conn.SetReadDeadline(time.Now().Add(timeout))
+		} else if timeout == 0 {
+			// A zero timeout means "no read deadline". Clear any deadline a prior
+			// read armed; otherwise it persists and fires on an idle read, which
+			// is exactly the reconnect regression the callers avoid by toggling
+			// the timeout to 0 around idle frame/segment reads (CASSGO-125).
+			c.conn.SetReadDeadline(time.Time{})
 		}
 
 		nn, err = io.ReadFull(c.r, p[n:])
@@ -1515,7 +1558,7 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 	// arming the connection-level timeout — otherwise WithContext(ctx-with-deadline)
 	// cannot effectively extend a short Session.Timeout.
 	_, ctxHasDeadline := ctx.Deadline()
-	if timeout := c.r.GetTimeout(); timeout > 0 && !ctxHasDeadline {
+	if requestTimeout := time.Duration(c.requestTimeout.Load()); requestTimeout > 0 && !ctxHasDeadline {
 		if call.timer == nil {
 			call.timer = time.NewTimer(0)
 			<-call.timer.C
@@ -1528,7 +1571,7 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 			}
 		}
 
-		call.timer.Reset(timeout)
+		call.timer.Reset(requestTimeout)
 		timeoutCh = call.timer.C
 	}
 
