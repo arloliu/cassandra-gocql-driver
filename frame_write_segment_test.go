@@ -216,29 +216,59 @@ func TestPrepareModernLayoutMultiSegment(t *testing.T) {
 	}
 }
 
+// inflatingCompressor always produces output larger than its input, forcing
+// newCompressedSegment's "compression not worth it → send as-is" branch (uncompressed
+// length signalled as 0). identityCompressor (equal length) exercises the normal
+// compressed branch, so the two together cover both sides of that split.
+type inflatingCompressor struct{}
+
+func (inflatingCompressor) Name() string { return "inflating" }
+func (inflatingCompressor) AppendCompressed(dst, src []byte) ([]byte, error) {
+	return append(append(dst, src...), 0xFF), nil // one byte larger than src
+}
+func (inflatingCompressor) AppendDecompressed(dst, src []byte, _ uint32) ([]byte, error) {
+	return append(dst, src...), nil // unused on the send-as-is path
+}
+func (inflatingCompressor) AppendCompressedWithLength(dst, src []byte) ([]byte, error) {
+	return append(dst, src...), nil
+}
+func (inflatingCompressor) AppendDecompressedWithLength(dst, src []byte) ([]byte, error) {
+	return append(dst, src...), nil
+}
+
 // TestPrepareModernLayoutCompressedSelfContained covers the changed compressed
 // self-contained branch (which now uses newCompressedSegment's buffer directly instead
-// of copying it). With a deterministic compressor, the emitted segment must equal the
-// reference build and round-trip back to the original body.
+// of copying it). The emitted segment must equal the reference build and round-trip
+// back to the original body, across both the normal-compression branch
+// (identityCompressor) and the "send as-is" branch (inflatingCompressor).
 func TestPrepareModernLayoutCompressedSelfContained(t *testing.T) {
-	comp := identityCompressor{}
+	compressors := []struct {
+		name string
+		comp Compressor
+	}{
+		{"normal", identityCompressor{}},
+		{"send-as-is", inflatingCompressor{}},
+	}
+	for _, tc := range compressors {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reference: legacy behavior (segment built by newCompressedSegment then used).
+			ref := newFramer(tc.comp, protoVersion5, GlobalTypes)
+			require.NoError(t, ref.writeBatchFrame(0, buildTChartBatchReq(20), nil))
+			body := append([]byte(nil), ref.buf...)
+			wantSeg, err := newCompressedSegment(body, true, tc.comp)
+			require.NoError(t, err)
 
-	// Reference: legacy behavior (segment built by newCompressedSegment then used).
-	ref := newFramer(comp, protoVersion5, GlobalTypes)
-	require.NoError(t, ref.writeBatchFrame(0, buildTChartBatchReq(20), nil))
-	body := append([]byte(nil), ref.buf...)
-	wantSeg, err := newCompressedSegment(body, true, comp)
-	require.NoError(t, err)
+			f := newFramer(tc.comp, protoVersion5, GlobalTypes)
+			require.NoError(t, f.writeBatchFrame(0, buildTChartBatchReq(20), nil))
+			require.NoError(t, f.prepareModernLayout())
+			assert.Equal(t, wantSeg, f.buf, "compressed self-contained segment must match reference")
 
-	f := newFramer(comp, protoVersion5, GlobalTypes)
-	require.NoError(t, f.writeBatchFrame(0, buildTChartBatchReq(20), nil))
-	require.NoError(t, f.prepareModernLayout())
-	assert.Equal(t, wantSeg, f.buf, "compressed self-contained segment must match reference")
-
-	readback, isSelfContained, err := readCompressedSegment(bytes.NewReader(f.buf), comp)
-	require.NoError(t, err)
-	assert.True(t, isSelfContained)
-	assert.Equal(t, body, readback)
+			readback, isSelfContained, err := readCompressedSegment(bytes.NewReader(f.buf), tc.comp)
+			require.NoError(t, err)
+			assert.True(t, isSelfContained)
+			assert.Equal(t, body, readback)
+		})
+	}
 }
 
 // TestProtoV4FinishRetentionReuse covers proto-v4 writes, which skip prepareModernLayout
