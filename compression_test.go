@@ -88,6 +88,16 @@ func TestCompression_RoundTrip(t *testing.T) {
 			})
 			defer session.Close()
 
+			// Snappy was removed in native protocol v5+ (segment-layer
+			// compression is lz4-only); the driver disables it and connects
+			// without compression (see chooseCompression). Reaching this point
+			// with a snappy compressor on v5 proves the connection succeeded —
+			// previously it failed with "unsupported protocol version". There is
+			// nothing snappy-specific left to round-trip, so skip the rest.
+			if c.name == "snappy" && session.cfg.ProtoVersion >= protoVersion5 {
+				t.Skipf("snappy is unsupported on proto v%d; driver downgraded to no compression", session.cfg.ProtoVersion)
+			}
+
 			if err := createTable(session, "CREATE TABLE gocql_test."+c.table+" (id int PRIMARY KEY, blob text)"); err != nil {
 				t.Fatalf("create table: %v", err)
 			}

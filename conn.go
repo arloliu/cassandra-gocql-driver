@@ -525,6 +525,25 @@ func (s *startupCoordinator) options(ctx context.Context, startupCompleted *atom
 	}
 }
 
+// chooseCompression selects the STARTUP COMPRESSION option for a compressor
+// named name from the server-advertised list, honoring the negotiated protocol
+// version. On native protocol v5+, snappy is treated as unavailable regardless
+// of what the server advertises: v5 moved compression to the checksummed framing
+// layer, which only supports lz4, but Cassandra still lists snappy in SUPPORTED.
+// It returns ("", false) when no compatible algorithm is available, signaling
+// the caller to disable compression.
+func chooseCompression(version byte, name string, supported []string) (string, bool) {
+	if version >= protoVersion5 && name == "snappy" {
+		return "", false
+	}
+	for _, c := range supported {
+		if c == name {
+			return c, true
+		}
+	}
+	return "", false
+}
+
 func (s *startupCoordinator) startup(ctx context.Context, supported map[string][]string, startupCompleted *atomic.Bool) error {
 	m := map[string]string{
 		"CQL_VERSION":    s.conn.cfg.CQLVersion,
@@ -533,16 +552,21 @@ func (s *startupCoordinator) startup(ctx context.Context, supported map[string][
 	}
 
 	if s.conn.compressor != nil {
-		comp := supported["COMPRESSION"]
 		name := s.conn.compressor.Name()
-		for _, compressor := range comp {
-			if compressor == name {
-				m["COMPRESSION"] = compressor
-				break
+		if chosen, ok := chooseCompression(s.conn.version, name, supported["COMPRESSION"]); ok {
+			m["COMPRESSION"] = chosen
+		} else {
+			// Snappy was removed in native protocol v5+ (segment-layer
+			// compression is lz4-only), yet Cassandra still advertises it in
+			// SUPPORTED. Warn and connect without compression rather than send
+			// it and hit a confusing STARTUP rejection; matches the reference
+			// drivers. Any other unsupported compressor is disabled silently, as
+			// before.
+			if s.conn.version >= protoVersion5 && name == "snappy" {
+				s.conn.logger.Warning("Snappy compression is not supported on native protocol v5+; connecting without compression (use lz4).",
+					NewLogFieldString("address", s.conn.addr),
+					NewLogFieldString("compressor", name))
 			}
-		}
-
-		if _, ok := m["COMPRESSION"]; !ok {
 			s.conn.compressor = nil
 		}
 	}

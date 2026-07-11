@@ -1842,3 +1842,37 @@ func TestConnRecvSegmentNonSelfContained(t *testing.T) {
 	require.NoError(t, <-errCh)
 	require.NoError(t, <-writeErr)
 }
+
+// TestChooseCompression verifies protocol-version-aware compression negotiation.
+// The key case is snappy on proto v5+: Cassandra advertises snappy in SUPPORTED
+// on every protocol version, but v5 moved compression to the lz4-only framing
+// layer, so the driver must reject snappy on v5+ rather than send it and trigger
+// a STARTUP failure.
+func TestChooseCompression(t *testing.T) {
+	both := []string{"snappy", "lz4"} // Cassandra advertises both regardless of version
+
+	cases := []struct {
+		name       string
+		version    byte
+		compressor string
+		supported  []string
+		wantChosen string
+		wantOK     bool
+	}{
+		{"snappy on v4 is accepted", protoVersion4, "snappy", both, "snappy", true},
+		{"snappy on v5 is rejected", protoVersion5, "snappy", both, "", false},
+		{"lz4 on v5 is accepted", protoVersion5, "lz4", both, "lz4", true},
+		{"lz4 on v4 is accepted", protoVersion4, "lz4", both, "lz4", true},
+		{"snappy not advertised is rejected", protoVersion4, "snappy", []string{"lz4"}, "", false},
+		{"unknown compressor is rejected", protoVersion5, "zstd", both, "", false},
+		{"lz4 requested but only snappy advertised", protoVersion5, "lz4", []string{"snappy"}, "", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chosen, ok := chooseCompression(tc.version, tc.compressor, tc.supported)
+			require.Equal(t, tc.wantOK, ok)
+			require.Equal(t, tc.wantChosen, chosen)
+		})
+	}
+}
