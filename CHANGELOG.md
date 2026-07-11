@@ -7,6 +7,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0-otter] - 2026-07-11
+
+This release continues the downstream performance work with proto-v5
+write-side and batch-execution allocation reductions — pooling the
+request-frame segment framing, the same-statement batch collections, and the
+proto-v5 read-side segment payload buffers, plus retaining megabyte-scale
+framer buffers and capping the per-connection request table to shrink
+steady-state heap. It also adopts a curated set of upstream bug fixes
+(protocol-version negotiation, the `system.peers_v2` → `system.peers`
+fallback, and the idle-connection reconnect storm under a small
+`Session.Timeout`), each reviewed and adapted to otter-cache rather than
+rebased, alongside an original fix for Snappy compression on native protocol
+v5+. Upstream sources (CASSGO-NNN / PR #NNNN) and any deliberate deviations
+are cited per bullet.
+
+### Changed
+
+- Batching a single prepared statement over many rows — the write-heavy hot
+  case (e.g. one `INSERT` batched across many rows) — no longer allocates its
+  per-batch collections on every call. `executeBatchWithUnprepRetries`
+  previously built, per batch, a `[]batchStatment`, a fresh `[]queryValues`
+  per statement, and two dedup/eviction maps (`stmts`, `localCache`) — none
+  pooled, ~15% of allocations on a write-heavy profile. A new fast path
+  detects that every entry is the same prepared statement (identical `Stmt`,
+  all bound via args or a binding), prepares once, and serves the
+  `[]batchStatment` plus a single flat `[]queryValues` (pre-sized to
+  `rows × columns` and sub-sliced per row) from `sync.Pool`s, skipping both
+  maps. The pooled slices are cleared on acquire (the build loop and
+  `marshalQueryValue` only set fields conditionally, so a stale
+  `isUnset`/`preparedID`/`name` would corrupt the wire frame) and on release
+  (so a retained statement slice does not pin the flat values backing and
+  pooled values do not pin marshaled blob payloads), and are returned to the
+  pools as soon as `c.exec` returns — the frame is serialized synchronously
+  into the framer buffer, so the collections are dead before response
+  handling and any unprepared-retry recursion. Retention caps (4096
+  statements, 16384 values) drop one-off huge batches so they cannot pin
+  memory in the global pools. Steady-state the fast path allocates 0 B/op,
+  0 allocs/op (was ~14.4 KB, 100 allocs for a 100-statement batch). The
+  mixed- and raw-statement path — including its per-statement dedup cache and
+  per-`preparedID` unprepared-retry eviction — is unchanged and serializes
+  byte-for-byte identically.
+- Native-protocol-v5 request-frame serialization no longer allocates on the
+  steady-state write path. Two per-frame allocations were removed: (1)
+  `framer.finish()` now retains the grown request buffer in the pooled
+  framer, so a reused framer keeps its write-buffer capacity instead of
+  resetting to the small read buffer and re-growing from the default size on
+  every write — the existing read-path buffer retention never reached the
+  write path, whose helpers append into a buffer that reallocates away from
+  the initial read buffer once the body outgrows it; and (2) the common
+  case — a self-contained, uncompressed, single-segment frame (body fits one
+  segment, no compression) — now builds its proto-v5 segment (6-byte header +
+  payload + CRC32) into a reusable per-framer scratch buffer, replacing the
+  old path that `make()`'d a fresh segment and then copied it again into
+  another fresh buffer. A representative 100-row prepared batch drops from 12
+  allocs / ~70 KB to 0 allocs / 0 B and ~9.7µs to ~3.4µs on the
+  serialize-plus-segment path, cutting GC pressure under concurrent writes.
+  Retention is bounded by `maxPooledBufSize`, so an outsized frame does not
+  pin memory, and by the number of concurrent in-flight requests rather than
+  connection count. The multi-segment (>128 KiB) and compressed segment paths
+  are unchanged and the wire format is byte-identical. The uncompressed-
+  segment encoder is consolidated onto a single authority — a thin nil-dst
+  wrapper over the append form — so the corruption-sensitive segment wire
+  format has one implementation, with expanded write-path coverage over
+  oversized-buffer reuse, the >128 KiB multi-segment boundary, and both
+  branches of the compressed self-contained path (including the "compression
+  not worth it, send as-is" case).
+- The native-protocol-v5 uncompressed segment read path
+  (`readUncompressedSegment`) no longer allocates a fresh payload buffer per
+  segment. It previously called `make([]byte, payloadLen)` on every incoming
+  segment — ~23% of `alloc_space` on a read-heavy production profile — even
+  though every consumer copies the payload out (into the framer buffer, the
+  reassembly buffer, or via `discardFrame`) before the buffer could be
+  reused. Segment payloads are now drawn from a process-wide `sync.Pool` and
+  returned once the copy completes (`recvSegment` releases via a single
+  deferred call; `recvPartialFrames` releases per reassembly iteration).
+  Because payloads are protocol-bounded at `maxSegmentPayloadSize` (~128 KiB)
+  there is no oversized-buffer discard policy as with the framer pool, and
+  pool retention scales with peak concurrent in-flight segments rather than
+  connection count — a per-`Conn` scratch buffer was deliberately avoided so
+  heap retention stays off the per-connection dimension.
+  `BenchmarkReadUncompressedSegment` drops from 72 B/op, 2 allocs/op to
+  8 B/op, 1 alloc/op (the residual alloc is the pre-existing header-array
+  escape). The compressed read path is intentionally left unpooled, as it
+  sits outside the measured hot path.
+- Large framer read buffers are now retained in the `sync.Pool` for reuse
+  instead of being discarded on release. `readFrame` sizes each buffer to the
+  actual frame body (`make([]byte, head.length)`), and `release()` dropped
+  any buffer whose capacity exceeded the `maxPooledBufSize` cap. At the
+  previous 64 KiB cap, essentially every result/batch frame exceeded it
+  (production read frames average ~1 MiB) and was discarded on release,
+  forcing a fresh allocation on the next large frame and making `readFrame`
+  one of the top heap allocators (~23% of `alloc_space`) and a major driver
+  of GC CPU. Raising the cap to 2 MiB retains typical result/batch frames for
+  reuse while still dropping rare huge frames so a single oversized frame
+  cannot pin memory in a pooled framer. Because the cap gates *retention*
+  rather than buffer size, a pooled framer holds a real-sized buffer up to
+  this bound, never a padded one.
+- The per-connection request table (`callMap`) is now sized from a new
+  `ClusterConfig.MaxStreams` option instead of always allocating the protocol
+  maximum. Each connection previously reserved a fixed 32768-slot
+  atomic-pointer table (8 bytes/slot = 256 KB) regardless of real
+  concurrency; in production this dominated live heap (~640 MB / 37% across
+  ~2,400 connections, ~99% of slots never touched). The new default caps
+  protocol v3+ at 2048 streams, shrinking the table 16x (256 KB to 16 KB per
+  connection) with no application change, since real per-connection
+  concurrency is a few hundred streams. `MaxStreams` semantics: `0` (default)
+  uses 2048 for proto v3+; a negative value restores the full protocol
+  maximum (32768 for v3+, 128 for v1/v2); a positive value is capped to the
+  protocol maximum, floored at 64, and rounded up to a multiple of 64.
+  Protocol v1/v2 stay capped at 128 regardless. Lowering the ceiling makes a
+  stream id equal to `NumStreams` wire-representable, so the `processFrame`
+  receive guard is corrected from `>` to `>=` to reject it before indexing
+  the dense table (previously an unreachable off-by-one, now covered by a
+  regression test).
+
+### Fixed
+
+- Protocol-version negotiation with servers that only speak an older native
+  protocol works again. `ErrProtocol` now implements `Unwrap()`, restoring
+  `errors.As`/`errors.Is` traversal into its wrapped cause. During startup,
+  `checkProtocolRelatedError` calls `errors.As(err, &protocolErr)` to decide
+  whether a protocol-level failure is downgrade-eligible (a `supportedFrame`,
+  or an `errorFrame` with `ErrCodeProtocol`/`ErrCodeServer`) and therefore
+  worth retrying rather than convicting the host. The CASSGO-97 (#1920)
+  change that added support for error responses on non-zero stream ids began
+  wrapping the underlying `protocolError` inside an `ErrProtocol`
+  (`NewErrProtocol("%w", &protocolError{...})`), but because
+  `ErrProtocol struct{ error }` embeds the error without an `Unwrap` method,
+  `errors.As` could not reach the inner `protocolError.frame` — so responses
+  from older-protocol servers were no longer recognized as downgrade-eligible
+  and the host was treated as unreachable instead of negotiating down.
+  Adapted from upstream CASSGO-131 (cherry-pick of commit `1920205`). The
+  accompanying test-harness fix stops hardcoding protocol v5 in `TestServer`
+  (it now replies with the configured version, falling back to the request's
+  version) so the negotiation tests actually exercise the older-protocol path
+  that had masked the regression.
+- Requesting Snappy compression on native protocol v5+ no longer fails the
+  connection. Cassandra still advertises `[snappy lz4]` in its `SUPPORTED`
+  response on every protocol version, but v5 moved compression to the
+  checksummed framing (segment) layer, which is lz4-only. The driver
+  previously trusted that list, sent `COMPRESSION: snappy` in `STARTUP` on
+  v5, and the server rejected it — surfacing as a confusing "unsupported
+  protocol version 5 for host" connection failure. A new
+  `chooseCompression(version, name, supported)` helper now treats snappy as
+  unavailable on protocol v5+ regardless of what the server advertises; the
+  connection logs a warning and proceeds without compression (matching the
+  reference DataStax drivers, which downgrade rather than error). Snappy on
+  v3/v4 and lz4 on all versions are unaffected, and any other unsupported
+  compressor keeps the prior silent-disable behavior.
+- Restored the `system.peers_v2` → `system.peers` fallback in
+  `querySystemPeers`. When the driver probes `system.peers_v2` first
+  (protocol v4+ with `isSchemaV2` set) and the table doesn't exist, the
+  server returns an `ErrCodeInvalid` error — but the old code type-asserted
+  the query error to the bare `errorFrame` value (`err.(errorFrame)`), while
+  the framer actually returns that error as a `*RequestErrInvalid` pointer.
+  The assertion never matched, so the fallback never fired and nodes lacking
+  `system.peers_v2` (e.g. Cassandra 3.x speaking protocol v4) failed peer
+  discovery instead of dropping back to `system.peers`. Now matched via
+  `errors.As` against the `RequestError` interface, which `*RequestErrInvalid`
+  satisfies (and which also unwraps wrapped errors). Adapted from upstream
+  CASSGO-126 (cherry-pick of `e1d69bd`).
+- Idle connections no longer reconnect constantly under a small
+  `Session.Timeout`. The receive loop applied the connection read timeout
+  (`Session.Timeout`) to idle frame-header (proto-v4 `processFrame`) and
+  proto-v5 segment (`recvSegment`) reads, so a connection merely waiting for
+  the next response frame tripped its read deadline and reconnected — a
+  "repeated Pool connection error" storm that worsened the tighter
+  `Session.Timeout` was set. This is the v2.0.0 regression fixed upstream in
+  CASSGO-125 (commit `590aabe`), which otter-cache inherited: `processFrame`
+  cleared the read deadline directly, but `connReader.Read` re-armed it on
+  the next read because the timeout was still non-zero, and the proto-v5
+  `recvSegment` path — the one otter-cache uses in production — never cleared
+  it at all. The fix decouples the request timeout from the read deadline: a
+  new `Conn.requestTimeout` (`atomic.Int64`, set to `ConnectTimeout` during
+  the startup handshake and `Session.Timeout` afterward) now drives the
+  `execInternal` request timer, heartbeat OPTIONS, and startup handshake, so
+  transiently zeroing the read deadline around an idle read can no longer
+  disarm those request timers; `connReader.Read` clears the deadline when its
+  timeout is `0` (so `SetTimeout(0)` truly disarms it rather than leaving a
+  prior deadline armed); and both `processFrame` and `recvSegment` zero the
+  read timeout around the idle header/segment read and restore it for the
+  actively-arriving frame body and continuation segments, which stay bounded.
+  On the proto-v5 segment path the read deadline is disabled only for the
+  idle wait for the next segment to begin — it is re-armed the instant the
+  segment header is read and validated (via an `onSegmentHeader` callback
+  threaded through `readUncompressedSegment`/`readCompressedSegment`), so the
+  payload, CRC, and continuation-segment reads stay bounded. A peer that
+  sends a valid segment header then stalls mid-payload therefore hits the
+  read deadline instead of wedging the receive goroutine until the heartbeat
+  failure threshold closes the connection, mirroring the header/body deadline
+  split the proto-v4 `processFrame` path already had.
+
 ## [2.2.1-otter] - 2026-05-19
 
 ### Added
