@@ -410,6 +410,10 @@ type framer struct {
 	// compressBuf is a scratch buffer for compression/decompression to reduce allocations
 	compressBuf []byte
 
+	// segBuf is a reusable scratch buffer for the proto-v5 write-side self-contained
+	// segment, so steady-state frame writes don't allocate a fresh segment each time.
+	segBuf []byte
+
 	customPayload map[string][]byte
 
 	types *RegisteredTypes
@@ -646,6 +650,9 @@ func (f *framer) release() {
 	}
 	if cap(f.compressBuf) > maxPooledBufSize {
 		f.compressBuf = nil
+	}
+	if cap(f.segBuf) > maxPooledBufSize {
+		f.segBuf = nil
 	}
 	f.buf = f.readBuffer[:0]
 	framerPool.Put(f)
@@ -1103,6 +1110,15 @@ func (f *framer) finish() error {
 	}
 	length := len(f.buf) - frameHeadSize
 	f.setLength(length)
+
+	// Retain the grown request buffer in the pool. Write helpers append into f.buf,
+	// which reallocates away from f.readBuffer once the body outgrows the initial
+	// capacity; without this, release() resets f.buf to the small readBuffer and every
+	// request re-grows from defaultBufSize (the read-path B2 retention never reaches
+	// the write path). Bounded like release() so an outsized frame doesn't pin memory.
+	if cap(f.buf) > cap(f.readBuffer) && cap(f.buf) <= maxPooledBufSize {
+		f.readBuffer = f.buf
+	}
 
 	return nil
 }
@@ -2703,6 +2719,19 @@ func (f *framer) prepareModernLayout() error {
 		selfContained = false
 	}
 
+	// The self-contained uncompressed single-segment case (the common one — batch/query
+	// body <= maxSegmentPayloadSize, no compression) builds the segment into the
+	// framer's reusable segBuf, so steady-state reuse allocates nothing. The old path
+	// make()'d a fresh segment AND copied it again into a fresh adjustedBuf.
+	if adjustedBuf == nil && f.compres == nil {
+		f.segBuf, err = appendUncompressedSegment(f.segBuf[:0], f.buf, selfContained)
+		if err != nil {
+			return err
+		}
+		f.buf = f.segBuf
+		return nil
+	}
+
 	// Process the remaining buffer
 	if f.compres != nil {
 		tempBuf, err = newCompressedSegment(f.buf, selfContained, f.compres)
@@ -2713,10 +2742,58 @@ func (f *framer) prepareModernLayout() error {
 		return err
 	}
 
+	if adjustedBuf == nil {
+		f.buf = tempBuf
+		return nil
+	}
+
 	adjustedBuf = append(adjustedBuf, tempBuf...)
 	f.buf = adjustedBuf
 
 	return nil
+}
+
+// appendUncompressedSegment builds one proto-v5 uncompressed segment (6-byte header,
+// payload, 4-byte CRC32) for payload into dst, reusing dst's capacity. dst must be
+// empty (len 0); it is the allocation-free write-side counterpart to
+// newUncompressedSegment for the self-contained single-segment case.
+func appendUncompressedSegment(dst, payload []byte, isSelfContained bool) ([]byte, error) {
+	const (
+		headerSize       = 6
+		selfContainedBit = 1 << 17
+	)
+
+	payloadLen := len(payload)
+	if payloadLen > maxSegmentPayloadSize {
+		return nil, fmt.Errorf("gocql: payload length (%d) exceeds maximum size of %d", payloadLen, maxSegmentPayloadSize)
+	}
+
+	segmentSize := headerSize + payloadLen + crc32Size
+	if cap(dst) < segmentSize {
+		dst = make([]byte, segmentSize)
+	} else {
+		dst = dst[:segmentSize]
+	}
+
+	headerInt := uint32(payloadLen)
+	if isSelfContained {
+		headerInt |= selfContainedBit
+	}
+	dst[0] = byte(headerInt)
+	dst[1] = byte(headerInt >> 8)
+	dst[2] = byte(headerInt >> 16)
+
+	crc := Crc24(dst[:3])
+	dst[3] = byte(crc)
+	dst[4] = byte(crc >> 8)
+	dst[5] = byte(crc >> 16)
+
+	copy(dst[headerSize:], payload)
+
+	payloadCRC32 := Crc32(payload)
+	binary.LittleEndian.PutUint32(dst[headerSize+payloadLen:], payloadCRC32)
+
+	return dst, nil
 }
 
 const (
