@@ -39,6 +39,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The six-consecutive-failure threshold and the heartbeat timeout floor are unchanged,
   as is the control connection's own heartbeat.
 
+- A query against a host whose pool is empty now waits for a fill that is already in
+  flight instead of returning `ErrNoConnections` without ever touching the network.
+  Picking from an empty pool spawns a refill and returns nothing,
+  so every query issued between a node's connections dropping and its pool refilling
+  failed immediately, even though a connection was seconds away.
+  The pool now publishes a claim before it starts a fill,
+  and a query that finds every candidate host empty waits for those claims
+  and retries on the first connection that lands.
+  The wait is bounded by the caller's context deadline when there is one,
+  by `Session.Timeout` otherwise (a non-positive `Session.Timeout` waits on the context alone),
+  and it ends immediately when the last fill it was waiting for finished empty-handed,
+  when the host is removed from the ring, or when the session is closed.
+  Saturated pools keep their previous next-host behaviour and are never waited for,
+  and a speculative execution that found no host at all can no longer beat a sibling
+  that is waiting for a connection.
+
 ## [2.3.0-otter] - 2026-07-11
 
 This release continues the downstream performance work with proto-v5

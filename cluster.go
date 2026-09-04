@@ -348,6 +348,10 @@ type ClusterConfig struct {
 	// nil selects defaultHeartbeatPhase.
 	heartbeatPhase func(interval time.Duration) time.Duration
 
+	// testPoolHook is called at the connection-pool fill checkpoints named by
+	// poolEvent (internal, for testing); nil in production.
+	testPoolHook func(ev poolEvent, host *HostInfo)
+
 	// Metadata configures driver's internal metadata caching and event listening.
 	Metadata MetadataConfig
 }

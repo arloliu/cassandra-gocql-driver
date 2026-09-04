@@ -68,9 +68,46 @@ type internalRequest interface {
 	ExecutableStatement
 }
 
+// runStage identifies a checkpoint in run that a test can observe through
+// queryExecutor.testRunHook.
+type runStage uint8
+
+const (
+	// runEntered fires as run starts, before any host is selected.
+	runEntered runStage = iota
+	// runNoHost fires just before run reports that it found no host to try.
+	runNoHost
+)
+
+// fillCandidate is a host whose pool was empty with a fill in flight,
+// so a query may wait for that fill instead of failing fast.
+type fillCandidate struct {
+	host SelectedHost
+	pool *hostConnPool
+}
+
 type queryExecutor struct {
 	pool   *policyConnPool
 	policy HostSelectionPolicy
+
+	// testBeforeSnapshot runs in do between a nil Pick and pickOrState.
+	// Nil in production.
+	testBeforeSnapshot func()
+	// testAfterWake runs in awaitFill before every snapshot,
+	// including the first one.
+	// Nil in production.
+	testAfterWake func()
+	// testBeforePickOrState runs in awaitFill after the snapshot and before each
+	// candidate is inspected, outside every lock.
+	// Nil in production.
+	testBeforePickOrState func()
+	// testBeforeWait runs in awaitFill immediately before it blocks on a
+	// generation.
+	// Nil in production.
+	testBeforeWait func()
+	// testRunHook runs at run's checkpoints.
+	// Nil in production.
+	testRunHook func(stage runStage)
 }
 
 func (q *queryExecutor) attemptQuery(ctx context.Context, qry internalRequest, conn *Conn) *Iter {
@@ -83,23 +120,72 @@ func (q *queryExecutor) attemptQuery(ctx context.Context, qry internalRequest, c
 	return iter
 }
 
-func (q *queryExecutor) speculate(ctx context.Context, qry internalRequest, sp SpeculativeExecutionPolicy,
-	hostIter NextHost, results chan *Iter) *Iter {
-	ticker := time.NewTicker(sp.Delay())
-	defer ticker.Stop()
+// coordinate runs the main execution plus the speculative ones and returns the
+// first outcome that decides the query.
+//
+// A runner that never reached a host reports on its own channel instead of
+// producing an iterator, so a no-host report can never beat a sibling that is
+// waiting for a fill.
+// The query fails with ErrNoConnections as soon as every launched runner reported
+// no host, whether or not a further launch is still scheduled.
+//
+// Parameters:
+//   - ctx: cancelled by executeQuery once a result is returned
+//   - sp: the speculative execution policy; sp.Attempts() extra runners
+//   - hostIter: the shared, already synchronized host iterator
+//
+// Returns:
+//   - *Iter: the winning iterator, or an error iterator
+func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp SpeculativeExecutionPolicy,
+	hostIter NextHost) *Iter {
+	// remaining counts scheduled launches that have not started yet.
+	remaining := sp.Attempts()
+	results := make(chan *Iter, 1+remaining)
+	// Buffered so a runner reporting no host never blocks.
+	noHostCh := make(chan struct{}, 1+remaining)
+	launched, noHost := 1, 0
 
-	for i := 0; i < sp.Attempts(); i++ {
-		select {
-		case <-ticker.C:
-			go q.run(ctx, qry, hostIter, results)
-		case <-ctx.Done():
-			return newErrIter(ctx.Err(), qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
-		case iter := <-results:
-			return iter
-		}
+	go q.run(ctx, qry, hostIter, results, noHostCh)
+
+	var tick <-chan time.Time
+	if remaining > 0 {
+		ticker := time.NewTicker(sp.Delay())
+		defer ticker.Stop()
+		tick = ticker.C
 	}
 
-	return nil
+	for {
+		select {
+		case iter := <-results:
+			// Any real result wins.
+			return iter
+		case <-noHostCh:
+			// A no-host report never consumes a launch.
+			noHost++
+			// noHost == launched means no launched runner is still viable, so the
+			// query must not stay alive until the next speculative tick: with a
+			// long delay that wait outlives Session.Timeout, and the query context
+			// defaults to context.Background(), so Session.Close cannot release it.
+			// A runner waiting for a fill has not reported, so it keeps
+			// noHost < launched and the sibling protection intact, and a launch
+			// that has not started yet cannot help either: it would draw from the
+			// shared host iterator, which is already exhausted.
+			if noHost == launched {
+				return newErrIter(ErrNoConnections, qry.getQueryMetrics(), qry.Keyspace(),
+					qry.getRoutingInfo(), qry.getKeyspaceFunc())
+			}
+		case <-tick:
+			// Only the ticker launches.
+			remaining--
+			launched++
+			go q.run(ctx, qry, hostIter, results, noHostCh)
+			if remaining == 0 {
+				tick = nil
+			}
+		case <-ctx.Done():
+			return newErrIter(ctx.Err(), qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
+		}
+	}
 }
 
 func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
@@ -147,24 +233,9 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	ctx, cancel := context.WithCancel(qry.Context())
 	defer cancel()
 
-	results := make(chan *Iter, 1)
-
-	// Launch the main execution
-	go q.run(ctx, qry, hostIter, results)
-
-	// The speculative executions are launched _in addition_ to the main
-	// execution, on a timer. So Speculation{2} would make 3 executions running
-	// in total.
-	if iter := q.speculate(ctx, qry, sp, hostIter, results); iter != nil {
-		return iter, nil
-	}
-
-	select {
-	case iter := <-results:
-		return iter, nil
-	case <-ctx.Done():
-		return newErrIter(ctx.Err(), qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc()), nil
-	}
+	// The speculative executions are launched _in addition_ to the main execution, on a timer.
+	// So Speculation{2} would make 3 executions running in total.
+	return q.coordinate(ctx, qry, sp, hostIter), nil
 }
 
 func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter NextHost) *Iter {
@@ -173,26 +244,37 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter Ne
 
 	var lastErr error
 	var iter *Iter
-	for selectedHost != nil {
-		host := selectedHost.Info()
-		if host == nil || !host.IsUp() {
-			selectedHost = hostIter()
-			continue
+	// cands stays nil until a host's pool is found empty with a fill in flight.
+	var cands []fillCandidate
+	for {
+		if selectedHost == nil {
+			// The hosts are exhausted; wait for a fill before giving up.
+			if lastErr != nil || len(cands) == 0 {
+				break
+			}
+
+			conn, host, err := q.awaitFill(ctx, cands)
+			cands = nil
+			if err != nil {
+				return newErrIter(err, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
+			}
+			if conn == nil {
+				break
+			}
+
+			selectedHost = host
+			iter = q.attemptQuery(ctx, qry, conn)
+		} else {
+			var conn *Conn
+			conn, cands = q.pickForHost(selectedHost, cands)
+			if conn == nil {
+				selectedHost = hostIter()
+				continue
+			}
+
+			iter = q.attemptQuery(ctx, qry, conn)
 		}
 
-		pool, ok := q.pool.getPool(host)
-		if !ok {
-			selectedHost = hostIter()
-			continue
-		}
-
-		conn := pool.Pick()
-		if conn == nil {
-			selectedHost = hostIter()
-			continue
-		}
-
-		iter = q.attemptQuery(ctx, qry, conn)
 		iter.host = selectedHost.Info()
 		// Update host
 		switch iter.err {
@@ -248,11 +330,137 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter Ne
 	return newErrIter(ErrNoConnections, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
 }
 
-func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter NextHost, results chan<- *Iter) {
-	// Coordination teardown: parent at executeQuery selects on <-results
-	// or <-ctx.Done(). If q.do panics, no result is sent and the parent
-	// waits until ctx cancel. Push a panic-error iter so the parent
-	// unblocks immediately.
+// pickForHost selects a connection for selectedHost.
+//
+// When the host's pool turns out to be empty with a fill in flight,
+// the host is recorded as a fill candidate,
+// so the caller can wait for that fill once the hosts are exhausted.
+// The recheck after a nil Pick is a single read of the pool,
+// so a connection cannot disappear between deciding "no connection" and deciding "no fill".
+//
+// Parameters:
+//   - selectedHost: the host to serve the query from
+//   - cands: the fill candidates collected so far
+//
+// Returns:
+//   - *Conn: a usable connection, or nil when the caller should move to the next host
+//   - []fillCandidate: cands, extended when this host is worth waiting for
+func (q *queryExecutor) pickForHost(selectedHost SelectedHost, cands []fillCandidate) (*Conn, []fillCandidate) {
+	host := selectedHost.Info()
+	if host == nil || !host.IsUp() {
+		return nil, cands
+	}
+
+	pool, ok := q.pool.getPool(host)
+	if !ok {
+		return nil, cands
+	}
+
+	conn := pool.Pick()
+	if conn != nil {
+		return conn, cands
+	}
+
+	if q.testBeforeSnapshot != nil {
+		q.testBeforeSnapshot()
+	}
+
+	// Pick already published a fill claim if one was due, so this recheck never
+	// schedules one of its own.
+	conn, state := pool.pickOrState()
+	if state == poolEmptyPending {
+		cands = append(cands, fillCandidate{host: selectedHost, pool: pool})
+	}
+
+	return conn, cands
+}
+
+// awaitFill waits until one of the candidate pools produces a connection or until
+// every candidate has stopped being worth waiting for.
+//
+// All candidates share one absolute deadline.
+// The timer rules mirror those of a request on a connection:
+// a caller deadline wins over Session.Timeout,
+// and a non-positive Session.Timeout waits on the context alone.
+//
+// Parameters:
+//   - ctx: the query context
+//   - cands: pools that were empty with a fill in flight; filtered in place
+//
+// Returns:
+//   - *Conn: the connection to attempt the query on, nil when none appeared
+//   - SelectedHost: the host that connection belongs to
+//   - error: ErrNoConnections when no candidate is left or the timeout expired,
+//     ctx.Err() on cancellation, ErrSessionClosed once the session's pool is closed
+func (q *queryExecutor) awaitFill(ctx context.Context, cands []fillCandidate) (*Conn, SelectedHost, error) {
+	var timeoutCh <-chan time.Time
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		if timeout := q.pool.session.cfg.Timeout; timeout > 0 {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			timeoutCh = timer.C
+		}
+	}
+
+	for {
+		if q.testAfterWake != nil {
+			q.testAfterWake()
+		}
+
+		// The generation is captured before any pool is read, so a wake that
+		// happens during the reads below cannot be lost.
+		gen, parentClosed, kept := q.pool.snapshot(cands)
+		if parentClosed {
+			return nil, nil, ErrSessionClosed
+		}
+
+		cands = kept[:0]
+		for _, cand := range kept {
+			if q.testBeforePickOrState != nil {
+				q.testBeforePickOrState()
+			}
+
+			conn, state := cand.pool.pickOrState()
+			switch state {
+			case poolPicked:
+				return conn, cand.host, nil
+			case poolEmptyPending:
+				// A fill is scheduled or running: still worth waiting for.
+				cands = append(cands, cand)
+			default:
+				// Closed, saturated, or empty and idle: nothing to wait for.
+			}
+		}
+
+		if len(cands) == 0 {
+			return nil, nil, ErrNoConnections
+		}
+
+		if q.testBeforeWait != nil {
+			q.testBeforeWait()
+		}
+
+		select {
+		case <-gen:
+		case <-timeoutCh:
+			return nil, nil, ErrNoConnections
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-q.pool.session.ctx.Done():
+			return nil, nil, ErrSessionClosed
+		}
+	}
+}
+
+func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter NextHost, results chan<- *Iter,
+	noHost chan<- struct{}) {
+	if q.testRunHook != nil {
+		q.testRunHook(runEntered)
+	}
+
+	// Coordination teardown: parent at coordinate selects on <-results, <-noHost or <-ctx.Done().
+	// If q.do panics, no result is sent and the parent waits until ctx cancel.
+	// Push a panic-error iter so the parent unblocks immediately.
 	defer recoverGoroutine(q.pool.session.logger, "queryExecutor.run", func(err error) {
 		errIter := newErrIter(err, qry.getQueryMetrics(), qry.Keyspace(),
 			qry.getRoutingInfo(), qry.getKeyspaceFunc())
@@ -262,8 +470,22 @@ func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter N
 		}
 	})
 
+	iter := q.do(ctx, qry, hostIter)
+	if iter.err == ErrNoConnections {
+		// do returns ErrNoConnections only when it never reached a host, so a
+		// sibling still waiting for a fill must not lose to this report.
+		if q.testRunHook != nil {
+			q.testRunHook(runNoHost)
+		}
+		select {
+		case noHost <- struct{}{}:
+		case <-ctx.Done():
+		}
+		return
+	}
+
 	select {
-	case results <- q.do(ctx, qry, hostIter):
+	case results <- iter:
 	case <-ctx.Done():
 	}
 }

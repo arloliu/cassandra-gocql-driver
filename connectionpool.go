@@ -96,6 +96,45 @@ func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
+// poolState is what hostConnPool.pickOrState observed in one read of a pool.
+type poolState uint8
+
+const (
+	// poolClosed means the pool is closed and will never serve a connection again.
+	poolClosed poolState = iota
+	// poolPicked means a usable connection was returned alongside this state.
+	poolPicked
+	// poolSaturated means the pool holds connections but none of them has an available stream.
+	poolSaturated
+	// poolEmptyPending means the pool holds no connection and at least one fill is in flight.
+	poolEmptyPending
+	// poolEmptyIdle means the pool holds no connection and no fill is in flight,
+	// so waiting for this pool would wait forever.
+	poolEmptyIdle
+)
+
+// poolEvent identifies a checkpoint in the fill machinery that a test can observe
+// through ClusterConfig.testPoolHook.
+type poolEvent uint8
+
+const (
+	// poolConnectAttempt fires in connect, before each session.connect attempt.
+	poolConnectAttempt poolEvent = iota
+	// poolConnAppended fires in connect, after a connection was appended to the pool
+	// and before the parent generation is notified.
+	poolConnAppended
+	// poolFillAsyncStart fires in fill's asynchronous branch, before connectMany.
+	poolFillAsyncStart
+	// poolFillAdmission fires in fill, in the read-to-write lock transition that
+	// precedes the double check.
+	poolFillAdmission
+	// poolFillDone fires in fillDone, after a fill claim was released and before
+	// the parent generation is notified.
+	// It is the last thing an asynchronous fill branch does, so a test can use it
+	// as a completion barrier instead of polling the claim count.
+	poolFillDone
+)
+
 type policyConnPool struct {
 	session *Session
 
@@ -105,6 +144,17 @@ type policyConnPool struct {
 
 	mu            sync.RWMutex
 	hostConnPools map[string]*hostConnPool
+	// closed is terminal: once set, no pool is registered again and no successor
+	// wake generation is ever created, so a waiter can safely give up.
+	closed bool
+	// wake is the current wake generation, created lazily by generation and
+	// closed exactly once by notifyLocked.
+	wake chan struct{}
+
+	// testAfterParentNotify, when set, runs after removeHost or Close published the
+	// terminal state and released p.mu, before the child pools are closed.
+	// Nil in production.
+	testAfterParentNotify func()
 }
 
 func connConfig(cfg *ClusterConfig) (*ConnConfig, error) {
@@ -186,6 +236,11 @@ func newPolicyConnPool(session *Session) *policyConnPool {
 func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.closed {
+		// Close is terminal: registering a pool again would strand it.
+		return
+	}
 
 	toRemove := make(map[string]struct{})
 	for hostID := range p.hostConnPools {
@@ -297,13 +352,92 @@ func (p *policyConnPool) getPoolByHostID(hostID string) (pool *hostConnPool, ok 
 	return
 }
 
-func (p *policyConnPool) Close() {
+// generation returns the wake channel a waiter should block on, creating it when
+// this is the first waiter of the current generation.
+//
+// The caller must hold p.mu.
+// Capturing the channel and reading pool state must happen in this order,
+// otherwise a notify between the two would be lost.
+//
+// Returns:
+//   - <-chan struct{}: closed by the next pool event
+func (p *policyConnPool) generation() <-chan struct{} {
+	if p.wake == nil {
+		p.wake = make(chan struct{})
+	}
+	return p.wake
+}
+
+// notifyLocked ends the current wake generation, waking every waiter holding it.
+//
+// The caller must hold p.mu.
+// Dropping the channel makes the close happen at most once per generation;
+// the next waiter creates a successor.
+func (p *policyConnPool) notifyLocked() {
+	if p.wake != nil {
+		close(p.wake)
+		p.wake = nil
+	}
+}
+
+// notify ends the current wake generation.
+//
+// It must never be called while a hostConnPool.mu is held: the lock order is
+// p.mu -> pool.mu and never the reverse.
+func (p *policyConnPool) notify() {
+	p.mu.Lock()
+	p.notifyLocked()
+	p.mu.Unlock()
+}
+
+// snapshot captures the wake generation and revalidates cands in one critical section.
+//
+// Doing both under p.mu is what makes a removal or a close unmissable: a waiter
+// either observes the pool as unregistered (or the parent as closed), or it holds a
+// generation that the later removal or close is guaranteed to end.
+//
+// Parameters:
+//   - cands: the candidates a waiter still wants to wait for; filtered in place
+//
+// Returns:
+//   - <-chan struct{}: the generation to block on, nil when the parent is closed
+//   - bool: true when the parent pool is closed, which is terminal
+//   - []fillCandidate: the candidates whose exact pool pointer is still registered
+func (p *policyConnPool) snapshot(cands []fillCandidate) (<-chan struct{}, bool, []fillCandidate) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// close the pools
-	for addr, pool := range p.hostConnPools {
-		delete(p.hostConnPools, addr)
+	if p.closed {
+		// Terminal: no successor generation is ever created.
+		return nil, true, nil
+	}
+
+	gen := p.generation()
+	kept := cands[:0]
+	for _, cand := range cands {
+		if p.hostConnPools[cand.host.Info().HostID()] == cand.pool {
+			kept = append(kept, cand)
+		}
+	}
+
+	return gen, false, kept
+}
+
+func (p *policyConnPool) Close() {
+	p.mu.Lock()
+	p.closed = true
+	pools := p.hostConnPools
+	p.hostConnPools = map[string]*hostConnPool{}
+	p.notifyLocked()
+	p.mu.Unlock()
+
+	if p.testAfterParentNotify != nil {
+		p.testAfterParentNotify()
+	}
+
+	// The children are closed outside p.mu; a child never notifies the parent from
+	// its own Close, so no waiter can be woken by a half-torn-down pool.
+	for _, pool := range pools {
 		pool.Close()
 	}
 }
@@ -311,6 +445,10 @@ func (p *policyConnPool) Close() {
 func (p *policyConnPool) addHost(host *HostInfo) {
 	hostID := host.HostID()
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
 	pool, ok := p.hostConnPools[hostID]
 	if !ok {
 		pool = newHostConnPool(
@@ -325,7 +463,11 @@ func (p *policyConnPool) addHost(host *HostInfo) {
 	}
 	p.mu.Unlock()
 
-	pool.fill()
+	// The fill runs after p.mu was released: connect notifies the parent
+	// generation, which takes p.mu, so filling under it would self-deadlock.
+	if pool.claimFill() {
+		pool.runFill()
+	}
 }
 
 // removeHost unregisters and closes the pool built for this exact *HostInfo.
@@ -333,6 +475,9 @@ func (p *policyConnPool) addHost(host *HostInfo) {
 // The pointer check runs under p.mu, so a caller holding an object that
 // refreshRing has since replaced under the same host ID leaves the
 // replacement's pool untouched.
+//
+// The unregistration and the wake share one p.mu section,
+// so a query waiting for a fill on this pool cannot miss the removal.
 //
 // Parameters:
 //   - host: the ring object whose pool should be removed
@@ -346,7 +491,12 @@ func (p *policyConnPool) removeHost(host *HostInfo) {
 	}
 
 	delete(p.hostConnPools, hostID)
+	p.notifyLocked()
 	p.mu.Unlock()
+
+	if p.testAfterParentNotify != nil {
+		p.testAfterParentNotify()
+	}
 
 	go func() {
 		defer recoverGoroutine(p.session.logger, "hostConnPool.Close.removeHost", nil)
@@ -362,11 +512,17 @@ type hostConnPool struct {
 	port     int
 	size     int
 	keyspace string
-	// protection for conns, closed, filling
+	// protection for conns, closed, filling, fillsPending
 	mu      sync.RWMutex
 	conns   []*Conn
 	closed  bool
 	filling bool
+	// fillsPending counts the fill claims that have been published and not yet
+	// released by fillDone.
+	// It is a plain int, not an atomic, on purpose:
+	// pool.mu is the single linearization point,
+	// so a claim and a pickOrState decision are totally ordered.
+	fillsPending int
 
 	pos    uint32
 	logger StructuredLogger
@@ -398,26 +554,109 @@ func newHostConnPool(session *Session, host *HostInfo, port, size int,
 	return pool
 }
 
+// claimFill publishes a pending-fill claim so a waiting query observes the pool as
+// poolEmptyPending instead of giving up.
+//
+// The claim and the pool state it describes are published under the same pool.mu,
+// which is what makes the claim unmissable.
+// Exactly one fillDone must release each claim.
+//
+// Returns:
+//   - bool: true when the claim was published; false when the pool is closed
+func (pool *hostConnPool) claimFill() bool {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	if pool.closed {
+		return false
+	}
+	pool.fillsPending++
+
+	return true
+}
+
+// scheduleFill claims a fill and runs it on a new goroutine.
+func (pool *hostConnPool) scheduleFill() {
+	if pool.claimFill() {
+		// The goroutine is spawned outside pool.mu.
+		go pool.runFill()
+	}
+}
+
+// runFill runs one claimed fill cycle and releases its claim exactly once.
+//
+// The caller must already hold a claim published by claimFill or by
+// HandleError's critical section.
+func (pool *hostConnPool) runFill() {
+	var handedOff bool
+	// Registered first, so it runs last and can still recover a panic escaping
+	// fillDone itself.
+	defer recoverGoroutine(pool.logger, "hostConnPool.runFill", nil)
+	defer func() {
+		if !handedOff {
+			pool.fillDone()
+		}
+	}()
+
+	handedOff = pool.fill()
+}
+
+// fillDone releases one fill claim and ends the current wake generation.
+//
+// The decrement is published under pool.mu and the parent is notified only after
+// that lock was released, keeping the p.mu -> pool.mu lock order intact.
+// The poolFillDone checkpoint is reached between the two, so observing it proves
+// the decrement already happened.
+func (pool *hostConnPool) fillDone() {
+	pool.mu.Lock()
+	pool.fillsPending--
+	pool.mu.Unlock()
+
+	pool.testHook(poolFillDone)
+
+	pool.notify()
+}
+
+// notify ends the session-wide wake generation, if this pool belongs to a session.
+//
+// It tolerates a zero-value pool so hand-built pools in tests never panic.
+func (pool *hostConnPool) notify() {
+	if pool.session == nil || pool.session.pool == nil {
+		return
+	}
+	pool.session.pool.notify()
+}
+
+// testHook invokes the cluster's pool test hook, if one is configured.
+//
+// Parameters:
+//   - ev: the checkpoint being reached
+func (pool *hostConnPool) testHook(ev poolEvent) {
+	if pool.session == nil || pool.session.cfg.testPoolHook == nil {
+		return
+	}
+	pool.session.cfg.testPoolHook(ev, pool.host)
+}
+
 // Pick a connection from this connection pool for the given query.
 func (pool *hostConnPool) Pick() *Conn {
 	pool.mu.RLock()
-	defer pool.mu.RUnlock()
 
 	if pool.closed {
+		pool.mu.RUnlock()
 		return nil
 	}
 
 	size := len(pool.conns)
-	if size < pool.size {
-		// try to fill the pool
-		go func() {
-			defer recoverGoroutine(pool.logger, "hostConnPool.fill.pick", nil)
-			pool.fill()
-		}()
-
-		if size == 0 {
-			return nil
+	needFill := size < pool.size
+	if size == 0 {
+		pool.mu.RUnlock()
+		if needFill {
+			// The claim is published outside the read lock, so it is ordered
+			// against every pickOrState decision by pool.mu alone.
+			pool.scheduleFill()
 		}
+		return nil
 	}
 
 	pos := int(atomic.AddUint32(&pool.pos, 1) - 1)
@@ -436,7 +675,62 @@ func (pool *hostConnPool) Pick() *Conn {
 		}
 	}
 
+	pool.mu.RUnlock()
+
+	if needFill {
+		pool.scheduleFill()
+	}
+
 	return leastBusyConn
+}
+
+// pickOrState is the slow path taken only after Pick returned nil.
+//
+// One read lock decides both "is there a usable connection" and "is a fill in
+// flight" from the same read of conns and fillsPending, so a connection cannot
+// disappear between the two questions.
+// It never schedules a fill: Pick already published a claim if one was due.
+//
+// Returns:
+//   - *Conn: the least busy connection, non-nil only with poolPicked
+//   - poolState: what this single read observed
+func (pool *hostConnPool) pickOrState() (*Conn, poolState) {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	if pool.closed {
+		return nil, poolClosed
+	}
+
+	size := len(pool.conns)
+	if size == 0 {
+		if pool.fillsPending > 0 {
+			return nil, poolEmptyPending
+		}
+		return nil, poolEmptyIdle
+	}
+
+	pos := int(atomic.AddUint32(&pool.pos, 1) - 1)
+
+	var (
+		leastBusyConn    *Conn
+		streamsAvailable int
+	)
+
+	// same selection loop as Pick
+	for i := 0; i < size; i++ {
+		conn := pool.conns[(pos+i)%size]
+		if streams := conn.AvailableStreams(); streams > streamsAvailable {
+			leastBusyConn = conn
+			streamsAvailable = streams
+		}
+	}
+
+	if leastBusyConn == nil {
+		return nil, poolSaturated
+	}
+
+	return leastBusyConn, poolPicked
 }
 
 // Size returns the number of connections currently active in the pool
@@ -478,13 +772,24 @@ func (pool *hostConnPool) Close() {
 	}
 }
 
-// Fill the connection pool
-func (pool *hostConnPool) fill() {
+// fill runs one fill cycle for the connection pool.
+//
+// Every caller must already hold a pending-fill claim (see claimFill) and runFill
+// owns its release: the claim is what a waiting query observes as poolEmptyPending.
+// filling and fillsPending are deliberately different things.
+// filling is fill's own admission gate, so a claim can be published and then exit
+// at the double check below because another runner won admission;
+// that runner holds a claim of its own, so no waiter is left without a pending fill.
+//
+// Returns:
+//   - handedOff: true once the asynchronous branch was spawned,
+//     after which that goroutine owns the single fillDone for this claim
+func (pool *hostConnPool) fill() (handedOff bool) {
 	pool.mu.RLock()
 	// avoid filling a closed pool, or concurrent filling
 	if pool.closed || pool.filling {
 		pool.mu.RUnlock()
-		return
+		return false
 	}
 
 	// determine the filling work to be done
@@ -494,11 +799,12 @@ func (pool *hostConnPool) fill() {
 	// avoid filling a full (or overfull) pool
 	if fillCount <= 0 {
 		pool.mu.RUnlock()
-		return
+		return false
 	}
 
 	// switch from read to write lock
 	pool.mu.RUnlock()
+	pool.testHook(poolFillAdmission)
 	pool.mu.Lock()
 
 	// double check everything since the lock was released
@@ -508,7 +814,7 @@ func (pool *hostConnPool) fill() {
 		// looks like another goroutine already beat this
 		// goroutine to the filling
 		pool.mu.Unlock()
-		return
+		return false
 	}
 
 	// ok fill the pool
@@ -525,8 +831,7 @@ func (pool *hostConnPool) fill() {
 	// the fillingStopped responsibility, the pool is permanently stuck
 	// (later Pick / HandleError see filling=true and skip refilling).
 	// `handedOff` flips once the async goroutine has been spawned, after
-	// which IT owns calling fillingStopped.
-	handedOff := false
+	// which IT owns calling fillingStopped and the single fillDone.
 	defer func() {
 		if r := recover(); r != nil {
 			if !handedOff {
@@ -551,7 +856,7 @@ func (pool *hostConnPool) fill() {
 		if err != nil {
 			// probably unreachable host
 			pool.fillingStopped(err)
-			return
+			return false
 		}
 		// notify the session that this node is connected
 		go func() {
@@ -566,16 +871,22 @@ func (pool *hostConnPool) fill() {
 	// fill the rest of the pool asynchronously
 	handedOff = true
 	go func() {
+		// Registered first, so it runs last: the claim is released after
+		// fillingStopped, and the parent generation is notified once.
+		defer pool.fillDone()
+
 		var stopped bool
-		// Recovery teardown: if connectMany panics, pool.filling stays
-		// true forever and no future fill() can run. Ensure
-		// fillingStopped runs. `stopped` flag prevents double-call when
-		// the body completed normally.
+		// Recovery teardown: if connectMany panics,
+		// pool.filling stays true forever and no future fill() can run.
+		// Ensure fillingStopped runs.
+		// `stopped` flag prevents double-call when the body completed normally.
 		defer recoverGoroutine(pool.logger, "hostConnPool.fill.async", func(err error) {
 			if !stopped {
 				pool.fillingStopped(err)
 			}
 		})
+
+		pool.testHook(poolFillAsyncStart)
 
 		err := pool.connectMany(fillCount)
 
@@ -588,6 +899,8 @@ func (pool *hostConnPool) fill() {
 			go pool.session.handleNodeConnected(pool.host)
 		}
 	}()
+
+	return handedOff
 }
 
 func (pool *hostConnPool) logConnectErr(err error) {
@@ -680,6 +993,7 @@ func (pool *hostConnPool) connect() (err error) {
 	reconnectionPolicy := pool.session.cfg.ReconnectionPolicy
 	maxRetries := reconnectionPolicy.GetMaxRetries()
 	for i := 0; i < maxRetries; i++ {
+		pool.testHook(poolConnectAttempt)
 		conn, err = pool.session.connect(pool.session.ctx, pool.host, pool)
 		if err == nil {
 			break
@@ -716,14 +1030,22 @@ func (pool *hostConnPool) connect() (err error) {
 
 	// add the Conn to the pool
 	pool.mu.Lock()
-	defer pool.mu.Unlock()
 
 	if pool.closed {
+		pool.mu.Unlock()
 		conn.Close()
 		return nil
 	}
 
 	pool.conns = append(pool.conns, conn)
+	pool.mu.Unlock()
+
+	pool.testHook(poolConnAppended)
+
+	// Wake waiters on the first connection of a multi-connection cycle rather
+	// than only when the whole cycle ends.
+	// The notify takes p.mu, so pool.mu must already be released here.
+	pool.notify()
 
 	return nil
 }
@@ -735,31 +1057,42 @@ func (pool *hostConnPool) HandleError(conn *Conn, err error, closed bool) {
 		return
 	}
 
-	// TODO: track the number of errors per host and detect when a host is dead,
-	// then also have something which can detect when a host comes back.
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
+	// The mutation keeps a deferred unlock so a panicking application logger
+	// cannot strand pool.mu; only the spawn moves outside the lock.
+	spawn := func() bool {
+		// TODO: track the number of errors per host and detect when a host is dead,
+		// then also have something which can detect when a host comes back.
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
 
-	if pool.closed {
-		// pool closed
-		return
-	}
+		if pool.closed {
+			// pool closed: nothing was removed, so nothing is claimed
+			return false
+		}
 
-	pool.logger.Info("Pool connection error.",
-		NewLogFieldString("addr", conn.addr), NewLogFieldError("err", err))
+		pool.logger.Info("Pool connection error.",
+			NewLogFieldString("addr", conn.addr), NewLogFieldError("err", err))
 
-	// find the connection index
-	for i, candidate := range pool.conns {
-		if candidate == conn {
+		// find the connection index
+		for i, candidate := range pool.conns {
+			if candidate != conn {
+				continue
+			}
 			// remove the connection, not preserving order
 			pool.conns[i], pool.conns = pool.conns[len(pool.conns)-1], pool.conns[:len(pool.conns)-1]
 
-			// lost a connection, so fill the pool
-			go func() {
-				defer recoverGoroutine(pool.logger, "hostConnPool.fill.HandleError", nil)
-				pool.fill()
-			}()
-			break
+			// The claim is published in the same critical section as the
+			// removal, so a query cannot observe the pool empty and idle in
+			// between.
+			pool.fillsPending++
+			return true
 		}
+
+		// the connection was not ours: nothing removed, nothing claimed
+		return false
+	}()
+
+	if spawn {
+		go pool.runFill()
 	}
 }
