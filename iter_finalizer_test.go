@@ -45,9 +45,9 @@ func newChannelLogger() *channelLogger {
 	return &channelLogger{warnings: make(chan string, 8)}
 }
 
-func (l *channelLogger) Error(_ string, _ ...LogField)   {}
-func (l *channelLogger) Info(_ string, _ ...LogField)    {}
-func (l *channelLogger) Debug(_ string, _ ...LogField)   {}
+func (l *channelLogger) Error(_ string, _ ...LogField) {}
+func (l *channelLogger) Info(_ string, _ ...LogField)  {}
+func (l *channelLogger) Debug(_ string, _ ...LogField) {}
 func (l *channelLogger) Warning(msg string, _ ...LogField) {
 	atomic.AddInt64(&l.count, 1)
 	l.mu.Lock()

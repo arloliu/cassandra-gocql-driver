@@ -1,5 +1,12 @@
 version: "2"
 
+# Test files in this repo are behind build tags (`//go:build all || unit`).
+# Without this the default build context sees 8 of 49 test files and the rest
+# are never linted.
+run:
+  build-tags:
+    - unit
+
 issues:
   max-same-issues: 50
 

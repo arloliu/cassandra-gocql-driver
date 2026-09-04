@@ -290,8 +290,8 @@ func TestMapScan_UDT_PopulatedMapDistinctAcrossRows(t *testing.T) {
 	}
 	cols := []ColumnInfo{{Name: "u", TypeInfo: udt}}
 
-	row1 := buildUDTBody([]byte("alpha"), []byte("\x00\x01"))   // first=alpha second=1
-	row2 := buildUDTBody([]byte("beta"), []byte("\x00\x02"))    // first=beta second=2
+	row1 := buildUDTBody([]byte("alpha"), []byte("\x00\x01")) // first=alpha second=1
+	row2 := buildUDTBody([]byte("beta"), []byte("\x00\x02"))  // first=beta second=2
 	iter := makeIterFromRows(cols, [][][]byte{{row1}, {row2}})
 
 	m1 := make(map[string]interface{})
