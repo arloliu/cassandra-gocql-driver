@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1-otter] - 2026-09-04
+
+This release makes a paused or wedged node recoverable.
+A node that stops answering without dropping its sockets — a `SIGSTOP`'d process,
+a container frozen by its runtime, a host that has gone away behind a NAT —
+left the driver with an empty pool it never convicted and never refilled,
+because each of the mechanisms that should have noticed missed it for its own reason:
+DOWN bookkeeping keyed by an address the failure detectors never hold,
+a TLS handshake with no deadline on it,
+a heartbeat cadence that depended on a connection's age,
+and a ring refresh that rebuilt the control host on the wrong port.
+Queries issued in the window between a node's connections dropping and its pool refilling
+now wait for the fill that is already in flight instead of failing on an empty pool.
+Three of the defects are inherited from upstream rather than introduced here —
+the port reset on ring re-key, the `AddressTranslator` double-translation,
+and the mixed endpoint published by `controlConn.setupConn`.
+The behaviour changes worth reading before upgrading are the `AddressTranslator` entry,
+which no longer rewrites the control connection's own address,
+and the heartbeat entry, which fixes every connection at one 5-second interval.
+
 ### Fixed
 
 - Hosts are now marked DOWN by identity rather than by address lookup,
