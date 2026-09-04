@@ -264,7 +264,6 @@ func (s *Session) init() error {
 	if err != nil {
 		return err
 	}
-	s.ring.endpoints = hosts
 
 	if !s.cfg.disableControlConn {
 		s.control = createControlConn(s)
