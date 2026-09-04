@@ -1010,10 +1010,20 @@ func TestReconnection(t *testing.T) {
 	defer session.Close()
 
 	h := session.ring.allHosts()[0]
-	session.handleNodeDown(h.ConnectAddress(), h.Port())
+	// Driver-side failure detection (a fill cycle that ended with an empty pool,
+	// a failed control dial) marks hosts DOWN by identity, so exercise that path
+	// rather than the address lookup a server event uses.
+	session.handleHostDown(h)
 
 	if h.State() != NodeDown {
 		t.Fatal("Host should be NodeDown but not.")
+	}
+
+	// Sibling assertion: the DOWN must also unregister the pool, so application
+	// traffic cannot refill the host and ReconnectInterval owns the recovery
+	// asserted below.
+	if _, ok := session.pool.getPoolFor(h); ok {
+		t.Fatal("Host pool should have been removed but was not.")
 	}
 
 	time.Sleep(cluster.ReconnectInterval + h.Version().nodeUpDelay() + 1*time.Second)

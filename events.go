@@ -239,6 +239,19 @@ func (s *Session) startPoolFill(host *HostInfo) {
 }
 
 func (s *Session) handleNodeConnected(host *HostInfo) {
+	if !s.ring.owns(host) {
+		return
+	}
+	if s.testAfterOwnsConnected != nil {
+		s.testAfterOwnsConnected()
+	}
+	if _, ok := s.pool.getPoolFor(host); !ok {
+		// The pool was removed or replaced after the fill succeeded; the
+		// host stays in its current state and the replacement's own fill
+		// (or reconnectDownedHosts) owns recovery.
+		return
+	}
+
 	s.logger.Debug("Pool connected to node.",
 		NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldInt("port", host.Port()), NewLogFieldString("host_id", host.HostID()))
 
@@ -256,16 +269,52 @@ func (s *Session) handleNodeDown(ip net.IP, port int) {
 
 	host, ok := s.ring.getHostByIP(ip.String())
 	if ok {
-		host.setState(NodeDown)
-		if s.cfg.filterHost(host) {
-			return
-		}
-
-		s.policy.HostDown(host)
-		hostID := host.HostID()
-		s.pool.removeHost(hostID)
-		s.hostListeners.OnHostDown(HostDownEvent{Host: host})
+		s.markHostDown(host)
 	}
+}
+
+// handleHostDown marks host DOWN by identity.
+//
+// The *HostInfo must be the ring's current object for its host ID (ring.owns):
+// contact-point objects without an ID and objects replaced by refreshRing under the same ID are ignored.
+// Unlike handleNodeDown, which is keyed by the broadcast address a server event carries,
+// this path is used by driver-side failure detection (pool fill failure, control dial failure)
+// that holds the object it failed on,
+// so it works behind port mapping, NAT and an AddressTranslator where the address lookup would miss.
+//
+// Parameters:
+//   - host: the ring object to mark DOWN; nil is ignored
+func (s *Session) handleHostDown(host *HostInfo) {
+	if !s.ring.owns(host) {
+		if host != nil {
+			s.logger.Debug("Ignoring DOWN for a host that is not the current ring entry.",
+				NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldInt("port", host.Port()), NewLogFieldString("host_id", host.HostID()))
+		}
+		return
+	}
+	if s.testAfterOwnsDown != nil {
+		s.testAfterOwnsDown()
+	}
+
+	s.logger.Warning("Node is DOWN.",
+		NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldInt("port", host.Port()), NewLogFieldString("host_id", host.HostID()))
+	s.markHostDown(host)
+}
+
+// markHostDown applies the DOWN transition to a host the caller has already
+// resolved: state, policy, pool removal (pointer-checked) and listeners.
+//
+// Parameters:
+//   - host: the resolved ring object
+func (s *Session) markHostDown(host *HostInfo) {
+	host.setState(NodeDown)
+	if s.cfg.filterHost(host) {
+		return
+	}
+
+	s.policy.HostDown(host)
+	s.pool.removeHost(host)
+	s.hostListeners.OnHostDown(HostDownEvent{Host: host})
 }
 
 const (

@@ -256,6 +256,29 @@ func (p *policyConnPool) getPool(host *HostInfo) (pool *hostConnPool, ok bool) {
 	return
 }
 
+// getPoolFor returns the pool registered for host only if it was built for
+// this exact *HostInfo object.
+//
+// The pointer check is evaluated under p.mu, so a pool that refreshRing
+// replaced under the same host ID is reported as missing.
+//
+// Parameters:
+//   - host: the ring object whose pool is wanted
+//
+// Returns:
+//   - *hostConnPool: the registered pool, or nil
+//   - bool: true when a pool is registered for host.HostID() and pool.host == host
+func (p *policyConnPool) getPoolFor(host *HostInfo) (pool *hostConnPool, ok bool) {
+	hostID := host.HostID()
+	p.mu.RLock()
+	pool, ok = p.hostConnPools[hostID]
+	if ok && pool.host != host {
+		pool, ok = nil, false
+	}
+	p.mu.RUnlock()
+	return
+}
+
 func (p *policyConnPool) getPoolByHostID(hostID string) (pool *hostConnPool, ok bool) {
 	p.mu.RLock()
 	pool, ok = p.hostConnPools[hostID]
@@ -294,10 +317,19 @@ func (p *policyConnPool) addHost(host *HostInfo) {
 	pool.fill()
 }
 
-func (p *policyConnPool) removeHost(hostID string) {
+// removeHost unregisters and closes the pool built for this exact *HostInfo.
+//
+// The pointer check runs under p.mu, so a caller holding an object that
+// refreshRing has since replaced under the same host ID leaves the
+// replacement's pool untouched.
+//
+// Parameters:
+//   - host: the ring object whose pool should be removed
+func (p *policyConnPool) removeHost(host *HostInfo) {
+	hostID := host.HostID()
 	p.mu.Lock()
 	pool, ok := p.hostConnPools[hostID]
-	if !ok {
+	if !ok || pool.host != host {
 		p.mu.Unlock()
 		return
 	}
@@ -575,7 +607,6 @@ func (pool *hostConnPool) fillingStopped(err error) {
 	pool.filling = false
 	count := len(pool.conns)
 	host := pool.host
-	port := pool.port
 	pool.mu.Unlock()
 
 	// if we errored and the size is now zero, make sure the host is marked as down
@@ -584,7 +615,7 @@ func (pool *hostConnPool) fillingStopped(err error) {
 		NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldString("host_id", host.HostID()), NewLogFieldInt("count", count))
 	if err != nil && count == 0 {
 		if pool.session.cfg.ConvictionPolicy.AddFailure(err, host) {
-			pool.session.handleNodeDown(host.ConnectAddress(), port)
+			pool.session.handleHostDown(host)
 		}
 	}
 }

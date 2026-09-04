@@ -111,6 +111,13 @@ type Session struct {
 	isInitialized bool
 
 	logger StructuredLogger
+
+	// Per-instance test hooks, invoked immediately after ring.owns returned true
+	// in handleHostDown / handleNodeConnected so tests can replace the ring entry
+	// inside the check-to-mutation window.
+	// Default nil (no-op).
+	testAfterOwnsDown      func()
+	testAfterOwnsConnected func()
 }
 
 func addrsToHosts(addrs []string, defaultPort int, logger StructuredLogger) ([]*HostInfo, error) {
@@ -655,9 +662,29 @@ func (s *Session) executeQuery(qry *internalQuery) (it *Iter) {
 func (s *Session) removeHost(h *HostInfo) {
 	s.logger.Warning("Removing host.", NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", h.HostID()))
 	s.policy.RemoveHost(h)
-	hostID := h.HostID()
-	s.pool.removeHost(hostID)
-	s.ring.removeHost(hostID)
+	s.pool.removeHost(h)
+	s.ring.removeHost(h.HostID())
+}
+
+// hostPoolEmpty reports whether host is the current ring object and its
+// registered pool holds no connections.
+//
+// A host without a pool (during Session.init, or after removal) and an object
+// the ring no longer owns both return false, so callers never convict a host
+// they cannot act on.
+//
+// Parameters:
+//   - host: the ring object to inspect
+//
+// Returns:
+//   - bool: true when ring.owns(host), a pool is registered for this exact
+//     object, and that pool's Size() is zero
+func (s *Session) hostPoolEmpty(host *HostInfo) bool {
+	if !s.ring.owns(host) {
+		return false
+	}
+	pool, ok := s.pool.getPoolFor(host)
+	return ok && pool.Size() == 0
 }
 
 // KeyspaceMetadata returns the schema metadata for the keyspace specified. Returns an error if the keyspace does not exist.

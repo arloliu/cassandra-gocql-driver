@@ -482,16 +482,7 @@ func (c *controlConn) attemptReconnectToAnyOfHosts(hosts []*HostInfo) (*Conn, er
 	for _, host := range hosts {
 		conn, err = c.session.connect(c.session.ctx, host, c)
 		if err != nil {
-			// Route the dial failure through ConvictionPolicy so the host can
-			// be marked down — same idiom as connectionpool.go:584. Without
-			// this, a node that came back with different resources (e.g. a
-			// Scylla node restarted with more shards) keeps its prior
-			// driver-side metadata until something else triggers a refresh,
-			// which has produced shard-count mismatches and panics. Adapted
-			// from upstream PR #1729 / scylladb/gocql#145.
-			if c.session.cfg.ConvictionPolicy.AddFailure(err, host) {
-				c.session.handleNodeDown(host.ConnectAddress(), host.Port())
-			}
+			c.convictOnDialFailure(host, err)
 			c.session.logger.Info("During reconnection, control connection failed to establish a connection to host.",
 				NewLogFieldIP("host_addr", host.ConnectAddress()),
 				NewLogFieldInt("port", host.Port()),
@@ -512,6 +503,27 @@ func (c *controlConn) attemptReconnectToAnyOfHosts(hosts []*HostInfo) (*Conn, er
 		conn = nil
 	}
 	return conn, err
+}
+
+// convictOnDialFailure routes a control-connection dial failure through the
+// ConvictionPolicy, but only for a host whose pool is already empty.
+//
+// A host that the control connection cannot dial and whose pool holds no
+// connections either has nothing left to serve traffic, so it is marked DOWN
+// and ReconnectInterval drives its recovery. A host whose pool still holds
+// (or has since refilled) connections is left alone: tearing it down on a
+// single failed control dial would take a working node out of rotation.
+//
+// Emptiness and ring identity are evaluated before AddFailure, so a stateful
+// ConvictionPolicy is never consumed on a host this path would not act on.
+//
+// Parameters:
+//   - host: the host the control connection failed to dial
+//   - err: the dial error handed to the ConvictionPolicy
+func (c *controlConn) convictOnDialFailure(host *HostInfo, err error) {
+	if c.session.hostPoolEmpty(host) && c.session.cfg.ConvictionPolicy.AddFailure(err, host) {
+		c.session.handleHostDown(host)
+	}
 }
 
 func (c *controlConn) HandleError(conn *Conn, err error, closed bool) {

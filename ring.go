@@ -74,6 +74,25 @@ func (r *ring) getHost(hostID string) (host *HostInfo, ok bool) {
 	return
 }
 
+// owns reports whether host is the ring's current object for its host ID.
+//
+// Identity is pointer equality: a contact-point object without a host ID, an
+// object that was never added, and an object replaced by refreshRing under the
+// same host ID all return false.
+//
+// Parameters:
+//   - host: the *HostInfo to check; nil is allowed and returns false
+//
+// Returns:
+//   - bool: true only when the ring maps host.HostID() to this exact pointer
+func (r *ring) owns(host *HostInfo) bool {
+	if host == nil || host.HostID() == "" {
+		return false
+	}
+	current, ok := r.getHost(host.HostID())
+	return ok && current == host
+}
+
 func (r *ring) allHosts() []*HostInfo {
 	r.mu.RLock()
 	hosts := make([]*HostInfo, 0, len(r.hosts))

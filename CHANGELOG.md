@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Hosts are now marked DOWN by identity rather than by address lookup,
+  so a failed fill cycle on an empty pool really takes the host out of rotation
+  in port-mapped, NAT'd and `AddressTranslator` deployments.
+  Ring DOWN bookkeeping is keyed by the broadcast address,
+  but the driver's own failure detection — a pool whose fill cycle ended with no connections,
+  and the control connection's reconnect attempts — only ever holds the connect address.
+  Where the two differ the lookup missed,
+  the host silently stayed UP, and application traffic kept refilling it,
+  so a node that had gone away was never handed over to the recovery machinery.
+  Recovery of a host marked DOWN this way is owned by `ReconnectInterval`
+  (default 60 s; keep it greater than zero),
+  by the control-connection reconnect, and by server UP events.
+  A failed control-connection dial now convicts only a host whose pool is already empty:
+  a host that still has (or has since refilled) connections is left alone
+  instead of being torn down on a single failed dial.
+
 ## [2.3.0-otter] - 2026-07-11
 
 This release continues the downstream performance work with proto-v5
