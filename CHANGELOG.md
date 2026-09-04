@@ -55,6 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a speculative execution that found no host at all can no longer beat a sibling
   that is waiting for a connection.
 
+- The TLS handshake of a new connection is now bounded by `ConnectTimeout`,
+  so a node that is still reachable at the TCP level but answers nothing —
+  a paused or wedged process — can be convicted instead of parking the pool.
+  The default dialer already bounded the TCP dial and connection setup already bounded the STARTUP exchange,
+  but the handshake between them inherited the session context, which has no deadline,
+  so with `SslOpts` configured a fill cycle against such a node never ended,
+  the pool never reported an empty fill, and none of the recovery machinery ever engaged.
+  The handshake gets its own `ConnectTimeout`, the way the dial and the STARTUP exchange each get one;
+  a `ConnectTimeout` of zero still means unbounded.
+  A `HostDialer` of your own is unaffected and owns the bounding of everything it does.
+
 ## [2.3.0-otter] - 2026-07-11
 
 This release continues the downstream performance work with proto-v5

@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 )
 
 // HostDialer allows customizing connection to cluster nodes.
@@ -57,6 +58,10 @@ type DialedHost struct {
 type defaultHostDialer struct {
 	dialer    Dialer
 	tlsConfig *tls.Config
+	// connectTimeout bounds the TLS handshake, mirroring the bound the default
+	// dialer puts on the TCP dial and the one connection setup puts on STARTUP.
+	// Non-positive means unbounded, as everywhere else ConnectTimeout is read.
+	connectTimeout time.Duration
 }
 
 func (hd *defaultHostDialer) DialHost(ctx context.Context, host *HostInfo) (*DialedHost, error) {
@@ -75,6 +80,18 @@ func (hd *defaultHostDialer) DialHost(ctx context.Context, host *HostInfo) (*Dia
 		return nil, err
 	}
 	addr := host.HostnameAndPort()
+
+	// A node that is up at the TCP level but answers nothing — a paused process,
+	// say — completes the dial in the kernel and then never replies to the
+	// ClientHello, so an unbounded handshake parks the whole fill cycle and the
+	// host is never convicted. Give the handshake its own ConnectTimeout, the
+	// way the dial and the STARTUP exchange each get one.
+	if hd.tlsConfig != nil && hd.connectTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, hd.connectTimeout)
+		defer cancel()
+	}
+
 	return WrapTLS(ctx, conn, addr, hd.tlsConfig)
 }
 

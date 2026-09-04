@@ -22,8 +22,6 @@
 package gocql
 
 import (
-	"context"
-	"crypto/tls"
 	"net"
 	"strings"
 	"sync"
@@ -311,63 +309,6 @@ func (h *pausePoolHook) releaseAll() {
 	close(h.release)
 }
 
-// boundedHostDialer is the default host dialer with ConnectTimeout applied to
-// the whole connection setup, TLS handshake included.
-//
-// The production dialer bounds the TCP dial (net.Dialer.Timeout)
-// and the STARTUP exchange (startupCoordinator.setupConn),
-// but the TLS handshake between them inherits the session context alone.
-// A paused node still completes TCP handshakes in the kernel while nothing answers the ClientHello,
-// so with the encrypted client transport this suite runs against,
-// an unbounded handshake would park every fill cycle for the whole pause and no cycle could fail.
-type boundedHostDialer struct {
-	dialer    *net.Dialer
-	tlsConfig *tls.Config
-	timeout   time.Duration
-}
-
-// newBoundedHostDialer builds the dialer cfg would have built, bounded by
-// cfg.ConnectTimeout end to end.
-//
-// Parameters:
-//   - cfg: the cluster config the session is created from; read, never stored
-//
-// Returns:
-//   - *boundedHostDialer: dialer ready to be installed as ClusterConfig.HostDialer
-func newBoundedHostDialer(t *testing.T, cfg *ClusterConfig) *boundedHostDialer {
-	t.Helper()
-
-	var tlsConfig *tls.Config
-	if cfg.SslOpts != nil {
-		var err error
-		tlsConfig, err = setupTLSConfig(cfg.SslOpts)
-		require.NoError(t, err, "setupTLSConfig")
-	}
-
-	return &boundedHostDialer{
-		dialer:    &net.Dialer{Timeout: cfg.ConnectTimeout},
-		tlsConfig: tlsConfig,
-		timeout:   cfg.ConnectTimeout,
-	}
-}
-
-// DialHost dials host and wraps the connection in TLS when one is configured.
-//
-// Returns:
-//   - *DialedHost: the established connection
-//   - error: dial or handshake failure, including the timeout
-func (d *boundedHostDialer) DialHost(ctx context.Context, host *HostInfo) (*DialedHost, error) {
-	ctx, cancel := context.WithTimeout(ctx, d.timeout)
-	defer cancel()
-
-	conn, err := d.dialer.DialContext(ctx, "tcp", host.ConnectAddressAndPort())
-	if err != nil {
-		return nil, err
-	}
-
-	return WrapTLS(ctx, conn, host.HostnameAndPort(), d.tlsConfig)
-}
-
 // pauseRecoveryFixture is one session against the ccm cluster, wired to the gates
 // both pause phases need.
 type pauseRecoveryFixture struct {
@@ -416,7 +357,6 @@ func newPauseRecoveryFixture(t *testing.T, clusterInfo *ccm.ClusterInfo) *pauseR
 		cfg.Logger = logs
 		cfg.testPoolHook = hook.hook
 	})
-	cluster.HostDialer = newBoundedHostDialer(t, cluster)
 
 	session, err := cluster.CreateSession()
 	require.NoError(t, err, "CreateSession")
