@@ -92,6 +92,39 @@ func NodeDown(node string) error {
 	return err
 }
 
+// Pause suspends the node's Cassandra process with SIGSTOP.
+//
+// The node keeps its listening sockets, so clients still complete TCP
+// handshakes against it, but no request, TLS handshake or STARTUP exchange
+// is served until Resume is called.
+//
+// Parameters:
+//   - node: ccm node name, e.g. "node1"
+//
+// Returns:
+//   - error: If the ccm command failed
+//
+// Example:
+//
+//	if err := ccm.Pause("node1"); err != nil { ... }
+//	defer ccm.Resume("node1")
+func Pause(node string) error {
+	_, err := execCmd(node, "pause")
+	return err
+}
+
+// Resume continues a paused node's Cassandra process with SIGCONT.
+//
+// Parameters:
+//   - node: ccm node name, e.g. "node1"
+//
+// Returns:
+//   - error: If the ccm command failed
+func Resume(node string) error {
+	_, err := execCmd(node, "resume")
+	return err
+}
+
 func AddNode(name, ip string, jmxPort int) error {
 	_, err := execCmd("add", name, "-i", ip, "-j", strconv.Itoa(jmxPort), "-d", "datacenter1")
 	return err
