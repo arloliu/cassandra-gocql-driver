@@ -26,128 +26,119 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
-// TestHeartBeat_ParseErrorDoesNotFailConnection asserts that parseFrame
-// errors during heartbeat OPTIONS responses do NOT count toward the
-// connection's failure threshold. Before the §8 fix, 5 malformed
-// heartbeat responses within ~5 seconds would force-close the
-// connection (failures > 5 path). After the fix, parse errors are
-// logged as transient and the connection survives indefinitely.
-//
-// The test drives the parse-error path via the optionsRespFn hook:
-// the fake server's opOptions response is replaced with a body that
-// looks structurally correct (right op code) but has an invalid string
-// list (claims 1 entry then no payload), tripping parseSupportedFrame.
-func TestHeartBeat_ParseErrorDoesNotFailConnection(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+// heartbeatTestInterval is the shortened steady-state heartbeat interval used by the
+// event-driven heartbeat tests; the phase is zero so the first heartbeat fires at once.
+const heartbeatTestInterval = 200 * time.Millisecond
 
-	// Counter pattern: with NumConns=1 and disableControlConn=true
-	// (testCluster default), the session setup sends exactly 1 opOptions
-	// (the pool conn's startup negotiation). All subsequent opOptions
-	// come from the heartbeat. We let the first call through cleanly so
-	// session setup succeeds, then corrupt every subsequent response.
-	// This guarantees no clean heartbeat ever fires, so sleepTime stays
-	// at 1s and we deterministically see 5+ heartbeats in a 7s window.
+// zeroHeartbeatPhase is a heartbeatPhase provider that makes the first heartbeat fire immediately.
+func zeroHeartbeatPhase(time.Duration) time.Duration { return 0 }
+
+// newHeartbeatSession starts a fake server and a one-connection session
+// whose heartbeat OPTIONS responses are written by respond.
+//
+// With NumConns=1 and disableControlConn=true (testCluster default),
+// session setup sends exactly one opOptions (the pool connection's startup negotiation)
+// before the heartbeat goroutine starts,
+// so the first opOptions is passed through untouched and every later one is a heartbeat handed to respond.
+// The returned channel is closed when the nth heartbeat has been answered.
+//
+// Parameters:
+//   - t: The test; the server and session are closed in t.Cleanup.
+//   - interval: The steady-state heartbeat interval for the session.
+//   - n: The heartbeat count at which the returned channel is closed.
+//   - respond: Writes the response to a heartbeat OPTIONS frame.
+//
+// Returns:
+//   - *Session: The connected session.
+//   - <-chan struct{}: Closed once n heartbeats have been answered.
+func newHeartbeatSession(t *testing.T, interval time.Duration, n uint64, respond func(respFrame *framer, stream int)) (*Session, <-chan struct{}) {
+	t.Helper()
+
 	var optionsReceived uint64
-	var heartbeatCount uint64
+	done := make(chan struct{})
 	srv := newTestServerOpts{
 		addr:     "127.0.0.1:0",
 		protocol: defaultProto,
 		optionsRespFn: func(respFrame *framer, stream int) bool {
-			n := atomic.AddUint64(&optionsReceived, 1)
-			if n == 1 {
-				return false // first call is startup; pass through
+			seq := atomic.AddUint64(&optionsReceived, 1)
+			if seq == 1 {
+				return false // startup negotiation; pass through
 			}
-			atomic.AddUint64(&heartbeatCount, 1)
-			// Heartbeats expect *supportedFrame. We send opSupported
-			// with a malformed stringMultiMap body — claims 1 entry
-			// then truncates. parseSupportedFrame errors.
-			respFrame.writeHeader(0, opSupported, stream)
-			respFrame.writeShort(1)
+			respond(respFrame, stream)
+			if seq-1 == n {
+				close(done)
+			}
 			return true
 		},
-	}.newServer(t, ctx)
-	defer srv.Stop()
+	}.newServer(t, t.Context())
+	t.Cleanup(srv.Stop)
 
 	cluster := testCluster(defaultProto, srv.Address)
 	cluster.NumConns = 1
 	cluster.Timeout = 5 * time.Second
+	cluster.heartbeatInterval = interval
+	cluster.heartbeatPhase = zeroHeartbeatPhase
 	db, err := cluster.CreateSession()
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	defer db.Close()
+	require.NoError(t, err, "CreateSession")
+	t.Cleanup(db.Close)
 
-	// Wait long enough for >5 heartbeats. The heartbeat timer is 1s on
-	// failure (sleepTime never changes from 1s since no clean heartbeat
-	// fires after the first startup OPTIONS). 7s gives us ~6 heartbeats
-	// with margin.
-	const waitDuration = 7 * time.Second
-	time.Sleep(waitDuration)
+	return db, done
+}
 
-	got := atomic.LoadUint64(&heartbeatCount)
-	if got < 5 {
-		t.Errorf("expected >=5 heartbeat opOptions calls in %v, got %d", waitDuration, got)
-	}
-
-	// The connection must still be alive: a query should succeed.
-	if err := db.Query("void").Exec(); err != nil {
-		t.Fatalf("query after parse-error heartbeats failed; connection likely closed: %v", err)
+// waitSignal blocks until ch yields (a send or a close), failing the test when the bound expires.
+//
+// Parameters:
+//   - t: The test; t.Fatalf is called when the bound expires.
+//   - ch: The channel to wait on; a send or a close ends the wait.
+//   - timeout: The upper bound on the wait.
+//   - what: What is being waited for, quoted in the failure message.
+func waitSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, what string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), timeout)
+	defer cancel()
+	select {
+	case <-ch:
+	case <-ctx.Done():
+		t.Fatalf("timed out after %v waiting for %s", timeout, what)
 	}
 }
 
-// TestHeartBeat_ErrorResponseDoesNotFailConnection asserts the §8 sibling
-// fix: a server replying with an error frame to OPTIONS does not count
-// toward the failure threshold. The error is logged at Debug, not
-// silently dropped (the prior TODO behavior).
+// TestHeartBeat_ParseErrorDoesNotFailConnection asserts that parseFrame
+// errors during heartbeat OPTIONS responses do NOT count toward the
+// connection's failure threshold: after more than five malformed
+// heartbeat responses the connection still serves queries.
+//
+// The fake server's opOptions response is replaced with a body that
+// looks structurally correct (right op code) but has an invalid string
+// list (claims 1 entry then no payload), tripping parseSupportedFrame.
+func TestHeartBeat_ParseErrorDoesNotFailConnection(t *testing.T) {
+	db, done := newHeartbeatSession(t, heartbeatTestInterval, 6, func(respFrame *framer, stream int) {
+		respFrame.writeHeader(0, opSupported, stream)
+		respFrame.writeShort(1)
+	})
+
+	waitSignal(t, done, 10*time.Second, "six malformed heartbeat responses")
+
+	require.NoError(t, db.Query("void").Exec(),
+		"query after parse-error heartbeats failed; connection likely closed")
+}
+
+// TestHeartBeat_ErrorResponseDoesNotFailConnection asserts the sibling rule:
+// a server replying with an error frame to OPTIONS does not count toward the failure threshold.
+// The error is logged at Debug, not silently dropped.
 func TestHeartBeat_ErrorResponseDoesNotFailConnection(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	db, done := newHeartbeatSession(t, heartbeatTestInterval, 6, func(respFrame *framer, stream int) {
+		respFrame.writeHeader(0, opError, stream)
+		respFrame.writeInt(0x0000) // ServerError code
+		respFrame.writeString("synthetic heartbeat error")
+	})
 
-	// Same counter pattern as the parse-error test above: let the first
-	// opOptions through for startup, corrupt all subsequent (heartbeat)
-	// responses. Guarantees deterministic 1s heartbeat cadence.
-	var optionsReceived uint64
-	var heartbeatCount uint64
-	srv := newTestServerOpts{
-		addr:     "127.0.0.1:0",
-		protocol: defaultProto,
-		optionsRespFn: func(respFrame *framer, stream int) bool {
-			n := atomic.AddUint64(&optionsReceived, 1)
-			if n == 1 {
-				return false
-			}
-			atomic.AddUint64(&heartbeatCount, 1)
-			// Reply with a structured error frame instead of
-			// opSupported — exercises the `case error:` branch.
-			respFrame.writeHeader(0, opError, stream)
-			respFrame.writeInt(0x0000) // ServerError code
-			respFrame.writeString("synthetic heartbeat error")
-			return true
-		},
-	}.newServer(t, ctx)
-	defer srv.Stop()
+	waitSignal(t, done, 10*time.Second, "six error-frame heartbeat responses")
 
-	cluster := testCluster(defaultProto, srv.Address)
-	cluster.NumConns = 1
-	cluster.Timeout = 5 * time.Second
-	db, err := cluster.CreateSession()
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	defer db.Close()
-
-	const waitDuration = 7 * time.Second
-	time.Sleep(waitDuration)
-
-	got := atomic.LoadUint64(&heartbeatCount)
-	if got < 5 {
-		t.Errorf("expected >=5 heartbeat opOptions calls in %v, got %d", waitDuration, got)
-	}
-
-	if err := db.Query("void").Exec(); err != nil {
-		t.Fatalf("query after server-error heartbeats failed; connection likely closed: %v", err)
-	}
+	require.NoError(t, db.Query("void").Exec(),
+		"query after server-error heartbeats failed; connection likely closed")
 }

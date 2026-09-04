@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -152,6 +153,14 @@ type ConnConfig struct {
 
 	tlsConfig       *tls.Config
 	disableCoalesce bool
+
+	// heartbeatInterval is the start-to-start spacing of heartbeat OPTIONS
+	// frames; connConfig resolves a zero ClusterConfig value to the
+	// heartbeatInterval constant.
+	heartbeatInterval time.Duration
+	// heartbeatPhase returns the wait before a new connection's first
+	// heartbeat; connConfig resolves nil to defaultHeartbeatPhase.
+	heartbeatPhase func(interval time.Duration) time.Duration
 }
 
 // ConnErrorHandler handles connection errors and state changes for connections.
@@ -736,10 +745,16 @@ func (p *protocolError) Error() string {
 	return fmt.Sprintf("gocql: received unexpected frame on stream %d: %v", p.frame.Header().stream, p.frame)
 }
 
+// heartbeatInterval is the steady-state, start-to-start spacing of heartbeat OPTIONS frames on every connection,
+// independent of the connection's age and of whether the previous heartbeat succeeded.
+// With the failure threshold in Conn.heartBeat,
+// a dead connection is closed within phase + 6*heartbeatTimeout + 5*max(0, interval-heartbeatTimeout).
+const heartbeatInterval = 5 * time.Second
+
 // heartbeatMinTimeout is the floor for per-OPTIONS heartbeat exec timeouts.
-// Heartbeats run on a 5-second cadence after the first success, so capping the
-// round-trip at a sub-second Session.Timeout (common for low-latency reads)
-// would trip the failure threshold under any GC pause / TCP retransmit / brief
+// Heartbeats run on a heartbeatInterval cadence, so capping the round-trip
+// at a sub-second Session.Timeout (common for low-latency reads) would trip
+// the failure threshold under any GC pause / TCP retransmit / brief
 // coordinator hiccup and close otherwise-healthy connections (upstream #1919).
 // 5 seconds matches the steady-state heartbeat interval.
 const heartbeatMinTimeout = 5 * time.Second
@@ -755,6 +770,32 @@ func heartbeatTimeout(connTimeout time.Duration) time.Duration {
 	return heartbeatMinTimeout
 }
 
+// defaultHeartbeatPhase returns a random first heartbeat wait in [interval/2, interval).
+//
+// Connections created in the same instant (a pool fill) spread their heartbeats over half an interval
+// instead of probing, and failing, in lockstep.
+//
+// Parameters:
+//   - interval: The steady-state heartbeat interval; must be positive.
+//
+// Returns:
+//   - time.Duration: The wait before the connection's first heartbeat.
+func defaultHeartbeatPhase(interval time.Duration) time.Duration {
+	return interval/2 + rand.N(interval/2)
+}
+
+// heartBeat sends OPTIONS frames on a fixed start-to-start cadence
+// and closes the connection after six consecutive send failures.
+//
+// The first wait is the per-connection phase from cfg.heartbeatPhase;
+// every later wait is cfg.heartbeatInterval,
+// re-armed when the previous wait fires and before the OPTIONS round-trip,
+// so a slow or failing OPTIONS consumes the interval rather than extending it.
+// The cadence never depends on whether a heartbeat succeeded,
+// so a dead connection is detected in the same time whether it was created a moment ago or long before.
+//
+// Parameters:
+//   - ctx: Cancelled when the connection closes; ends the loop.
 func (c *Conn) heartBeat(ctx context.Context) {
 	defer recoverGoroutine(c.logger, "Conn.heartBeat", func(err error) {
 		c.closeWithError(err)
@@ -764,8 +805,8 @@ func (c *Conn) heartBeat(ctx context.Context) {
 		c.testHeartBeatPanicAt()
 	}
 
-	sleepTime := 1 * time.Second
-	timer := time.NewTimer(sleepTime)
+	interval := c.cfg.heartbeatInterval
+	timer := time.NewTimer(c.cfg.heartbeatPhase(interval))
 	defer timer.Stop()
 
 	var failures int
@@ -776,13 +817,16 @@ func (c *Conn) heartBeat(ctx context.Context) {
 			return
 		}
 
-		timer.Reset(sleepTime)
-
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
 		}
+
+		// Start-to-start: the timer just fired and was drained,
+		// so Reset arms the next wait before the OPTIONS round-trip begins.
+		// The phase is used for the first wait only and is never re-applied.
+		timer.Reset(interval)
 
 		hbCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout(time.Duration(c.requestTimeout.Load())))
 		framer, err := c.exec(hbCtx, &writeOptionsFrame{}, nil)
@@ -820,7 +864,6 @@ func (c *Conn) heartBeat(ctx context.Context) {
 		switch r := resp.(type) {
 		case *supportedFrame:
 			// Everything ok
-			sleepTime = 5 * time.Second
 			failures = 0
 		case error:
 			// Server replied with an error frame to OPTIONS. Operationally

@@ -142,20 +142,31 @@ func connConfig(cfg *ClusterConfig) (*ConnConfig, error) {
 		}
 	}
 
+	interval := cfg.heartbeatInterval
+	if interval <= 0 {
+		interval = heartbeatInterval
+	}
+	phase := cfg.heartbeatPhase
+	if phase == nil {
+		phase = defaultHeartbeatPhase
+	}
+
 	return &ConnConfig{
-		ProtoVersion:   cfg.ProtoVersion,
-		MaxStreams:     cfg.MaxStreams,
-		CQLVersion:     cfg.CQLVersion,
-		Timeout:        cfg.Timeout,
-		WriteTimeout:   cfg.WriteTimeout,
-		ConnectTimeout: cfg.ConnectTimeout,
-		Dialer:         cfg.Dialer,
-		HostDialer:     hostDialer,
-		Compressor:     cfg.Compressor,
-		Authenticator:  cfg.Authenticator,
-		AuthProvider:   cfg.AuthProvider,
-		Keepalive:      cfg.SocketKeepalive,
-		Logger:         cfg.Logger,
+		ProtoVersion:      cfg.ProtoVersion,
+		MaxStreams:        cfg.MaxStreams,
+		CQLVersion:        cfg.CQLVersion,
+		Timeout:           cfg.Timeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		ConnectTimeout:    cfg.ConnectTimeout,
+		Dialer:            cfg.Dialer,
+		HostDialer:        hostDialer,
+		Compressor:        cfg.Compressor,
+		Authenticator:     cfg.Authenticator,
+		AuthProvider:      cfg.AuthProvider,
+		Keepalive:         cfg.SocketKeepalive,
+		Logger:            cfg.Logger,
+		heartbeatInterval: interval,
+		heartbeatPhase:    phase,
 	}, nil
 }
 

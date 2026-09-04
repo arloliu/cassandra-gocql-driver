@@ -25,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a host that still has (or has since refilled) connections is left alone
   instead of being torn down on a single failed dial.
 
+- Heartbeats now run on one 5-second interval on every connection, regardless of the connection's age.
+  Previously the loop started at a 1-second cadence and only widened to 5 seconds after the first successful OPTIONS,
+  so a connection's failure budget depended on how long it had been alive,
+  and every connection of a pool filled in the same instant probed — and failed — in lockstep.
+  Each connection now also draws a random first-heartbeat phase in `[interval/2, interval)`,
+  spreading a pool's heartbeats over half an interval.
+  The interval is start-to-start and can be consumed by a slow OPTIONS round-trip,
+  so the worst case before a dead connection is closed is
+  `phase + 6*heartbeatTimeout + 5*max(0, interval - heartbeatTimeout)`:
+  32.5 to 35 seconds for any `Session.Timeout` at or below the 5-second heartbeat timeout floor,
+  and `phase + 6*Session.Timeout` above it.
+  The six-consecutive-failure threshold and the heartbeat timeout floor are unchanged,
+  as is the control connection's own heartbeat.
+
 ## [2.3.0-otter] - 2026-07-11
 
 This release continues the downstream performance work with proto-v5

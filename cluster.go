@@ -340,6 +340,14 @@ type ClusterConfig struct {
 	// internal config for testing
 	disableControlConn bool
 
+	// heartbeatInterval overrides the steady-state heartbeat interval (internal, for testing);
+	// zero selects the heartbeatInterval constant.
+	heartbeatInterval time.Duration
+
+	// heartbeatPhase overrides the wait before a connection's first heartbeat (internal, for testing);
+	// nil selects defaultHeartbeatPhase.
+	heartbeatPhase func(interval time.Duration) time.Duration
+
 	// Metadata configures driver's internal metadata caching and event listening.
 	Metadata MetadataConfig
 }
