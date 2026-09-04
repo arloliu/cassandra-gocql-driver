@@ -317,7 +317,16 @@ type connHost struct {
 func (c *controlConn) setupConn(conn *Conn, sessionInit bool) error {
 	// we need up-to-date host info for the filterHost call below
 	iter := conn.querySystemLocal(context.TODO())
-	host, err := c.session.hostInfoFromIter(iter, conn.host.ConnectAddress(), conn.r.RemoteAddr().(*net.TCPAddr).Port)
+	// The address and the port both come from the HostInfo this connection was dialled
+	// with, so the pair published to the ring is the logical dial target: what the next
+	// dial to this host is made with, and what a custom HostDialer is handed.
+	// The socket's remote port is deliberately not read here.
+	// It equals this one under the default dialer, which dials ConnectAddressAndPort,
+	// but a HostDialer that redirects can make the two differ,
+	// and pairing this address with that port yields an endpoint neither side ever named -
+	// one that such a dialer is entitled to refuse.
+	// ringDescriber.getLocalHostInfo keeps the same pair on every later refresh.
+	host, err := c.session.hostInfoFromIter(iter, conn.host.ConnectAddress(), conn.host.Port())
 	if err != nil {
 		// just cleanup
 		iter.Close()

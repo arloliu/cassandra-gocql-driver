@@ -66,6 +66,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `ConnectTimeout` of zero still means unbounded.
   A `HostDialer` of your own is unaffected and owns the bounding of everything it does.
 
+- `AddressTranslator` is no longer applied to the control connection's own address and port.
+  `newHostInfoFromRow` translated whatever connect address it ended up with,
+  including the one its caller had just handed it —
+  and on the control path that caller is the connection itself,
+  so the pair being translated was the pair the driver was already connected through.
+  On a control reconnect that pair is itself the output of an earlier translation,
+  and `AddressTranslator` is not required to be idempotent:
+  a port-offset translator turned 9042 into 19042 at discovery and 19042 into 29042 on the next reconnect,
+  compounding once per rebuild until the address-change path installed the drifted pair as the ring entry.
+  The address has been translated twice on this path for as long as the path has existed;
+  the port joined it in the previous entry.
+  A connect address resolved from a system table — every peer — is translated exactly as before.
+  If you relied on the control host's own address being rewritten by your translator,
+  give the address you want the driver to use as the contact point instead.
+
+- A ring refresh no longer forgets the port the control connection was dialled on.
+  The driver knows that port — it is the one the control connection's own `HostInfo` carries —
+  but the ring describer rebuilt that same host with `ClusterConfig.Port` (9042 by default).
+  The wrong port stayed invisible while a refresh only updated the existing ring entry,
+  because an entry that already has a port keeps it;
+  it took effect the moment a refresh replaced the entry after the host's address changed,
+  and from then on every dial to that host went to 9042 and was refused forever.
+  Contact points reached on a non-default port — port-mapped, NAT'd or proxied deployments — were the ones affected.
+  The port kept is the logical dial target, not the socket's remote port:
+  it is the value the next dial is made with and the value a custom `HostDialer` is handed,
+  and under a `HostDialer` that redirects the two are not the same.
+  `controlConn.setupConn` publishes that same pair when it first adds the control host,
+  instead of pairing the dialled address with the port it happened to be connected on:
+  a mixed pair is an endpoint neither the dialer nor the server ever named,
+  a dialer that routes by the exact host it is handed is entitled to refuse it,
+  and no later refresh can repair it,
+  because `HostInfo.update` keeps a connect address and a non-zero port an entry already has.
+  Peers are unchanged: `system.peers` carries no port,
+  so `ClusterConfig.Port` remains the documented assumption for them,
+  and `system.peers_v2`'s `native_port` still overrides it.
+
 ## [2.3.0-otter] - 2026-07-11
 
 This release continues the downstream performance work with proto-v5

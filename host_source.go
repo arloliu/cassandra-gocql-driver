@@ -37,6 +37,11 @@ import (
 	"time"
 )
 
+// connectAddressSourceCaller is the source HostInfo.connectAddressLocked reports
+// when the connect address is the one the caller handed to newHostInfoFromRow
+// rather than one read from a system table.
+const connectAddressSourceCaller = "connect_address"
+
 var (
 	ErrCannotFindHost    = errors.New("cannot find host")
 	ErrHostAlreadyExists = errors.New("host already exists")
@@ -231,7 +236,7 @@ func validIpAddr(addr net.IP) bool {
 
 func (h *HostInfo) connectAddressLocked() (net.IP, string) {
 	if validIpAddr(h.connectAddress) {
-		return h.connectAddress, "connect_address"
+		return h.connectAddress, connectAddressSourceCaller
 	} else if validIpAddr(h.rpcAddress) {
 		return h.rpcAddress, "rpc_adress"
 	} else if validIpAddr(h.preferredIP) {
@@ -693,9 +698,17 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 	// this ensures that connectAddress gets a valid IP starting with host.connectAddress and if it's not valid
 	// then falls back to an address read from the system table
 	// it is important that a system table address is not picked up UNLESS connectAddress is nil or not valid
-	host.connectAddress, _ = host.connectAddressLocked()
+	var addrSource string
+	host.connectAddress, addrSource = host.connectAddressLocked()
 
-	if s != nil && s.cfg.AddressTranslator != nil {
+	// Only an address that came out of a system table is translated. A caller-supplied
+	// defaultAddr (source connectAddressSourceCaller) is the address the driver is already
+	// connected through, so it is reachable by construction and, on a control reconnect,
+	// is itself the output of an earlier translation - AddressTranslator is not required
+	// to be idempotent, so translating it again compounds. A port-offset translator would
+	// turn 9042 into 19042 at discovery and then 19042 into 29042 on the next reconnect.
+	// The port travels with the address: it is the port that pair was reached on.
+	if s != nil && s.cfg.AddressTranslator != nil && addrSource != connectAddressSourceCaller {
 		ip, port := s.cfg.translateAddressPort(host.ConnectAddress(), host.port, s.logger)
 		if !validIpAddr(ip) {
 			return nil, fmt.Errorf("invalid host address (before translation: %v:%v, after translation: %v:%v)", host.ConnectAddress(), host.port, ip.String(), port)
@@ -749,8 +762,23 @@ func (r *ringDescriber) getLocalHostInfo() (*HostInfo, error) {
 		return nil, errNoControl
 	}
 
-	// keep connect address for local host, ignore address from system.local
-	host, err := r.session.hostInfoFromIter(iter, iter.host.actualConnectAddress(), r.session.cfg.Port)
+	// Keep the address and the port the control connection was dialled with,
+	// ignoring the address from system.local.
+	// That pair is the logical dial target:
+	// it is what the next dial to this host is made with,
+	// and what a custom HostDialer is handed.
+	// It is deliberately not the socket's remote address,
+	// which a redirecting HostDialer can make into something the driver could never dial on its own.
+	// controlConn.setupConn publishes the same pair when it first adds the control host,
+	// so initialization and every later refresh agree.
+	//
+	// cfg.Port must not be used here:
+	// system.local carries no port on releases without native_port,
+	// so passing cfg.Port silently rewrites a contact point reached on a non-default port back to 9042.
+	// That is discarded while an existing ring entry is only updated (HostInfo.update keeps a non-zero port),
+	// but it takes effect when refreshRing replaces the entry after an address change -
+	// every later dial then goes to the wrong port.
+	host, err := r.session.hostInfoFromIter(iter, iter.host.actualConnectAddress(), iter.host.Port())
 	if err != nil {
 		// just cleanup
 		iter.Close()
