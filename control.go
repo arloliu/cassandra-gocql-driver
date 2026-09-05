@@ -445,7 +445,7 @@ func (c *controlConn) reconnect() {
 	// Request the refresh; never wait for it.
 	// This reconnect can be running on the ring flusher's own goroutine:
 	// a refresh's control query that fails on write reaches HandleError synchronously,
-	// and a refresh that finds no control connection calls reconnect from withConnHost.
+	// and a refresh that finds no control connection calls reconnect from acquireConn.
 	// Waiting on the flusher from there is a deadlock,
 	// and Session.Close then hangs in ringRefresher.stop.
 	// The debounce, rather than an immediate trigger,
@@ -580,27 +580,31 @@ func (c *controlConn) writeFrame(w frameBuilder) (frame, error) {
 	return framer.parseFrame()
 }
 
-func (c *controlConn) withConnHost(fn func(*connHost) *Iter) *Iter {
+// acquireConn returns the current control connection, reconnecting a bounded
+// number of times while there is none.
+//
+// Returns:
+//   - *connHost: the control connection current when it was found
+//   - error: errNoControl when no connection could be established
+func (c *controlConn) acquireConn() (*connHost, error) {
 	const maxConnectAttempts = 5
-	connectAttempts := 0
 
 	for i := 0; i < maxConnectAttempts; i++ {
-		ch := c.getConn()
-		if ch == nil {
-			if connectAttempts > maxConnectAttempts {
-				break
-			}
-
-			connectAttempts++
-
-			c.reconnect()
-			continue
+		if ch := c.getConn(); ch != nil {
+			return ch, nil
 		}
-
-		return fn(ch)
+		c.reconnect()
 	}
 
-	return newErrIter(errNoControl, &queryMetrics{}, "", nil, nil)
+	return nil, errNoControl
+}
+
+func (c *controlConn) withConnHost(fn func(*connHost) *Iter) *Iter {
+	ch, err := c.acquireConn()
+	if err != nil {
+		return newErrIter(err, &queryMetrics{}, "", nil, nil)
+	}
+	return fn(ch)
 }
 
 func (c *controlConn) withConn(fn func(*Conn) *Iter) *Iter {

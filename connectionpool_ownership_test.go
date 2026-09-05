@@ -287,6 +287,19 @@ func (h *poolHooks) releaseDial() {
 	}
 }
 
+// drain returns every event queued so far without waiting for more.
+func (h *poolHooks) drain() []poolEventRecord {
+	var out []poolEventRecord
+	for {
+		select {
+		case rec := <-h.events:
+			out = append(out, rec)
+		default:
+			return out
+		}
+	}
+}
+
 // await waits for ev to fire for host, discarding other events.
 func (h *poolHooks) await(t *testing.T, ev poolEvent, host *HostInfo, what string) {
 	t.Helper()
@@ -473,6 +486,29 @@ func TestPoolAddHost_RejectsUnownedObjectWithNoPool(t *testing.T) {
 
 	_, ok = f.session.pool.getPool(f.host)
 	require.False(t, ok, "an object the ring does not own must not get a pool")
+}
+
+// TestPoolAddHost_SkipsFillOfUnownedObjectsOwnPool:
+// an object the ring no longer owns is ignored even while its own pool is still registered,
+// so no fill cycle runs on a pool removeHost is about to close.
+//
+// A fill on the fixture's full pool would run synchronously inside addHost:
+// it would claim, find nothing to do and fire poolFillDone before addHost returned,
+// so the event history is checked without waiting.
+func TestPoolAddHost_SkipsFillOfUnownedObjectsOwnPool(t *testing.T) {
+	f := newOwnershipFixture(t)
+	a := f.host
+	before, ok := f.session.pool.getPool(a)
+	require.True(t, ok)
+	f.session.ring.removeHost(a.HostID())
+	f.hooks.drain()
+
+	f.session.pool.addHost(a)
+
+	require.Empty(t, f.hooks.drain(), "no fill checkpoint may fire for an unowned object")
+	after, ok := f.session.pool.getPool(a)
+	require.True(t, ok)
+	require.Same(t, before, after, "the registered pool must be untouched")
 }
 
 // TestPoolAddHost_ThenRemoveHostLeavesNoOrphan: an admission that passed while the
@@ -790,7 +826,7 @@ func TestRemoveHost_PolicyPanicReleasesPublishMutex(t *testing.T) {
 
 	// A later transition on any object must still get the mutex.
 	ran := make(chan bool, 1)
-	go func() { ran <- session.withOwnedHost(host, func() {}) }()
+	go func() { ran <- session.withOwnedHost(host, func() bool { return true }) }()
 	select {
 	case owned := <-ran:
 		require.False(t, owned, "the ring removal preceded the panic, so the object is no longer owned")

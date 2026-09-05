@@ -121,12 +121,34 @@ type hostSelector struct {
 	// used counts population hosts consumed from iterators: handed out by draw,
 	// or consumed and discarded by advance.
 	used int
-	// rePicks counts replacement iterators drawn.
+	// rePicks counts replacement iterators drawn; once it is positive,
+	// iter is a replacement, whose draws are capped.
 	rePicks int
-	// replaced is set once iter is a replacement, whose draws are capped.
-	replaced bool
 	// exhausted is set when draw returned nil: every later draw returns nil.
 	exhausted bool
+}
+
+// charge records a host handed out by the current iterator against the budget.
+//
+// With maxHosts == 0 nothing is counted and every host is accepted.
+// Otherwise only a population host is counted and accepted;
+// an ineligible one is rejected and costs nothing.
+//
+// Parameters:
+//   - host: the iterator's selection, non-nil
+//
+// Returns:
+//   - bool: true when the host was accepted
+func (s *hostSelector) charge(host SelectedHost) bool {
+	if s.maxHosts == 0 {
+		return true
+	}
+	info := host.Info()
+	if info == nil || !s.eligible(info) {
+		return false
+	}
+	s.used++
+	return true
 }
 
 // draw returns the next selection, or nil once the budget is spent.
@@ -148,18 +170,14 @@ func (s *hostSelector) draw() SelectedHost {
 		if s.exhausted {
 			return nil
 		}
-		if s.replaced && s.used >= s.maxHosts {
+		if s.rePicks > 0 && s.used >= s.maxHosts {
 			s.exhausted = true
 			return nil
 		}
 
 		host := s.iter()
 		if host != nil {
-			if s.maxHosts == 0 {
-				return host
-			}
-			if info := host.Info(); info != nil && s.eligible(info) {
-				s.used++
+			if s.charge(host) {
 				return host
 			}
 			continue
@@ -171,7 +189,6 @@ func (s *hostSelector) draw() SelectedHost {
 		}
 		s.rePicks++
 		s.iter = s.pick()
-		s.replaced = true
 	}
 }
 
@@ -188,12 +205,8 @@ func (s *hostSelector) advance() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	host := s.iter()
-	if host == nil || s.maxHosts == 0 {
-		return
-	}
-	if info := host.Info(); info != nil && s.eligible(info) {
-		s.used++
+	if host := s.iter(); host != nil {
+		s.charge(host)
 	}
 }
 
@@ -368,8 +381,25 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	return q.coordinate(ctx, qry, sp, sel), nil
 }
 
-// pooledUp reports whether host is up and holds a registered pool:
-// the population upHostCount measures, and the first two checks pickForHost makes.
+// upPool returns host's registered pool if host is up.
+//
+// It is the admission predicate shared by the selector's budget
+// (the population upHostCount measures) and by pickForHost.
+//
+// Parameters:
+//   - host: the host to judge
+//
+// Returns:
+//   - *hostConnPool: the pool, when the host is up and pooled
+//   - bool: true when the host is up and pooled
+func (q *queryExecutor) upPool(host *HostInfo) (*hostConnPool, bool) {
+	if !host.IsUp() {
+		return nil, false
+	}
+	return q.pool.getPool(host)
+}
+
+// pooledUp reports whether host is up and holds a registered pool.
 //
 // Parameters:
 //   - host: the host to judge
@@ -377,10 +407,7 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 // Returns:
 //   - bool: true when the host is up and pooled
 func (q *queryExecutor) pooledUp(host *HostInfo) bool {
-	if !host.IsUp() {
-		return false
-	}
-	_, ok := q.pool.getPool(host)
+	_, ok := q.upPool(host)
 	return ok
 }
 
@@ -510,11 +537,10 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 //   - []fillCandidate: cands, extended when this host is worth waiting for
 func (q *queryExecutor) pickForHost(selectedHost SelectedHost, cands []fillCandidate) (*Conn, []fillCandidate) {
 	host := selectedHost.Info()
-	if host == nil || !host.IsUp() {
+	if host == nil {
 		return nil, cands
 	}
-
-	pool, ok := q.pool.getPool(host)
+	pool, ok := q.upPool(host)
 	if !ok {
 		return nil, cands
 	}

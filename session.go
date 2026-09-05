@@ -779,18 +779,17 @@ func (s *Session) unpublishHost(h *HostInfo) {
 //
 // Parameters:
 //   - host: the object the caller holds
-//   - fn: the transition to apply to an owned host
+//   - fn: the transition to apply to an owned host; its result is passed through
 //
 // Returns:
-//   - bool: true when fn ran
-func (s *Session) withOwnedHost(host *HostInfo, fn func()) bool {
+//   - bool: fn's result, or false when host is not owned and fn did not run
+func (s *Session) withOwnedHost(host *HostInfo, fn func() bool) bool {
 	s.hostPublishMu.Lock()
 	defer s.hostPublishMu.Unlock()
 	if !s.ring.owns(host) {
 		return false
 	}
-	fn()
-	return true
+	return fn()
 }
 
 // hostPoolEmpty reports whether host is the current ring object and its

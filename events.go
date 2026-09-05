@@ -242,13 +242,11 @@ func (s *Session) handleNodeUp(eventIp net.IP, eventPort int) {
 // Parameters:
 //   - host: the ring object to fill and publish
 func (s *Session) startPoolFill(host *HostInfo) {
-	if !s.ring.owns(host) {
-		return
-	}
 	// we let the pool call handleNodeConnected to change the host state
 	s.pool.addHost(host)
-	s.withOwnedHost(host, func() {
+	s.withOwnedHost(host, func() bool {
 		s.policy.AddHost(host)
+		return true
 	})
 }
 
@@ -266,13 +264,12 @@ func (s *Session) handleNodeConnected(host *HostInfo) {
 	// The ownership and pool checks, the state change and the policy
 	// publication form one transition under hostPublishMu,
 	// so a removal or a DOWN of the same host cannot interleave with it.
-	published := false
-	s.withOwnedHost(host, func() {
+	if s.withOwnedHost(host, func() bool {
 		if _, ok := s.pool.getPoolFor(host); !ok {
 			// The pool was removed or replaced after the fill succeeded; the
 			// host stays in its current state and the replacement's own fill
 			// (or reconnectDownedHosts) owns recovery.
-			return
+			return false
 		}
 
 		s.logger.Debug("Pool connected to node.",
@@ -280,12 +277,12 @@ func (s *Session) handleNodeConnected(host *HostInfo) {
 
 		host.setState(NodeUp)
 
-		if !s.cfg.filterHost(host) {
-			s.policy.HostUp(host)
-			published = true
+		if s.cfg.filterHost(host) {
+			return false
 		}
-	})
-	if published {
+		s.policy.HostUp(host)
+		return true
+	}) {
 		s.hostListeners.OnHostUp(HostUpEvent{Host: host})
 	}
 }
@@ -339,18 +336,16 @@ func (s *Session) markHostDown(host *HostInfo) {
 	// An object the ring no longer owns is left untouched: its state no longer
 	// matters, and reporting it DOWN to a policy that keys by address could
 	// evict a replacement that took the same address.
-	notified := false
-	s.withOwnedHost(host, func() {
+	if s.withOwnedHost(host, func() bool {
 		host.setState(NodeDown)
 		if s.cfg.filterHost(host) {
-			return
+			return false
 		}
 
 		s.policy.HostDown(host)
 		s.pool.removeHost(host)
-		notified = true
-	})
-	if notified {
+		return true
+	}) {
 		s.hostListeners.OnHostDown(HostDownEvent{Host: host})
 	}
 }

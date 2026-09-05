@@ -894,25 +894,18 @@ func (r *ringDescriber) GetHosts() ([]*HostInfo, string, error) {
 		return r.prevHosts, r.prevPartitioner, errNoControl
 	}
 
-	var (
-		localHost *HostInfo
-		peerHosts []*HostInfo
-		err       error
-	)
-	noConn := r.session.control.withConnHost(func(ch *connHost) *Iter {
-		localHost, err = r.getLocalHostInfo(ch)
-		if err != nil {
-			return nil
-		}
-		if r.session.cfg.testRingSnapshotHook != nil {
-			r.session.cfg.testRingSnapshotHook()
-		}
-		peerHosts, err = r.getClusterPeerInfo(ch, localHost)
-		return nil
-	})
-	if noConn != nil {
-		return r.prevHosts, r.prevPartitioner, noConn.err
+	ch, err := r.session.control.acquireConn()
+	if err != nil {
+		return r.prevHosts, r.prevPartitioner, err
 	}
+	localHost, err := r.getLocalHostInfo(ch)
+	if err != nil {
+		return r.prevHosts, r.prevPartitioner, err
+	}
+	if r.session.cfg.testRingSnapshotHook != nil {
+		r.session.cfg.testRingSnapshotHook()
+	}
+	peerHosts, err := r.getClusterPeerInfo(ch, localHost)
 	if err != nil {
 		return r.prevHosts, r.prevPartitioner, err
 	}
@@ -1114,13 +1107,21 @@ func (d *refreshDebouncer) refreshNow() <-chan error {
 	}
 	if d.broadcaster == nil {
 		d.broadcaster = newErrorBroadcaster()
-		select {
-		case d.refreshNowCh <- struct{}{}:
-		default:
-			// already a refresh pending
-		}
+		d.requestLocked()
 	}
 	return d.broadcaster.newListener()
+}
+
+// requestLocked hands the flusher one immediate refresh request, under d.mu.
+//
+// The request channel holds a single pending request,
+// so requests that arrive while a refresh is running collapse into exactly one follow-up refresh.
+func (d *refreshDebouncer) requestLocked() {
+	select {
+	case d.refreshNowCh <- struct{}{}:
+	default:
+		// a refresh is already pending
+	}
 }
 
 // trigger requests an immediate refresh without waiting for its result.
@@ -1130,19 +1131,13 @@ func (d *refreshDebouncer) refreshNow() <-chan error {
 // and a pending debounce cannot postpone the trigger.
 // Unlike refreshNow, it attaches no listener,
 // so it allocates nothing and the caller never blocks.
-// Requests that arrive while a refresh is running collapse into exactly one follow-up refresh,
-// because the request channel holds a single pending request.
 func (d *refreshDebouncer) trigger() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.stopped {
 		return
 	}
-	select {
-	case d.refreshNowCh <- struct{}{}:
-	default:
-		// a refresh is already pending
-	}
+	d.requestLocked()
 }
 
 func (d *refreshDebouncer) flusher() {

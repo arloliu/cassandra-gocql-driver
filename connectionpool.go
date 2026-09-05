@@ -297,11 +297,20 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 	for addr := range toRemove {
 		pool := p.hostConnPools[addr]
 		delete(p.hostConnPools, addr)
-		go func(pool *hostConnPool) {
-			defer recoverGoroutine(p.session.logger, "hostConnPool.Close.async", nil)
-			pool.Close()
-		}(pool)
+		p.closeAsync(pool, "hostConnPool.Close.async")
 	}
+}
+
+// closeAsync closes pool on its own goroutine, so the caller never blocks on it.
+//
+// Parameters:
+//   - pool: the pool to close
+//   - site: the recoverGoroutine label naming the caller
+func (p *policyConnPool) closeAsync(pool *hostConnPool, site string) {
+	go func() {
+		defer recoverGoroutine(p.session.logger, site, nil)
+		pool.Close()
+	}()
 }
 
 // upHostCount reports how many hosts hold a pool and are up.
@@ -479,13 +488,13 @@ func (p *policyConnPool) Close() {
 //
 // Pools are keyed by host ID, and refreshRing replaces a host that changed
 // address with a new *HostInfo under the same ID, so the object a caller
-// holds may be superseded by the time it gets here. Under p.mu:
+// holds may be superseded by the time it gets here.
+// Under p.mu, an object the ring no longer owns is ignored; for an owned one:
 //
-//   - no pool for the ID: one is registered only if the ring owns host;
+//   - no pool for the ID: one is registered;
 //   - a pool built for this exact object: it is filled if it needs it;
-//   - a pool built for another object under this ID: if the ring owns host,
-//     that pool belongs to a superseded object and is replaced and closed;
-//     otherwise host is the superseded one and the current pool is left alone.
+//   - a pool built for another object under this ID: that pool belongs to
+//     a superseded object and is replaced and closed.
 //
 // Together with removeHost, which takes the host out of the ring before the
 // pool, every interleaving of a stale caller with a replacement ends with one
@@ -496,31 +505,19 @@ func (p *policyConnPool) Close() {
 func (p *policyConnPool) addHost(host *HostInfo) {
 	hostID := host.HostID()
 	p.mu.Lock()
-	if p.closed {
+	if p.closed || !p.session.ring.owns(host) {
 		p.mu.Unlock()
 		return
 	}
 	pool, ok := p.hostConnPools[hostID]
 	if ok && pool.host != host {
-		if !p.session.ring.owns(host) {
-			p.mu.Unlock()
-			return
-		}
 		// The registered pool was built for an object refreshRing has replaced.
 		delete(p.hostConnPools, hostID)
 		p.notifyLocked()
-		stale := pool
-		go func() {
-			defer recoverGoroutine(p.session.logger, "hostConnPool.Close.addHost", nil)
-			stale.Close()
-		}()
+		p.closeAsync(pool, "hostConnPool.Close.addHost")
 		ok = false
 	}
 	if !ok {
-		if !p.session.ring.owns(host) {
-			p.mu.Unlock()
-			return
-		}
 		pool = newHostConnPool(
 			p.session,
 			host,
@@ -568,10 +565,7 @@ func (p *policyConnPool) removeHost(host *HostInfo) {
 		p.testAfterParentNotify()
 	}
 
-	go func() {
-		defer recoverGoroutine(p.session.logger, "hostConnPool.Close.removeHost", nil)
-		pool.Close()
-	}()
+	p.closeAsync(pool, "hostConnPool.Close.removeHost")
 }
 
 // hostConnPool is a connection pool for a single host.
