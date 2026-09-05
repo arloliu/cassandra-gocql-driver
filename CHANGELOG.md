@@ -39,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   composition that does change, and it changes in the same way and for the same reason as
   `HostPoolHostPolicy` alone.
 
+### Changed
+
+- Bumped `github.com/pierrec/lz4/v4` from v4.1.8 to v4.1.27, adopting the dependency half of
+  upstream CASSGO-128. The block API this driver uses — `CompressBlockBound`,
+  `Compressor.CompressBlock` and `UncompressBlock` — is unchanged between the two versions;
+  the file declaring it is byte-identical. What changed is the implementation underneath:
+  the decoder drops the shortcut fast paths that carried its out-of-bounds problems and gains
+  explicit empty-input and length-overflow guards, the encoder picks up two bug fixes, and
+  arm64 gains an assembly implementation. For a driver that decompresses frames off a socket
+  the decoder hardening is the point of the upgrade. Compressed output bytes will differ from
+  v4.1.8 for the same input; the output is valid LZ4 and nothing in the driver compares
+  compressed bytes.
+
 ## [2.4.0-otter] - 2026-09-05
 
 This release makes a reusable query's argument source switchable.
