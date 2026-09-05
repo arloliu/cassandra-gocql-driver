@@ -208,16 +208,21 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	}
 
 	// if host is not specified for the query,
-	// then a host will be picked by HostSelectionPolicy
+	// then a host will be picked by HostSelectionPolicy.
+	// rePick stays nil for a pinned query: its iterator above is deliberately bound to
+	// one host, and drawing a replacement from the policy would move the query to a
+	// different coordinator.
+	var rePick func() NextHost
 	if hostIter == nil {
 		hostIter = q.policy.Pick(qry)
+		rePick = func() NextHost { return q.policy.Pick(qry) }
 	}
 
 	// check if the query is not marked as idempotent, if
 	// it is, we force the policy to NonSpeculative
 	sp := qry.speculativeExecutionPolicy()
 	if qry.GetHostID() != "" || !qry.IsIdempotent() || sp.Attempts() == 0 {
-		return q.do(qry.Context(), qry, hostIter), nil
+		return q.do(qry.Context(), qry, hostIter, rePick), nil
 	}
 
 	// When speculative execution is enabled, we could be accessing the host iterator from multiple goroutines below.
@@ -238,9 +243,34 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	return q.coordinate(ctx, qry, sp, hostIter), nil
 }
 
-func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter NextHost) *Iter {
+// do runs qry against the hosts hostIter yields, applying the retry policy between
+// attempts.
+//
+// Parameters:
+//   - ctx: cancels the execution
+//   - qry: the statement to run
+//   - hostIter: yields hosts until it reports exhaustion by returning nil
+//   - rePick: draws a fresh host iterator once hostIter is exhausted, or nil when
+//     re-picking is not allowed. It is nil for a query pinned with SetHostID, whose
+//     iterator does not come from the selection policy, and for speculative runners,
+//     which share one synchronized iterator so that they land on distinct hosts.
+//
+// Returns:
+//   - *Iter: the query's iterator, or an error iterator
+func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter NextHost,
+	rePick func() NextHost) *Iter {
 	selectedHost := hostIter()
 	rt := qry.retryPolicy()
+
+	// maxHosts bounds how far re-picking may take this query; see the RetryNextHost branch.
+	// It is snapshotted once so the bound is query-local and fixed: read live it could grow
+	// under a stream of host additions, which would leave a custom RetryPolicy whose Attempt
+	// never returns false without a termination proof. Missing a host that comes up
+	// mid-query is the conservative direction.
+	maxHosts := 0
+	if rePick != nil {
+		maxHosts = q.pool.upHostCount()
+	}
 
 	var lastErr error
 	var iter *Iter
@@ -305,6 +335,35 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter Ne
 		case RetryNextHost:
 			// retry on the next host
 			selectedHost = hostIter()
+			if selectedHost == nil && rePick != nil && !attemptsReached &&
+				qry.Attempts() < maxHosts {
+				// A policy whose Pick yields a one-shot iterator reports exhaustion after a
+				// single host, so this branch could never advance and the retry budget went
+				// unspent. hostpool.HostPoolHostPolicy is such a policy: its `used` guard is
+				// what stops the #1259 CPU spin, so the one-shot shape has to stay and the
+				// bound belongs here instead. See #812.
+				//
+				// Two bounds apply, and both are needed.
+				//
+				// attemptsReached is read here and not only at the exit below because this
+				// branch also runs on the terminal pass, whose selection is discarded - an
+				// ungated re-pick would cost one Pick more than the budget authorises.
+				//
+				// maxHosts caps the total number of attempts at the number of hosts that can
+				// be handed out, which is what makes this a no-op for every policy whose Pick
+				// already enumerates hosts: roundRobbin yields precisely the up hosts, so
+				// such an iterator drains at exactly maxHosts and the guard is already false
+				// when it does. Neither the ring nor the raw pool count would do - the ring
+				// keeps hosts that are down and hosts HostFilter rejected, and the pool map
+				// keeps a pool that was registered before its host came up, so either would
+				// hand an enumerating policy an extra selection round it does not get today.
+				//
+				// It also keeps a custom RetryPolicy whose Attempt never returns false
+				// bounded: before this branch existed such a policy terminated on iterator
+				// exhaustion, and a fixed maxHosts preserves a finite bound.
+				hostIter = rePick()
+				selectedHost = hostIter()
+			}
 		case Ignore:
 			iter.err = nil
 			stopRetries = true
@@ -470,7 +529,10 @@ func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter N
 		}
 	})
 
-	iter := q.do(ctx, qry, hostIter)
+	// Speculative runners share one synchronized iterator so they land on distinct hosts,
+	// and coordinate's no-host accounting depends on that iterator being the only source
+	// of hosts, so a runner must not draw a private replacement. See #812.
+	iter := q.do(ctx, qry, hostIter, nil)
 	if iter.err == ErrNoConnections {
 		// do returns ErrNoConnections only when it never reached a host, so a
 		// sibling still waiting for a fill must not lose to this report.

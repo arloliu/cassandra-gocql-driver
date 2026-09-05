@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Retries now advance across hosts under a host selection policy whose `Pick` yields a
+  one-shot iterator, which in practice means `HostPoolHostPolicy` from the `hostpool`
+  subpackage. Such a policy reports exhaustion after a single host, so the `RetryNextHost`
+  branch of the query executor could never advance and the query failed after one attempt
+  with its retry budget untouched — `SimpleRetryPolicy` maps every error to `RetryNextHost`,
+  so under that policy retries were entirely inert. The executor now draws a fresh iterator
+  from the selection policy when the current one is exhausted.
+
+  The number of attempts is bounded by the number of hosts that are up and hold a connection
+  pool, as well as by the retry policy, so a one-shot policy now behaves like a policy whose
+  iterator enumerates those hosts rather than like an unbounded retry. That count is taken
+  once when execution starts. **Migration:** queries that previously failed after a single
+  attempt will now be attempted up to once per such host, capped by the retry budget. Expect
+  changed latency distributions, error rates and load spread on `HostPoolHostPolicy`
+  deployments; lower `NumRetries` if the old fail-fast behaviour was being relied on.
+
+  Two limitations are deliberate. The fix does not apply when speculative execution is
+  configured, because speculative runners share one synchronized iterator so that they land
+  on distinct hosts, and any idempotent query with a non-zero `SpeculativeExecutionPolicy`
+  takes that path. And because `HostPoolHostPolicy` samples, a fresh selection may return the
+  host that just failed: the fix guarantees further selection rounds, not distinct
+  coordinators.
+
+  Policies whose `Pick` enumerates the up hosts — `RoundRobinHostPolicy`,
+  `DCAwareRoundRobinPolicy`, `RackAwareRoundRobinPolicy`, and `TokenAwareHostPolicy` over any
+  of them — are unaffected: their iterators drain at exactly that bound, so no second
+  selection round is ever taken. `TokenAwareHostPolicy` over `HostPoolHostPolicy` is the one
+  composition that does change, and it changes in the same way and for the same reason as
+  `HostPoolHostPolicy` alone.
+
 ## [2.4.0-otter] - 2026-09-05
 
 This release makes a reusable query's argument source switchable.

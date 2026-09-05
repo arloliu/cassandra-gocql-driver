@@ -304,6 +304,35 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 	}
 }
 
+// upHostCount reports how many hosts hold a pool and are up.
+//
+// That is exactly the set roundRobbin yields, so it is the honest measure of how many hosts
+// a selection policy can hand out. Registration alone is not: startPoolFill registers a pool
+// before adding the host to the policy, and reconnectDownedHosts drives that path for hosts
+// that are still down, so a registered pool can belong to a host no iterator will produce
+// for as long as its fill takes.
+//
+// Up is the predicate that closes both windows. A host reaches NodeUp only in
+// handleNodeConnected, after its pool is registered and after policy.AddHost, so anything
+// counted here is already in the policy; markHostDown sets NodeDown before it touches the
+// policy or the pool, so anything the policy has stopped yielding has already stopped being
+// counted. A host rejected by HostFilter never enters either.
+//
+// Returns:
+//   - int: the number of up hosts with a registered pool
+func (p *policyConnPool) upHostCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	count := 0
+	for _, pool := range p.hostConnPools {
+		if pool.host.IsUp() {
+			count++
+		}
+	}
+	return count
+}
+
 func (p *policyConnPool) Size() int {
 	p.mu.RLock()
 	count := 0
