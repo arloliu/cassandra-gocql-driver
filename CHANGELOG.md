@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.1-otter] - 2026-09-05
+
+This release makes retries work under `HostPoolHostPolicy`.
+That policy's `Pick` yields an iterator that reports exhaustion after a single host,
+so the `RetryNextHost` branch of the query executor could never advance
+and a query failed after one attempt with its retry budget untouched;
+under `SimpleRetryPolicy`, which maps every error to `RetryNextHost`, retries were inert.
+The executor now draws a fresh selection when the iterator is exhausted,
+bounded by the number of hosts that are up and hold a connection pool.
+The behaviour change worth reading before upgrading is the migration note in the `Fixed` entry:
+a `HostPoolHostPolicy` deployment will see more attempts per failing query than before.
+Speculative execution is still excluded from the fix, for the reason the entry gives.
+The other change is the `pierrec/lz4` bump from v4.1.8 to v4.1.27.
+It is kept as its own `Changed` entry, separate from the retry fix,
+so that a regression in decompression can be told apart from one in retry behaviour
+without a separate tag between them.
+
 ### Fixed
 
 - Retries now advance across hosts under a host selection policy whose `Pick` yields a
