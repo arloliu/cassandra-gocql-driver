@@ -360,6 +360,12 @@ type ClusterConfig struct {
 	// poolEvent (internal, for testing); nil in production.
 	testPoolHook func(ev poolEvent, host *HostInfo)
 
+	// testRingRefreshHook is called when a ring refresh starts
+	// and testRingRefreshDone when it ends, with its result (internal, for testing);
+	// both nil in production.
+	testRingRefreshHook func()
+	testRingRefreshDone func(err error)
+
 	// Metadata configures driver's internal metadata caching and event listening.
 	Metadata MetadataConfig
 }

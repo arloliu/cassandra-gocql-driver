@@ -187,7 +187,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	s.routingMetadataCache = newRoutingKeyInfoLRU(cfg.MaxRoutingKeyInfo)
 
 	s.hostSource = &ringDescriber{session: s}
-	s.ringRefresher = newRefreshDebouncer(ringRefreshDebounceTime, func() error { return refreshRing(s.hostSource) }, s.logger)
+	s.ringRefresher = newRefreshDebouncer(ringRefreshDebounceTime, s.runRingRefresh, s.logger)
 
 	s.queryObserver = cfg.QueryObserver
 	s.batchObserver = cfg.BatchObserver

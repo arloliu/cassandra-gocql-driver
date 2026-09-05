@@ -868,6 +868,28 @@ func (r *ringDescriber) GetHosts() ([]*HostInfo, string, error) {
 	return hosts, partitioner, nil
 }
 
+// runRingRefresh is the ring refresher's refresh function.
+//
+// It wraps refreshRing so that a failure is logged even when nobody waits for the result:
+// a debounced or triggered refresh has no listener,
+// so its error would otherwise vanish.
+//
+// Returns:
+//   - error: refreshRing's error, after logging it
+func (s *Session) runRingRefresh() error {
+	if s.cfg.testRingRefreshHook != nil {
+		s.cfg.testRingRefreshHook()
+	}
+	err := refreshRing(s.hostSource)
+	if err != nil {
+		s.logger.Warning("Ring refresh failed.", NewLogFieldError("err", err))
+	}
+	if s.cfg.testRingRefreshDone != nil {
+		s.cfg.testRingRefreshDone(err)
+	}
+	return err
+}
+
 // debounceRingRefresh submits a ring refresh request to the ring refresh debouncer.
 func (s *Session) debounceRingRefresh() {
 	s.ringRefresher.debounce()
@@ -1037,6 +1059,28 @@ func (d *refreshDebouncer) refreshNow() <-chan error {
 		}
 	}
 	return d.broadcaster.newListener()
+}
+
+// trigger requests an immediate refresh without waiting for its result.
+//
+// Unlike debounce, it never touches the debounce timer,
+// so a caller that fires more often than the debounce interval cannot postpone the refresh,
+// and a pending debounce cannot postpone the trigger.
+// Unlike refreshNow, it attaches no listener,
+// so it allocates nothing and the caller never blocks.
+// Requests that arrive while a refresh is running collapse into exactly one follow-up refresh,
+// because the request channel holds a single pending request.
+func (d *refreshDebouncer) trigger() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopped {
+		return
+	}
+	select {
+	case d.refreshNowCh <- struct{}{}:
+	default:
+		// a refresh is already pending
+	}
 }
 
 func (d *refreshDebouncer) flusher() {
