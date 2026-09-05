@@ -442,11 +442,16 @@ func (c *controlConn) reconnect() {
 		return
 	}
 
-	err = c.session.refreshRing()
-	if err != nil {
-		c.session.logger.Warning("Unable to refresh ring.",
-			NewLogFieldError("err", err))
-	}
+	// Request the refresh; never wait for it.
+	// This reconnect can be running on the ring flusher's own goroutine:
+	// a refresh's control query that fails on write reaches HandleError synchronously,
+	// and a refresh that finds no control connection calls reconnect from withConnHost.
+	// Waiting on the flusher from there is a deadlock,
+	// and Session.Close then hangs in ringRefresher.stop.
+	// The debounce, rather than an immediate trigger,
+	// also paces a refresh whose own query keeps failing and reconnecting.
+	// A failed refresh is logged by Session.runRingRefresh.
+	c.session.debounceRingRefresh()
 }
 
 func (c *controlConn) attemptReconnect() (*Conn, error) {
