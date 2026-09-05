@@ -31,7 +31,9 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -123,6 +125,144 @@ func Pause(node string) error {
 func Resume(node string) error {
 	_, err := execCmd(node, "resume")
 	return err
+}
+
+// configDir returns the ccm configuration directory.
+//
+// Returns:
+//   - string: $CCM_CONFIG_DIR when set, otherwise ~/.ccm
+func configDir() (string, error) {
+	if dir := os.Getenv("CCM_CONFIG_DIR"); dir != "" {
+		return dir, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("locate home directory: %w", err)
+	}
+	return filepath.Join(home, ".ccm"), nil
+}
+
+// nodeDir returns the directory ccm keeps node's configuration in.
+//
+// Returns:
+//   - string: <config dir>/<active cluster>/<node>
+func nodeDir(node string) (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+
+	// ccm records the active cluster's name in CURRENT.
+	current, err := os.ReadFile(filepath.Join(dir, "CURRENT"))
+	if err != nil {
+		return "", fmt.Errorf("read the active ccm cluster: %w", err)
+	}
+
+	return filepath.Join(dir, strings.TrimSpace(string(current)), node), nil
+}
+
+// SetNodeAddress moves node to ip and restarts it.
+//
+// The data directory is left alone, so the node keeps its host_id and its
+// tokens and rejoins as itself at a new address - the shape a pod recycled onto
+// a new IP has, and the one issue #1884 is about.
+//
+// ccm has no command for this: the address lives in the node's cassandra.yaml,
+// which Cassandra reads, and again in ccm's own node.conf, which ccm reads to
+// find the node afterwards. Both have to move together or the next ccm command
+// talks to the old address.
+//
+// Parameters:
+//   - node: ccm node name, e.g. "node3"
+//   - ip: the address to move it to, e.g. "127.0.0.4"
+//
+// Returns:
+//   - error: if the node could not be stopped, rewritten, or started again
+func SetNodeAddress(node, ip string) error {
+	dir, err := nodeDir(node)
+	if err != nil {
+		return err
+	}
+
+	yamlPath := filepath.Join(dir, "conf", "cassandra.yaml")
+	oldIP, err := listenAddress(yamlPath)
+	if err != nil {
+		return err
+	}
+	if oldIP == ip {
+		return nil
+	}
+
+	if err := NodeDown(node); err != nil {
+		return fmt.Errorf("stop %s: %w", node, err)
+	}
+
+	if err := replaceInFile(yamlPath, func(line string) string {
+		for _, key := range []string{"listen_address", "rpc_address"} {
+			if strings.HasPrefix(line, key+":") {
+				return key + ": " + ip
+			}
+		}
+		return line
+	}); err != nil {
+		return fmt.Errorf("rewrite %s: %w", yamlPath, err)
+	}
+
+	// node.conf lists the address twice, under interfaces.binary and
+	// interfaces.storage, each as a bare sequence entry.
+	confPath := filepath.Join(dir, "node.conf")
+	if err := replaceInFile(confPath, func(line string) string {
+		if strings.TrimSpace(line) == "- "+oldIP {
+			return strings.Replace(line, oldIP, ip, 1)
+		}
+		return line
+	}); err != nil {
+		return fmt.Errorf("rewrite %s: %w", confPath, err)
+	}
+
+	if err := NodeUp(node); err != nil {
+		return fmt.Errorf("start %s at %s: %w", node, ip, err)
+	}
+	return nil
+}
+
+// listenAddress reads listen_address out of a cassandra.yaml.
+//
+// Returns:
+//   - string: the configured address
+func listenAddress(path string) (string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.HasPrefix(line, "listen_address:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "listen_address:")), nil
+		}
+	}
+	return "", fmt.Errorf("no listen_address in %s", path)
+}
+
+// replaceInFile rewrites path, passing every line through replace.
+func replaceInFile(path string, replace func(string) string) error {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for i, line := range lines {
+		lines[i] = replace(line)
+	}
+
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), info.Mode())
 }
 
 func AddNode(name, ip string, jmxPort int) error {
