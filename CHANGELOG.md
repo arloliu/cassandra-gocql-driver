@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0-otter] - 2026-09-05
+
+This release makes a reusable query's argument source switchable.
+A `Query` built by `Session.Query` can now be handed a binding callback after construction,
+and a query already carrying a callback can be given a different one or switched back to
+static values, with the new `Query.Binding` method adopted from upstream CASSGO-130.
+
+Making that switch work in both directions also fixed a defect the driver already had.
+The two argument sources were set independently and neither cleared the other,
+so a query obtained from `Session.Bind` and then re-bound with `Bind` carried both —
+and the prepared path lets a callback win unconditionally,
+which meant the values the caller had just bound were thrown away
+and the statement ran on the old callback's arguments instead, silently.
+
 ### Added
+
 
 - `Query.Binding` sets a query's binding callback after construction,
   so a query built with `Session.Query` can be switched to a callback
