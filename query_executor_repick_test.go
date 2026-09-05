@@ -22,6 +22,7 @@
 package gocql
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,6 +42,8 @@ type oneShotPolicy struct {
 
 	// picks counts how many iterators were handed out.
 	picks atomic.Int32
+	// calls counts raw iterator calls across every iterator handed out.
+	calls atomic.Int32
 }
 
 var _ HostSelectionPolicy = (*oneShotPolicy)(nil)
@@ -52,6 +55,7 @@ func (p *oneShotPolicy) Pick(qry ExecutableStatement) NextHost {
 	inner := p.HostSelectionPolicy.Pick(qry)
 	used := false
 	return func() SelectedHost {
+		p.calls.Add(1)
 		if used {
 			return nil
 		}
@@ -368,4 +372,506 @@ func TestRetryNextHost_ReconnectingHostDoesNotWidenTheBound(t *testing.T) {
 	require.Equal(t, 1, iter.Attempts(), "only the up host can be attempted")
 	require.Equal(t, int32(1), policy.picks.Load(),
 		"a pool whose host is still down must not buy a second selection round")
+}
+
+// preAttemptQuery is the query the pre-attempt tests run: idempotent, no retry policy,
+// so only the pre-attempt site can move it to another host.
+//
+// Returns:
+//   - *Query: the query
+func preAttemptQuery(h *fillHarness, stmt string) *Query {
+	return h.session.Query(stmt).Idempotent(true).RetryPolicy(nil)
+}
+
+// TestPreAttempt_OneShotDownSampleThenServes proves a one-shot sample of a DOWN host is
+// replaced before the first attempt instead of ending the query with no attempt at all.
+//
+// Only the live host is up and pooled, so the budget is one: the DOWN sample is skipped
+// for free, the replacement lands on the live host, and the query is served.
+func TestPreAttempt_OneShotDownSampleThenServes(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	down, live := harness.hosts[0], harness.hosts[1]
+	harness.session.markHostDown(down)
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{down, live}}
+	harness.session.executor.policy = policy
+
+	iter := preAttemptQuery(harness, "void").Iter()
+	require.NoError(t, iter.Close(), "the live host must serve the query")
+	require.Equal(t, 1, iter.Attempts(), "one attempt, on the live host")
+	require.Equal(t, int32(2), policy.picks.Load(), "the DOWN sample is replaced once")
+}
+
+// TestPreAttempt_NonIdempotentUnchanged proves a non-idempotent query keeps today's
+// behaviour: its first sample is taken raw, rejected, and nothing replaces it.
+func TestPreAttempt_NonIdempotentUnchanged(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	down, live := harness.hosts[0], harness.hosts[1]
+	harness.session.markHostDown(down)
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{down, live}}
+	harness.session.executor.policy = policy
+
+	iter := harness.session.Query("void").Idempotent(false).RetryPolicy(nil).Iter()
+	require.ErrorIs(t, iter.Close(), ErrNoConnections, "a non-idempotent query is not moved to another host")
+	require.Equal(t, 0, iter.Attempts())
+	require.Equal(t, int32(1), policy.picks.Load(), "no replacement for a non-idempotent query")
+}
+
+// TestPreAttempt_NonIdempotentEmptyFirstUnchanged proves a non-idempotent query whose
+// first sample has an empty pool with a fill in flight still waits for that fill, with
+// speculation configured and no replacement drawn.
+func TestPreAttempt_NonIdempotentEmptyFirstUnchanged(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	empty, other := harness.hosts[0], harness.hosts[1]
+
+	harness.dialer.arm(nil)
+	detachPoolConn(t, harness.pool(t, empty))
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{empty, other}}
+	harness.session.executor.policy = policy
+
+	waiting := make(chan struct{}, 1)
+	harness.session.executor.testBeforeWait = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+
+	recorder := newAttemptRecorder()
+	result := harness.query(t.Context(), func(qry *Query) {
+		speculative(1, time.Hour)(qry)
+		// The speculative helper marks the query idempotent; this test is about the
+		// non-idempotent path.
+		qry.Idempotent(false).RetryPolicy(nil).Observer(recorder)
+	})
+	awaitSignal(t, waiting, "the query to wait for the fill")
+	harness.dialer.releaseAll()
+
+	require.NoError(t, awaitQuery(t, result), "the fill must serve the query")
+	require.Equal(t, 1, recorder.count())
+	require.Equal(t, int32(1), policy.picks.Load(), "no replacement for a non-idempotent query")
+}
+
+// TestPreAttempt_PinnedEmptyFirstUnchanged proves a pinned query whose host has an empty
+// pool with a fill in flight waits for that fill and never asks the policy for a host.
+func TestPreAttempt_PinnedEmptyFirstUnchanged(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	pinned := harness.hosts[0]
+
+	harness.dialer.arm(nil)
+	detachPoolConn(t, harness.pool(t, pinned))
+	policy := installOneShotPolicy(harness)
+
+	waiting := make(chan struct{}, 1)
+	harness.session.executor.testBeforeWait = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+
+	recorder := newAttemptRecorder()
+	result := harness.query(t.Context(), func(qry *Query) {
+		speculative(1, time.Hour)(qry)
+		qry.SetHostID(pinned.HostID()).RetryPolicy(nil).Observer(recorder)
+	})
+	awaitSignal(t, waiting, "the query to wait for the fill")
+	harness.dialer.releaseAll()
+
+	require.NoError(t, awaitQuery(t, result), "the fill must serve the query")
+	require.Equal(t, 1, recorder.count())
+	require.Equal(t, int32(0), policy.picks.Load(), "a pinned query never asks the policy")
+}
+
+// TestPreAttempt_RepeatedDownSampleIsBounded proves a policy that keeps sampling a DOWN
+// host is asked for at most 1+maxHosts iterators: skipped samples are free, so the
+// re-pick cap is what ends the search.
+func TestPreAttempt_RepeatedDownSampleIsBounded(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	down := harness.hosts[0]
+	harness.session.markHostDown(down)
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{down}}
+	harness.session.executor.policy = policy
+
+	iter := preAttemptQuery(harness, "void").Iter()
+	require.ErrorIs(t, iter.Close(), ErrNoConnections)
+	require.Equal(t, 0, iter.Attempts())
+	require.Equal(t, int32(2), policy.picks.Load(), "one host is up, so one replacement and no more")
+}
+
+// TestPreAttempt_ZeroBoundNeverRePicks proves a query whose snapshot holds no up, pooled
+// host draws its first iterator and nothing else.
+func TestPreAttempt_ZeroBoundNeverRePicks(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	for _, host := range harness.hosts {
+		harness.session.markHostDown(host)
+	}
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{harness.hosts[0]}}
+	harness.session.executor.policy = policy
+
+	iter := preAttemptQuery(harness, "void").Iter()
+	require.ErrorIs(t, iter.Close(), ErrNoConnections)
+	require.Equal(t, 0, iter.Attempts())
+	require.Equal(t, int32(1), policy.picks.Load(), "a zero budget never replaces")
+}
+
+// TestPreAttempt_ZeroSnapshotRecoveryServedByFirstIterator proves the first iterator is
+// never capped: a host that comes up after a zero snapshot and is yielded by the first
+// iterator is served as it always was, directly and with speculation configured.
+func TestPreAttempt_ZeroSnapshotRecoveryServedByFirstIterator(t *testing.T) {
+	for _, spec := range []bool{false, true} {
+		t.Run(map[bool]string{false: "direct", true: "speculative"}[spec], func(t *testing.T) {
+			harness := newFillHarness(t, 2, nil)
+			for _, host := range harness.hosts {
+				harness.session.markHostDown(host)
+			}
+			recovering := harness.hosts[1]
+
+			policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{recovering}}
+			harness.session.executor.policy = policy
+
+			// Bring the host back between the snapshot and the first draw; the UP
+			// transition runs on a goroutine, so wait for its publication.
+			harness.session.executor.testAfterSnapshot = sync.OnceFunc(func() {
+				harness.session.startPoolFill(recovering)
+				awaitHost(t, harness.collector.up, recovering, "the recovering host to reach UP")
+			})
+
+			qry := preAttemptQuery(harness, "void")
+			if spec {
+				speculative(1, time.Hour)(qry)
+			}
+			iter := qry.Iter()
+			require.NoError(t, iter.Close(), "the first iterator's host must be served")
+			require.Equal(t, 1, iter.Attempts())
+			require.Equal(t, int32(1), policy.picks.Load(), "a zero budget never replaces")
+		})
+	}
+}
+
+// TestPreAttempt_RepeatedSaturatedSampleIsBounded proves an up, pooled host with no
+// stream to offer spends budget each time it is sampled, so the search ends after
+// maxHosts selections with no retry policy involved at all.
+func TestPreAttempt_RepeatedSaturatedSampleIsBounded(t *testing.T) {
+	harness := newFillHarness(t, 2, noHeartbeat)
+	saturated := harness.hosts[0]
+	saturatePool(t, harness, harness.pool(t, saturated))
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{saturated}}
+	harness.session.executor.policy = policy
+
+	iter := preAttemptQuery(harness, "void").Iter()
+	require.ErrorIs(t, iter.Close(), ErrNoConnections)
+	require.Equal(t, 0, iter.Attempts())
+	require.Equal(t, int32(2), policy.picks.Load(), "two up hosts: two selections, then the budget is spent")
+}
+
+// TestPreAttempt_EnumeratingEmptyPoolsWaitForFill proves an enumerating policy whose
+// every host has an empty pool with a fill in flight spends the whole budget in its first
+// round and waits for a fill without a second Pick.
+func TestPreAttempt_EnumeratingEmptyPoolsWaitForFill(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	policy := &countingPickPolicy{HostSelectionPolicy: harness.session.executor.policy}
+	harness.session.executor.policy = policy
+
+	harness.dialer.arm(nil)
+	for _, host := range harness.hosts {
+		detachPoolConn(t, harness.pool(t, host))
+	}
+
+	waiting := make(chan struct{}, 1)
+	harness.session.executor.testBeforeWait = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+
+	recorder := newAttemptRecorder()
+	result := harness.query(t.Context(), func(qry *Query) { qry.Idempotent(true).RetryPolicy(nil).Observer(recorder) })
+	awaitSignal(t, waiting, "the query to wait for a fill")
+	require.Equal(t, int32(1), policy.picks.Load(), "both empty pools were selections; no replacement before waiting")
+
+	harness.dialer.releaseAll()
+	require.NoError(t, awaitQuery(t, result))
+	require.Equal(t, 1, recorder.count())
+	require.Equal(t, int32(1), policy.picks.Load())
+}
+
+// TestPreAttempt_EnumeratingSaturatedFirstNoSecondRound proves an enumerating policy takes
+// one selection round even when the host it visits first has no usable connection.
+//
+// 2.4.1-otter took a second round here, because its guard counted attempts:
+// the saturated host produced none, so the failing host was attempted twice.
+// A saturated host is a selection, and two selections spend a two-host budget.
+func TestPreAttempt_EnumeratingSaturatedFirstNoSecondRound(t *testing.T) {
+	harness := newFillHarness(t, 2, noHeartbeat)
+	saturated, failing := harness.hosts[0], harness.hosts[1]
+	saturatePool(t, harness, harness.pool(t, saturated))
+
+	round := []*HostInfo{saturated, failing}
+	policy := &scriptedIterPolicy{HostSelectionPolicy: harness.session.executor.policy, script: [][]*HostInfo{round, round}}
+	harness.session.executor.policy = policy
+
+	iter := harness.session.Query("kill").Idempotent(true).RetryPolicy(&SimpleRetryPolicy{NumRetries: 5}).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 1, iter.Attempts(), "the failing host is attempted once")
+	require.Equal(t, int32(1), policy.picks.Load(), "one round covered both up hosts")
+}
+
+// TestPreAttempt_EnumeratingFailingFirstOneRound is the control for the visit order that
+// already took one round before: the failing host first, then the saturated one.
+func TestPreAttempt_EnumeratingFailingFirstOneRound(t *testing.T) {
+	harness := newFillHarness(t, 2, noHeartbeat)
+	saturated, failing := harness.hosts[0], harness.hosts[1]
+	saturatePool(t, harness, harness.pool(t, saturated))
+
+	round := []*HostInfo{failing, saturated}
+	policy := &scriptedIterPolicy{HostSelectionPolicy: harness.session.executor.policy, script: [][]*HostInfo{round, round}}
+	harness.session.executor.policy = policy
+
+	iter := harness.session.Query("kill").Idempotent(true).RetryPolicy(&SimpleRetryPolicy{NumRetries: 5}).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 1, iter.Attempts())
+	require.Equal(t, int32(1), policy.picks.Load())
+}
+
+// TestPreAttempt_EnumeratingMembershipChangeMidRound pins the accepted transient: a host
+// counted in the budget that goes DOWN before the round reaches it leaves the round one
+// selection short, and the selector draws replacements until a cap ends it.
+//
+// The scripted policy answers every replacement with an empty iterator, so the re-pick cap
+// is what ends the search: three Picks in total, no attempt.
+func TestPreAttempt_EnumeratingMembershipChangeMidRound(t *testing.T) {
+	harness := newFillHarness(t, 2, noHeartbeat)
+	saturated, leaving := harness.hosts[0], harness.hosts[1]
+	saturatePool(t, harness, harness.pool(t, saturated))
+
+	policy := &scriptedIterPolicy{HostSelectionPolicy: harness.session.executor.policy, script: [][]*HostInfo{{saturated, leaving}}}
+	harness.session.executor.policy = policy
+
+	// The hook runs after the saturated host's nil Pick, before the round reaches the
+	// other host.
+	harness.session.executor.testBeforeSnapshot = sync.OnceFunc(func() { harness.session.markHostDown(leaving) })
+
+	iter := preAttemptQuery(harness, "void").Iter()
+	require.ErrorIs(t, iter.Close(), ErrNoConnections)
+	require.Equal(t, 0, iter.Attempts())
+	require.Equal(t, int32(3), policy.picks.Load(), "the first round plus maxHosts empty replacements")
+}
+
+// TestPreAttempt_PostFailureDownSampleThenReaches proves the search after a failed attempt
+// keeps going past a DOWN sample: the DOWN host is skipped for free and the next sample is
+// attempted.
+func TestPreAttempt_PostFailureDownSampleThenReaches(t *testing.T) {
+	testPostFailureDownSampleThenReaches(t, &SimpleRetryPolicy{NumRetries: 5})
+}
+
+// TestPreAttempt_AlwaysNextHostDownSampleThenReaches is the same search under a retry
+// policy that never stops: both sites draw from one budget, which ends it.
+func TestPreAttempt_AlwaysNextHostDownSampleThenReaches(t *testing.T) {
+	testPostFailureDownSampleThenReaches(t, alwaysNextHostPolicy{})
+}
+
+// testPostFailureDownSampleThenReaches runs the [live, DOWN, live] script under rt and
+// asserts both live hosts were attempted through three Picks.
+func testPostFailureDownSampleThenReaches(t *testing.T, rt RetryPolicy) {
+	t.Helper()
+
+	harness := newFillHarness(t, 3, nil)
+	first, down, last := harness.hosts[0], harness.hosts[2], harness.hosts[1]
+	harness.session.markHostDown(down)
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{first, down, last}}
+	harness.session.executor.policy = policy
+
+	iter := harness.session.Query("kill").Idempotent(true).RetryPolicy(rt).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 2, iter.Attempts(), "both up hosts are attempted")
+	require.Equal(t, int32(3), policy.picks.Load(), "the DOWN sample costs a Pick but no budget")
+}
+
+// TestPreAttempt_AlwaysNextHostOneShotTerminates proves a retry policy that never stops
+// is bounded by the selection budget alone.
+func TestPreAttempt_AlwaysNextHostOneShotTerminates(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	policy := installOneShotPolicy(harness)
+
+	iter := harness.session.Query("kill").Idempotent(true).RetryPolicy(alwaysNextHostPolicy{}).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 2, iter.Attempts())
+	require.Equal(t, int32(2), policy.picks.Load())
+}
+
+// TestPreAttempt_PostFailureSaturatedSampleThenReaches proves a replacement that lands on
+// an up, pooled host with nothing to offer is handed out, spends budget, and is followed
+// by another replacement through the pre-attempt site.
+func TestPreAttempt_PostFailureSaturatedSampleThenReaches(t *testing.T) {
+	harness := newFillHarness(t, 3, noHeartbeat)
+	first, saturated, last := harness.hosts[0], harness.hosts[1], harness.hosts[2]
+	saturatePool(t, harness, harness.pool(t, saturated))
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{first, saturated, last}}
+	harness.session.executor.policy = policy
+
+	iter := harness.session.Query("kill").Idempotent(true).RetryPolicy(&SimpleRetryPolicy{NumRetries: 5}).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 2, iter.Attempts(), "the saturated host is a selection but not an attempt")
+	require.Equal(t, int32(3), policy.picks.Load())
+}
+
+// TestPreAttempt_ReplacementThenFillStillAwaited proves a fill candidate recorded before
+// a replacement is still waited for once the budget is spent.
+func TestPreAttempt_ReplacementThenFillStillAwaited(t *testing.T) {
+	harness := newFillHarness(t, 2, noHeartbeat)
+	empty, saturated := harness.hosts[0], harness.hosts[1]
+
+	harness.dialer.arm(nil)
+	detachPoolConn(t, harness.pool(t, empty))
+	saturatePool(t, harness, harness.pool(t, saturated))
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{empty, saturated}}
+	harness.session.executor.policy = policy
+
+	waiting := make(chan struct{}, 1)
+	harness.session.executor.testBeforeWait = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+
+	recorder := newAttemptRecorder()
+	result := harness.query(t.Context(), func(qry *Query) { qry.Idempotent(true).RetryPolicy(nil).Observer(recorder) })
+	awaitSignal(t, waiting, "the query to wait for the fill")
+	require.Equal(t, int32(2), policy.picks.Load(), "the saturated replacement was drawn before waiting")
+
+	harness.dialer.releaseAll()
+	require.NoError(t, awaitQuery(t, result), "the candidate's fill must serve the query")
+	require.Equal(t, 1, recorder.count())
+	require.Equal(t, map[*HostInfo]int{empty: 1}, recorder.hosts())
+}
+
+// TestPreAttempt_ReplacementFailureAbandonsFillCandidate pins the priority between a
+// retained fill candidate and a failed attempt on a replacement: the failure ends the
+// query, even though the candidate's fill has completed by then.
+func TestPreAttempt_ReplacementFailureAbandonsFillCandidate(t *testing.T) {
+	gate := newRequestGate()
+	harness := newFillHarnessOpts(t, 2, fillHarnessOpts{recvHook: gate.hook})
+	t.Cleanup(gate.releaseAll)
+	empty, failing := harness.hosts[0], harness.hosts[1]
+
+	gate.arm(hostIP(failing))
+	harness.dialer.arm(nil)
+	detachPoolConn(t, harness.pool(t, empty))
+	appended := onFreshConnAppended(harness, empty)
+
+	policy := &scriptedOneShotPolicy{HostSelectionPolicy: harness.session.executor.policy, script: []*HostInfo{empty, failing}}
+	harness.session.executor.policy = policy
+
+	waiting := make(chan struct{}, 1)
+	harness.session.executor.testBeforeWait = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+
+	recorder := newAttemptRecorder()
+	result := execAsync(harness.session.Query("kill").WithContext(t.Context()).
+		Idempotent(true).RetryPolicy(&SimpleRetryPolicy{NumRetries: 5}).Observer(recorder))
+
+	// Either the replacement's request is in flight, or - on a driver without the
+	// replacement - the query is waiting for the fill.
+	select {
+	case <-gate.started:
+	case <-waiting:
+	case <-time.After(fillEventBudget):
+		t.Fatalf("timed out after %v waiting for the query to reach the gate or the fill wait", fillEventBudget)
+	}
+
+	// Complete the candidate's fill before the replacement is answered.
+	harness.dialer.releaseAll()
+	awaitSignal(t, appended, "the candidate's pool to receive its connection")
+	gate.releaseAll()
+
+	require.Error(t, awaitQuery(t, result), "the test server answers kill with an error")
+	require.Equal(t, 1, recorder.count(), "the replacement's failure ends the query")
+	require.Equal(t, map[*HostInfo]int{failing: 1}, recorder.hosts(), "the usable candidate is not attempted")
+	require.Equal(t, int32(2), policy.picks.Load())
+}
+
+// TestPreAttempt_TerminalPassAdvancesOnce proves the retry policy's terminal pass makes
+// exactly one raw iterator call: a token-aware iterator whose next replica is up but has
+// no pool is advanced past that replica and no fallback Pick happens.
+func TestPreAttempt_TerminalPassAdvancesOnce(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+	first, unpooled := harness.hosts[0], harness.hosts[1]
+
+	fallback := &countingPickPolicy{HostSelectionPolicy: RoundRobinHostPolicy()}
+	outer := tokenAwareOver(t, harness, fallback, 2, []*HostInfo{first, unpooled})
+	unpoolHost(harness, unpooled)
+
+	iter := routed(harness.session.Query("kill")).Idempotent(true).RetryPolicy(&SimpleRetryPolicy{NumRetries: 0}).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 1, iter.Attempts())
+	require.Equal(t, int32(1), outer.picks.Load())
+	require.Equal(t, int32(0), fallback.picks.Load(), "the terminal pass consumed the replica, not the fallback")
+}
+
+// TestRetryNextHost_TokenAwareReplicaPhaseNeverRePicks proves token-aware over an
+// enumerating fallback spends the budget in its replica phase and is never re-picked.
+func TestRetryNextHost_TokenAwareReplicaPhaseNeverRePicks(t *testing.T) {
+	harness := newFillHarness(t, 2, nil)
+
+	fallback := &countingPickPolicy{HostSelectionPolicy: RoundRobinHostPolicy()}
+	outer := tokenAwareOver(t, harness, fallback, 2, []*HostInfo{harness.hosts[0], harness.hosts[1]})
+
+	iter := routed(harness.session.Query("kill")).Idempotent(true).RetryPolicy(&SimpleRetryPolicy{NumRetries: 5}).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 2, iter.Attempts(), "both replicas are attempted")
+	require.Equal(t, int32(1), outer.picks.Load())
+	require.Equal(t, int32(1), fallback.picks.Load(), "the fallback is drawn lazily and contributes nothing")
+}
+
+// TestRetryNextHost_TokenAwareOverOneShotCapsMidReplicaPhase proves a replacement iterator
+// that yields several hosts - token-aware over a one-shot fallback - is capped at the
+// budget before it yields more.
+//
+// The first round spends two of three units on the replicas and the fallback's sample is
+// a replica already yielded, so a replacement is drawn; it yields the first replica again,
+// spending the last unit, and is capped before the second replica or the fallback.
+func TestRetryNextHost_TokenAwareOverOneShotCapsMidReplicaPhase(t *testing.T) {
+	harness := newFillHarness(t, 3, nil)
+	replicaA, replicaB, other := harness.hosts[0], harness.hosts[1], harness.hosts[2]
+
+	fallback := &scriptedOneShotPolicy{HostSelectionPolicy: RoundRobinHostPolicy(), script: []*HostInfo{replicaA, other}}
+	outer := tokenAwareOver(t, harness, fallback, 2, []*HostInfo{replicaA, replicaB})
+
+	recorder := newAttemptRecorder()
+	iter := routed(harness.session.Query("kill")).Idempotent(true).RetryPolicy(&SimpleRetryPolicy{NumRetries: 5}).Observer(recorder).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 3, iter.Attempts(), "three up hosts: three selections")
+	require.Equal(t, map[*HostInfo]int{replicaA: 2, replicaB: 1}, recorder.hosts(), "the replacement is capped after the first replica")
+	require.Equal(t, int32(2), outer.picks.Load())
+	require.Equal(t, int32(1), fallback.picks.Load(), "the replacement never reaches its fallback")
+}
+
+// TestRetryNextHost_TokenAwareFallbackHostCoveredInFirstRound proves a non-replica host the
+// fallback yields is a selection of the first round, so the round covers the budget.
+func TestRetryNextHost_TokenAwareFallbackHostCoveredInFirstRound(t *testing.T) {
+	harness := newFillHarness(t, 3, nil)
+
+	fallback := &countingPickPolicy{HostSelectionPolicy: RoundRobinHostPolicy()}
+	outer := tokenAwareOver(t, harness, fallback, 2, []*HostInfo{harness.hosts[0], harness.hosts[1]})
+
+	iter := routed(harness.session.Query("kill")).Idempotent(true).RetryPolicy(&SimpleRetryPolicy{NumRetries: 5}).Iter()
+	require.Error(t, iter.Close(), "the test server answers kill with an error")
+	require.Equal(t, 3, iter.Attempts(), "two replicas and the fallback's host")
+	require.Equal(t, int32(1), outer.picks.Load())
+	require.Equal(t, int32(1), fallback.picks.Load())
 }

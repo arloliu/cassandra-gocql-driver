@@ -77,7 +77,125 @@ const (
 	runEntered runStage = iota
 	// runNoHost fires just before run reports that it found no host to try.
 	runNoHost
+	// runResult fires after do produced a result, before run publishes it.
+	// A runner that found no host reports and returns before this stage.
+	runResult
+	// runExited fires as run returns, after its report or result was sent.
+	runExited
 )
+
+// hostSelector hands out the hosts one execution may try,
+// replacing a policy iterator that ran dry while the selection budget allows it.
+//
+// It is shared by every runner of a speculative execution, so the budget is query-wide:
+// a draw, the decision to replace the iterator, and the cap are one critical section.
+//
+// The budget is maxHosts, the number of up, pooled hosts snapshotted once per query.
+// The first iterator is the policy's own answer and is never capped;
+// a replacement is drawn only while fewer than maxHosts such hosts were consumed
+// and fewer than maxHosts replacements were drawn,
+// and it hands out hosts only up to that count.
+// A one-shot policy (hostpool.HostPoolHostPolicy, see #812 and #1259) is therefore
+// tried on up to one host per up, pooled host and asked for at most 1+maxHosts iterators;
+// a policy whose iterator already enumerates the up hosts consumes the budget in its first round
+// and is never asked for a replacement, as long as the hosts it holds are the hosts the pool holds.
+// When the two differ (a host joining or leaving mid-query, two host IDs behind one connect address)
+// an enumerating policy may be asked for a bounded number of further selections.
+//
+// With maxHosts == 0 the selector is the raw iterator behind a mutex:
+// no filtering, no accounting, no replacement.
+// That is the shape of a query pinned with SetHostID and of a non-idempotent query.
+type hostSelector struct {
+	mu sync.Mutex
+	// iter is the current iterator.
+	iter NextHost
+	// pick draws a replacement iterator from the policy; nil for a pinned query.
+	pick func() NextHost
+	// eligible reports whether a host is up and pooled - the population maxHosts counts.
+	// Hosts outside it are skipped:
+	// pickForHost would reject them without a fill candidate, and they must not spend budget.
+	eligible func(*HostInfo) bool
+	// maxHosts is the budget; 0 turns replacement off.
+	maxHosts int
+
+	// used counts population hosts consumed from iterators: handed out by draw,
+	// or consumed and discarded by advance.
+	used int
+	// rePicks counts replacement iterators drawn.
+	rePicks int
+	// replaced is set once iter is a replacement, whose draws are capped.
+	replaced bool
+	// exhausted is set when draw returned nil: every later draw returns nil.
+	exhausted bool
+}
+
+// draw returns the next selection, or nil once the budget is spent.
+//
+// Ineligible hosts are skipped.
+// A dry iterator is replaced while the budget allows;
+// a replacement that yields nothing spends a re-pick and is replaced in turn,
+// so the re-pick cap ends a policy that keeps sampling hosts the ring has already marked down.
+// Once nil is returned it stays nil:
+// both counters only grow, and the flag stops re-reading an iterator that came back to life.
+//
+// Returns:
+//   - SelectedHost: the host to try, or nil
+func (s *hostSelector) draw() SelectedHost {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for {
+		if s.exhausted {
+			return nil
+		}
+		if s.replaced && s.used >= s.maxHosts {
+			s.exhausted = true
+			return nil
+		}
+
+		host := s.iter()
+		if host != nil {
+			if s.maxHosts == 0 {
+				return host
+			}
+			if info := host.Info(); info != nil && s.eligible(info) {
+				s.used++
+				return host
+			}
+			continue
+		}
+
+		if s.used >= s.maxHosts || s.rePicks >= s.maxHosts {
+			s.exhausted = true
+			return nil
+		}
+		s.rePicks++
+		s.iter = s.pick()
+		s.replaced = true
+	}
+}
+
+// advance calls the current iterator once and discards the result.
+//
+// It is the retry policy's terminal pass:
+// the selection made there is thrown away, so no replacement may be spent on it,
+// but the raw call is kept so policies with lazy internal state (TokenAware's fallback Pick)
+// see exactly the calls they always saw.
+// A population host consumed this way is charged:
+// it was part of the enumeration,
+// and a speculative sibling must not read the shortened round as grounds for a replacement.
+func (s *hostSelector) advance() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	host := s.iter()
+	if host == nil || s.maxHosts == 0 {
+		return
+	}
+	if info := host.Info(); info != nil && s.eligible(info) {
+		s.used++
+	}
+}
 
 // fillCandidate is a host whose pool was empty with a fill in flight,
 // so a query may wait for that fill instead of failing fast.
@@ -108,6 +226,10 @@ type queryExecutor struct {
 	// testRunHook runs at run's checkpoints.
 	// Nil in production.
 	testRunHook func(stage runStage)
+	// testAfterSnapshot runs in executeQuery after the selector took its
+	// budget snapshot and before the first draw.
+	// Nil in production.
+	testAfterSnapshot func()
 }
 
 func (q *queryExecutor) attemptQuery(ctx context.Context, qry internalRequest, conn *Conn) *Iter {
@@ -132,12 +254,12 @@ func (q *queryExecutor) attemptQuery(ctx context.Context, qry internalRequest, c
 // Parameters:
 //   - ctx: cancelled by executeQuery once a result is returned
 //   - sp: the speculative execution policy; sp.Attempts() extra runners
-//   - hostIter: the shared, already synchronized host iterator
+//   - sel: the selector shared by every runner
 //
 // Returns:
 //   - *Iter: the winning iterator, or an error iterator
 func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp SpeculativeExecutionPolicy,
-	hostIter NextHost) *Iter {
+	sel *hostSelector) *Iter {
 	// remaining counts scheduled launches that have not started yet.
 	remaining := sp.Attempts()
 	results := make(chan *Iter, 1+remaining)
@@ -145,7 +267,7 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 	noHostCh := make(chan struct{}, 1+remaining)
 	launched, noHost := 1, 0
 
-	go q.run(ctx, qry, hostIter, results, noHostCh)
+	go q.run(ctx, qry, sel, results, noHostCh)
 
 	var tick <-chan time.Time
 	if remaining > 0 {
@@ -168,8 +290,8 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 			// defaults to context.Background(), so Session.Close cannot release it.
 			// A runner waiting for a fill has not reported, so it keeps
 			// noHost < launched and the sibling protection intact, and a launch
-			// that has not started yet cannot help either: it would draw from the
-			// shared host iterator, which is already exhausted.
+			// that has not started yet cannot help either: a no-host report means
+			// the shared selector is exhausted, and it stays exhausted.
 			if noHost == launched {
 				return newErrIter(ErrNoConnections, qry.getQueryMetrics(), qry.Keyspace(),
 					qry.getRoutingInfo(), qry.getKeyspaceFunc())
@@ -178,7 +300,7 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 			// Only the ticker launches.
 			remaining--
 			launched++
-			go q.run(ctx, qry, hostIter, results, noHostCh)
+			go q.run(ctx, qry, sel, results, noHostCh)
 			if remaining == 0 {
 				tick = nil
 			}
@@ -209,30 +331,32 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 
 	// if host is not specified for the query,
 	// then a host will be picked by HostSelectionPolicy.
-	// rePick stays nil for a pinned query: its iterator above is deliberately bound to
-	// one host, and drawing a replacement from the policy would move the query to a
-	// different coordinator.
-	var rePick func() NextHost
+	sel := &hostSelector{iter: hostIter}
 	if hostIter == nil {
-		hostIter = q.policy.Pick(qry)
-		rePick = func() NextHost { return q.policy.Pick(qry) }
+		sel.iter = q.policy.Pick(qry)
+		// Only an idempotent query may be moved to a replacement host: a pinned
+		// query's iterator is deliberately bound to one host, and a non-idempotent
+		// query keeps the host sequence it always had.
+		if qry.IsIdempotent() {
+			sel.pick = func() NextHost { return q.policy.Pick(qry) }
+			sel.eligible = q.pooledUp
+			// The budget is snapshotted once so it is query-local and fixed:
+			// read live it could grow under a stream of host additions,
+			// which would leave a custom RetryPolicy whose Attempt never returns false
+			// without a termination proof.
+			// Missing a host that comes up mid-query is the conservative direction.
+			sel.maxHosts = q.pool.upHostCount()
+		}
+	}
+	if q.testAfterSnapshot != nil {
+		q.testAfterSnapshot()
 	}
 
 	// check if the query is not marked as idempotent, if
 	// it is, we force the policy to NonSpeculative
 	sp := qry.speculativeExecutionPolicy()
 	if qry.GetHostID() != "" || !qry.IsIdempotent() || sp.Attempts() == 0 {
-		return q.do(qry.Context(), qry, hostIter, rePick), nil
-	}
-
-	// When speculative execution is enabled, we could be accessing the host iterator from multiple goroutines below.
-	// To ensure we don't call it concurrently, we wrap the returned NextHost function here to synchronize access to it.
-	var mu sync.Mutex
-	origHostIter := hostIter
-	hostIter = func() SelectedHost {
-		mu.Lock()
-		defer mu.Unlock()
-		return origHostIter()
+		return q.do(qry.Context(), qry, sel), nil
 	}
 
 	ctx, cancel := context.WithCancel(qry.Context())
@@ -240,37 +364,40 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 
 	// The speculative executions are launched _in addition_ to the main execution, on a timer.
 	// So Speculation{2} would make 3 executions running in total.
-	return q.coordinate(ctx, qry, sp, hostIter), nil
+	// They share sel, whose mutex serializes their draws.
+	return q.coordinate(ctx, qry, sp, sel), nil
 }
 
-// do runs qry against the hosts hostIter yields, applying the retry policy between
+// pooledUp reports whether host is up and holds a registered pool:
+// the population upHostCount measures, and the first two checks pickForHost makes.
+//
+// Parameters:
+//   - host: the host to judge
+//
+// Returns:
+//   - bool: true when the host is up and pooled
+func (q *queryExecutor) pooledUp(host *HostInfo) bool {
+	if !host.IsUp() {
+		return false
+	}
+	_, ok := q.pool.getPool(host)
+	return ok
+}
+
+// do runs qry against the hosts sel hands out, applying the retry policy between
 // attempts.
 //
 // Parameters:
 //   - ctx: cancels the execution
 //   - qry: the statement to run
-//   - hostIter: yields hosts until it reports exhaustion by returning nil
-//   - rePick: draws a fresh host iterator once hostIter is exhausted, or nil when
-//     re-picking is not allowed. It is nil for a query pinned with SetHostID, whose
-//     iterator does not come from the selection policy, and for speculative runners,
-//     which share one synchronized iterator so that they land on distinct hosts.
+//   - sel: hands out hosts until it reports exhaustion by returning nil; see
+//     hostSelector for the budget that governs replacement iterators
 //
 // Returns:
 //   - *Iter: the query's iterator, or an error iterator
-func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter NextHost,
-	rePick func() NextHost) *Iter {
-	selectedHost := hostIter()
+func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSelector) *Iter {
+	selectedHost := sel.draw()
 	rt := qry.retryPolicy()
-
-	// maxHosts bounds how far re-picking may take this query; see the RetryNextHost branch.
-	// It is snapshotted once so the bound is query-local and fixed: read live it could grow
-	// under a stream of host additions, which would leave a custom RetryPolicy whose Attempt
-	// never returns false without a termination proof. Missing a host that comes up
-	// mid-query is the conservative direction.
-	maxHosts := 0
-	if rePick != nil {
-		maxHosts = q.pool.upHostCount()
-	}
 
 	var lastErr error
 	var iter *Iter
@@ -298,7 +425,7 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter Ne
 			var conn *Conn
 			conn, cands = q.pickForHost(selectedHost, cands)
 			if conn == nil {
-				selectedHost = hostIter()
+				selectedHost = sel.draw()
 				continue
 			}
 
@@ -334,35 +461,12 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter Ne
 			// retry on the same host
 		case RetryNextHost:
 			// retry on the next host
-			selectedHost = hostIter()
-			if selectedHost == nil && rePick != nil && !attemptsReached &&
-				qry.Attempts() < maxHosts {
-				// A policy whose Pick yields a one-shot iterator reports exhaustion after a
-				// single host, so this branch could never advance and the retry budget went
-				// unspent. hostpool.HostPoolHostPolicy is such a policy: its `used` guard is
-				// what stops the #1259 CPU spin, so the one-shot shape has to stay and the
-				// bound belongs here instead. See #812.
-				//
-				// Two bounds apply, and both are needed.
-				//
-				// attemptsReached is read here and not only at the exit below because this
-				// branch also runs on the terminal pass, whose selection is discarded - an
-				// ungated re-pick would cost one Pick more than the budget authorises.
-				//
-				// maxHosts caps the total number of attempts at the number of hosts that can
-				// be handed out, which is what makes this a no-op for every policy whose Pick
-				// already enumerates hosts: roundRobbin yields precisely the up hosts, so
-				// such an iterator drains at exactly maxHosts and the guard is already false
-				// when it does. Neither the ring nor the raw pool count would do - the ring
-				// keeps hosts that are down and hosts HostFilter rejected, and the pool map
-				// keeps a pool that was registered before its host came up, so either would
-				// hand an enumerating policy an extra selection round it does not get today.
-				//
-				// It also keeps a custom RetryPolicy whose Attempt never returns false
-				// bounded: before this branch existed such a policy terminated on iterator
-				// exhaustion, and a fixed maxHosts preserves a finite bound.
-				hostIter = rePick()
-				selectedHost = hostIter()
+			if attemptsReached {
+				// The terminal pass discards its selection below; advance the iterator
+				// once, as always, without spending a replacement on it.
+				sel.advance()
+			} else {
+				selectedHost = sel.draw()
 			}
 		case Ignore:
 			iter.err = nil
@@ -511,10 +615,11 @@ func (q *queryExecutor) awaitFill(ctx context.Context, cands []fillCandidate) (*
 	}
 }
 
-func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter NextHost, results chan<- *Iter,
+func (q *queryExecutor) run(ctx context.Context, qry internalRequest, sel *hostSelector, results chan<- *Iter,
 	noHost chan<- struct{}) {
 	if q.testRunHook != nil {
 		q.testRunHook(runEntered)
+		defer q.testRunHook(runExited)
 	}
 
 	// Coordination teardown: parent at coordinate selects on <-results, <-noHost or <-ctx.Done().
@@ -529,10 +634,11 @@ func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter N
 		}
 	})
 
-	// Speculative runners share one synchronized iterator so they land on distinct hosts,
-	// and coordinate's no-host accounting depends on that iterator being the only source
-	// of hosts, so a runner must not draw a private replacement. See #812.
-	iter := q.do(ctx, qry, hostIter, nil)
+	// Speculative runners share one selector, so its budget is query-wide
+	// and coordinate's no-host accounting can rely on it:
+	// a runner that found no host has exhausted the selection for every runner, launched or not.
+	// See #812.
+	iter := q.do(ctx, qry, sel)
 	if iter.err == ErrNoConnections {
 		// do returns ErrNoConnections only when it never reached a host, so a
 		// sibling still waiting for a fill must not lose to this report.
@@ -546,6 +652,9 @@ func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter N
 		return
 	}
 
+	if q.testRunHook != nil {
+		q.testRunHook(runResult)
+	}
 	select {
 	case results <- iter:
 	case <-ctx.Done():

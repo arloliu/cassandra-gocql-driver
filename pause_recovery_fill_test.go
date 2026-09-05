@@ -64,7 +64,7 @@ var errFillTestEventDropped = errors.New("gocql: pool event publication dropped 
 //
 // Distinct IPs, not merely distinct ports, are required:
 // NewTestServer always binds 127.0.0.1 and the selection policies deduplicate hosts by connect address.
-var fillLoopbackAddrs = []string{"127.0.0.2:0", "127.0.0.3:0"}
+var fillLoopbackAddrs = []string{"127.0.0.2:0", "127.0.0.3:0", "127.0.0.4:0"}
 
 // gatedHostDialer is a HostDialer whose dials can be parked and failed on demand.
 //
@@ -608,37 +608,70 @@ type fillHarness struct {
 	collector *hostStateCollector
 }
 
+// fillHarnessOpts tunes newFillHarnessOpts.
+type fillHarnessOpts struct {
+	// tune applies cluster tweaks before CreateSession.
+	tune func(*ClusterConfig)
+	// recvHook runs in every test server's receive loop, synchronously, before the
+	// request is processed; ip is the server's loopback address without the port.
+	// Blocking in it holds that connection's request in flight.
+	recvHook func(ip string, f *framer)
+}
+
 // newFillHarness starts servers hosts and returns a connected session wired to a
 // gated dialer and a pool event recorder.
 //
-// A single-host harness uses the plain 127.0.0.1 test server; a multi-host harness
-// binds distinct loopback aliases and skips the test where they are unavailable.
-//
 // Parameters:
 //   - t: the test; servers and the session are registered for cleanup
-//   - hosts: how many test servers to start (1 or 2)
+//   - hosts: how many test servers to start (1 to len(fillLoopbackAddrs))
 //   - tune: optional cluster tweaks applied before CreateSession
 //
 // Returns:
 //   - *fillHarness: the connected harness, with every pool filled
 func newFillHarness(t *testing.T, hosts int, tune func(*ClusterConfig)) *fillHarness {
 	t.Helper()
+	return newFillHarnessOpts(t, hosts, fillHarnessOpts{tune: tune})
+}
+
+// newFillHarnessOpts is newFillHarness with every option.
+//
+// A single-host harness uses the plain 127.0.0.1 test server; a multi-host harness
+// binds distinct loopback aliases and skips the test where they are unavailable.
+//
+// Parameters:
+//   - t: the test; servers and the session are registered for cleanup
+//   - hosts: how many test servers to start
+//   - opts: the options
+//
+// Returns:
+//   - *fillHarness: the connected harness, with every pool filled
+func newFillHarnessOpts(t *testing.T, hosts int, opts fillHarnessOpts) *fillHarness {
+	t.Helper()
+
+	startServer := func(addr string) *TestServer {
+		ip, _, err := net.SplitHostPort(addr)
+		require.NoError(t, err, "split %q", addr)
+		var recvHook func(*framer)
+		if opts.recvHook != nil {
+			recvHook = func(f *framer) { opts.recvHook(ip, f) }
+		}
+		srv := newTestServerOpts{addr: addr, protocol: defaultProto, recvHook: recvHook}.newServer(t, testServerContext(t))
+		t.Cleanup(srv.Stop)
+		return srv
+	}
 
 	addresses := make([]string, 0, hosts)
 	if hosts == 1 {
-		srv := NewTestServer(t, defaultProto, testServerContext(t))
-		t.Cleanup(srv.Stop)
-		addresses = append(addresses, srv.Address)
+		addresses = append(addresses, startServer("127.0.0.1:0").Address)
 	} else {
 		require.LessOrEqual(t, hosts, len(fillLoopbackAddrs), "no loopback alias reserved for host %d", hosts)
 		for i := range hosts {
 			addr := fillLoopbackAddrs[i]
 			mustBindLoopbackAddr(t, addr)
-			srv := NewTestServerWithAddress(addr, t, defaultProto, testServerContext(t))
-			t.Cleanup(srv.Stop)
-			addresses = append(addresses, srv.Address)
+			addresses = append(addresses, startServer(addr).Address)
 		}
 	}
+	tune := opts.tune
 
 	dialer := newGatedHostDialer()
 	events := newPoolEventRecorder()
@@ -1478,6 +1511,16 @@ func (r *runStageRecorder) gate(stage runStage) chan struct{} {
 	gate := make(chan struct{}, 64)
 	r.gates[stage] = gate
 	return gate
+}
+
+// arrivals returns the arrival channel of stage, creating it on first use.
+//
+// Returns:
+//   - chan struct{}: receives one token per arrival at stage
+func (r *runStageRecorder) arrivals(stage runStage) chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.channelLocked(stage)
 }
 
 // await blocks until stage is reached once more.

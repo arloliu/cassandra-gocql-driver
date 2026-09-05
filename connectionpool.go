@@ -306,17 +306,20 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo) {
 
 // upHostCount reports how many hosts hold a pool and are up.
 //
-// That is exactly the set roundRobbin yields, so it is the honest measure of how many hosts
-// a selection policy can hand out. Registration alone is not: startPoolFill registers a pool
-// before adding the host to the policy, and reconnectDownedHosts drives that path for hosts
-// that are still down, so a registered pool can belong to a host no iterator will produce
-// for as long as its fill takes.
+// It is the budget hostSelector snapshots:
+// the hosts a selection policy can hand out and the pool can serve.
+// Registration alone would not do:
+// startPoolFill registers a pool before adding the host to the policy,
+// and reconnectDownedHosts drives that path for hosts that are still down,
+// so a registered pool can belong to a host no iterator will produce for as long as its fill takes.
+// Up excludes those, and markHostDown sets NodeDown before it touches the policy or the pool.
+// A host rejected by HostFilter never enters either.
 //
-// Up is the predicate that closes both windows. A host reaches NodeUp only in
-// handleNodeConnected, after its pool is registered and after policy.AddHost, so anything
-// counted here is already in the policy; markHostDown sets NodeDown before it touches the
-// policy or the pool, so anything the policy has stopped yielding has already stopped being
-// counted. A host rejected by HostFilter never enters either.
+// The count and the policy's host set can still differ for a moment -
+// a host that reached UP but is not yet published to the policy,
+// a host joining or leaving between a Pick and this snapshot -
+// and two host IDs behind one connect address are one host to the policies but two pools here;
+// hostSelector bounds what such a mismatch can cost.
 //
 // Returns:
 //   - int: the number of up hosts with a registered pool

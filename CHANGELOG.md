@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   healthy new control host. A snapshot that lists one host_id twice is now rejected whole,
   where it used to be applied row by row until the second row aborted the refresh part-way.
 
+- Under a selection policy whose `Pick` yields one host at a time (`HostPoolHostPolicy`), an
+  idempotent query whose first sampled host has no usable connection is now retried on
+  further samples instead of failing with `ErrNoConnections` after zero attempts, and the
+  retry-across-hosts behaviour introduced in 2.4.1-otter (#812) now also applies when
+  speculative execution is configured. The budget is one selection per up, pooled host for
+  the whole query, shared by all speculative runners and consumed by the policy's first
+  iterator as well as by replacements; the policy is asked for at most that many further
+  `Pick` calls, so #1259 cannot return. A policy whose iterator enumerates the hosts takes
+  one selection round when that round covered every up, pooled host, also under speculative
+  execution; 2.4.1-otter took a second round when an enumerated host with no usable
+  connection was visited before a failing one, contrary to its own note, and no longer
+  does. When the policy's view of the hosts and the pool's differ (a host joining or
+  leaving mid-query, two host IDs behind one address) an enumerating policy may be asked
+  for a bounded number of further selections. The first limitation recorded in the
+  2.4.1-otter entry no longer applies; the second (a sampling policy may return the host
+  that just failed, so distinct coordinators are not guaranteed) remains.
+
 ## [2.4.1-otter] - 2026-09-05
 
 This release makes retries work under `HostPoolHostPolicy`.
