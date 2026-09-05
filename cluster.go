@@ -226,6 +226,12 @@ type ClusterConfig struct {
 	PoolConfig PoolConfig
 
 	// If not zero, gocql attempt to reconnect known DOWN nodes in every ReconnectInterval.
+	//
+	// Setting it to zero disables that sweep, and no other component takes the job over: a
+	// host the driver has convicted then stays down until the server sends an UP event for
+	// it. Leave it set unless something outside the driver owns recovery.
+	//
+	// Default: 60s.
 	ReconnectInterval time.Duration
 
 	// The maximum amount of time to wait for schema agreement in a cluster after
