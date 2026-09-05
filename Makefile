@@ -6,6 +6,10 @@ CASSANDRA_VERSION ?= 4.1.6
 TEST_CQL_PROTOCOL ?= 4
 TEST_COMPRESSOR ?= no-compression
 TEST_INTEGRATION_TAGS ?= integration
+# Integration runs drive real Cassandra nodes through ccm; stopping and starting
+# one costs tens of seconds, so the ccm-tagged suite needs more than the Go
+# default. Override for a longer sweep.
+TEST_TIMEOUT ?= 10m
 
 CCM_VERSION ?= 39b8222b31a6c7afe8fe845d16981088a5a735ad
 GOLANGCI_VERSION = v2.1.6
@@ -110,15 +114,15 @@ cassandra-remove: .prepare-ccm
 
 test-integration: .prepare-cassandra-cluster
 	@echo "Run integration tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
-	go test -v ${TEST_OPTS} -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=5m -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
+	go test -v ${TEST_OPTS} -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=${TEST_TIMEOUT} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
 
 test-integration-auth: .prepare-cassandra-cluster
 	@echo "Run auth integration tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
-	go test -v -run=TestAuthentication -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=5m -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -runauth -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
+	go test -v -run=TestAuthentication -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=${TEST_TIMEOUT} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -runauth -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
 
 test-cassandra: .prepare-cassandra-cluster
 	@echo "Run cassandra-tagged tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
-	go test -v ${TEST_OPTS} -tags "cassandra gocql_debug" -timeout=5m -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
+	go test -v ${TEST_OPTS} -tags "cassandra gocql_debug" -timeout=${TEST_TIMEOUT} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
 
 test-unit:
 	@echo "Run unit tests"
