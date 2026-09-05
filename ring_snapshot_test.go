@@ -458,10 +458,11 @@ func TestRefreshRing_DuplicateLimitationTwoPhase(t *testing.T) {
 			require.Same(t, c, still, "the moved host must keep its object while the snapshot is rejected")
 			require.Equal(t, "127.0.0.7", c.ConnectAddress().String(), "the move must not be applied from a rejected snapshot")
 
+			// C is DOWN, so the reconnect tick is what requests the next refresh.
 			f.drain()
 			f.script.setPeers([]peerRow{moved})
-			f.session.ringRefresher.trigger()
-			require.NoError(t, f.awaitDone(t, "the refresh after the duplicate cleared"))
+			f.session.reconnectDownedHostsOnce()
+			require.NoError(t, f.awaitDone(t, "the refresh the tick requested after the duplicate cleared"))
 			after, ok := f.session.ring.getHost(peerIDOne)
 			require.True(t, ok)
 			require.Equal(t, "127.0.0.8", after.ConnectAddress().String(), "the move must be applied once the duplicate cleared")

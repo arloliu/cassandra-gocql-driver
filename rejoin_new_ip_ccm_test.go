@@ -23,7 +23,6 @@ package gocql
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -81,43 +80,29 @@ func rejoinAddressFor(t *testing.T, hosts []*HostInfo) string {
 // only listen_address and rpc_address move. That is what makes this different
 // from TestRollingRestartRecovery, where the address never changes.
 //
-// The two subtests disagree, and that is the result:
+// The two subtests take different paths to the same result:
 //
-//   - WithServerEvents passes. A TOPOLOGY_CHANGE for the new address makes the
-//     driver refresh its ring, it finds the same host_id at the new address,
-//     rebuilds, and serves.
+//   - WithServerEvents: a TOPOLOGY_CHANGE for the new address makes the driver
+//     refresh its ring, it finds the same host_id at the new address, rebuilds,
+//     and serves.
 //
-//   - WithoutServerEvents FAILS, and is skipped by default for that reason. It
-//     is the configuration the issue actually describes - #1582 words it as the
-//     topology events "may not fire or are not acted upon", which is routine in
-//     k8s - and it is the reproducer.
+//   - WithoutServerEvents: the configuration the issue actually describes -
+//     #1582 words it as the topology events "may not fire or are not acted
+//     upon", which is routine in k8s. Before the fix this subtest failed: the
+//     ring was refreshed from exactly three places - a TOPOLOGY_CHANGE, a
+//     STATUS_CHANGE UP naming an unknown address, and a control-connection
+//     reconnect - none of them periodic, so with the events lost and the control
+//     host unaffected nothing ever rediscovered the new address and
+//     reconnectDownedHosts dialled the stale one forever. Now every reconnect
+//     tick that finds a DOWN host also requests a ring refresh
+//     (Session.reconnectDownedHostsOnce), which is what finds the move here.
 //
-// Root cause, read off events.go and control.go: the ring is refreshed from
-// exactly three places. A TOPOLOGY_CHANGE, gated on DisableTopologyEvents
-// (events.go:192-194); a STATUS_CHANGE UP naming an IP the ring does not know,
-// gated on DisableNodeStatusEvents (events.go:219-222); and a control-connection
-// reconnect (control.go:445). There is no periodic refresh. So when the events
-// are lost and the control connection is undisturbed - which is the case when
-// the node that moved is not the control host - nothing ever rediscovers the new
-// address, and reconnectDownedHosts goes on dialling the stale one forever.
-// That is the reported symptom exactly.
-//
-// Fixing it is a design change - some bounded periodic or triggered re-read of
-// system.peers - and is deliberately not attempted here. This test is the
-// evidence it is needed.
-//
-// It carries its own build tag because it is destructive to the shared fixture.
-// Moving a node leaves the cluster's system.peers holding a row for the address
-// it vacated, and putting the node back does not remove that row, so a later
-// test sees a peer that will never answer. ccm.AddNode/RemoveNode do not have
-// that problem because nodetool removenode cleans up after them; there is no
-// equivalent for an address change. Run it on a cluster you are willing to
-// rebuild:
+// It carries its own build tag because it is destructive to the shared fixture:
+// a run killed before its cleanup - a package timeout, say - leaves the node
+// parked at the moved address. Run it on a cluster you are willing to rebuild:
 //
 //	make test-integration TEST_INTEGRATION_TAGS="ccm ccmtopology" \
 //	    TEST_OPTS="-run TestRejoinWithNewAddress"
-//
-// and add GOCQL_RUN_KNOWN_FAILURES=1 to include the failing subtest.
 func TestRejoinWithNewAddress(t *testing.T) {
 	require.NoError(t, ccm.AllUp())
 
@@ -132,11 +117,6 @@ func TestRejoinWithNewAddress(t *testing.T) {
 	})
 
 	t.Run("WithoutServerEvents", func(t *testing.T) {
-		if os.Getenv("GOCQL_RUN_KNOWN_FAILURES") == "" {
-			t.Skip("known failure, issue #1884: with topology and status events off " +
-				"nothing refreshes the ring, so the moved host is never rediscovered. " +
-				"Set GOCQL_RUN_KNOWN_FAILURES=1 to run it.")
-		}
 		rejoinAtNewAddress(t, clusterInfo, false)
 	})
 }

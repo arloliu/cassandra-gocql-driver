@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A node that rejoins the cluster at a different address under the same host_id is now
+  rediscovered without server events (#1884). The ring used to be refreshed from exactly
+  three places, none periodic: a TOPOLOGY_CHANGE, a STATUS_CHANGE UP naming an unknown
+  address, and a control-connection reconnect. When those events are lost and the node that
+  moved is not the control host, nothing re-read `system.peers` and the reconnect sweep
+  dialled the stale address forever, reporting "no hosts available in the pool"
+  indefinitely. Every `ReconnectInterval` tick that finds a DOWN host now also requests a
+  ring refresh, issued before the tick's synchronous dials and coalesced by the ring
+  debouncer. Under a stable control connection the tick itself adds two control queries per
+  interval per session while a host is DOWN (a third if the server rejects `system.peers_v2`
+  and the driver falls back to `system.peers`), and nothing while every host is UP; a
+  control-connection reconnect schedules its own refresh independently, as before. Nothing
+  is exported; `ReconnectInterval == 0` disables it along with the sweep.
+
+- The control connection's reconnect no longer waits for the ring refresher. It ended with a
+  synchronous ring refresh, and could be running on the ring flusher's own goroutine: a
+  refresh whose control query failed on write reached `HandleError` synchronously, and a
+  refresh that found no control connection reconnected from `withConnHost`. Either way the
+  wait was on itself, the refresh never completed, and `Session.Close` hung. The reconnect
+  now debounces the refresh and returns; a failed ring refresh is logged at Warning, where
+  before a debounced one failed silently.
+
+- Pool admission, host removal and selection-policy membership now follow ring ownership.
+  `refreshRing` replaces a host that changed address with a new object under the same
+  host_id, and callers that still held the old one could install a pool the replacement then
+  adopted, leave an orphan pool behind a removal, or republish a removed host to the policy.
+  A pool is registered only for the ring's current object and a pool built for a superseded
+  one is replaced; removal takes the ring first; and every membership or state transition of
+  a host runs under one mutex with ownership re-checked inside, serialised with removal. An
+  object the ring no longer owns is left untouched, so a stale DOWN cannot evict a
+  replacement that took the same address.
+
+- The ring snapshot is read on one control connection. `system.local` and the peers table
+  were read through two separate acquisitions, so a control-connection switch between them
+  paired one node's local row with another node's peer table and reconciliation removed the
+  healthy new control host. A snapshot that lists one host_id twice is now rejected whole,
+  where it used to be applied row by row until the second row aborted the refresh part-way.
+
 ## [2.4.1-otter] - 2026-09-05
 
 This release makes retries work under `HostPoolHostPolicy`.

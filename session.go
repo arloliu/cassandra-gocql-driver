@@ -512,27 +512,75 @@ func (s *Session) reconnectDownedHosts(intv time.Duration) {
 	for {
 		select {
 		case <-reconnectTicker.C:
-			s.logger.Debug("Connecting to downed hosts if there is any.")
-			hosts := s.ring.allHosts()
-
-			// Print session.ring for debug.
-			s.logger.Debug("Logging current ring state.", NewLogFieldString("ring", ringString(hosts)))
-
-			for _, h := range hosts {
-				if h.IsUp() {
-					continue
-				}
-				s.logger.Debug("Reconnecting to downed host.",
-					NewLogFieldIP("host_addr", h.ConnectAddress()),
-					NewLogFieldInt("host_port", h.Port()),
-					NewLogFieldString("host_id", h.HostID()))
-				// we let the pool call handleNodeConnected to change the host state
-				s.pool.addHost(h)
-			}
+			s.reconnectDownedHostsOnce()
 		case <-s.ctx.Done():
 			return
 		}
 	}
+}
+
+// reconnectDownedHostsOnce is one tick of reconnectDownedHosts.
+//
+// While at least one unfiltered ring host is DOWN it first requests a ring
+// refresh, then starts a pool fill for every host that is not UP.
+//
+// The refresh is what finds a host that came back at a different address
+// when the server events that would announce it are lost (#1884):
+// the ring is otherwise refreshed only from a topology event,
+// from a status event naming an unknown address,
+// and from a control-connection reconnect,
+// so with events off and the control host unaffected
+// the fill below would dial the stale address forever.
+// refreshRing sees the same host_id at the new address and rebuilds the entry.
+// The request is issued before the fills because a fill dials its first
+// connection synchronously, with the reconnection policy's retries and waits,
+// and must not delay the discovery behind every unreachable host.
+// It goes through the debouncer's immediate trigger,
+// so it is bounded to one request per tick, coalesces with a running refresh,
+// and never waits; on a healthy ring nothing is requested at all.
+func (s *Session) reconnectDownedHostsOnce() {
+	s.logger.Debug("Connecting to downed hosts if there is any.")
+	hosts := s.ring.allHosts()
+
+	// Print session.ring for debug.
+	s.logger.Debug("Logging current ring state.", NewLogFieldString("ring", ringString(hosts)))
+
+	if s.hasUnfilteredDownHost(hosts) {
+		s.ringRefresher.trigger()
+	}
+
+	for _, h := range hosts {
+		if h.IsUp() {
+			continue
+		}
+		s.logger.Debug("Reconnecting to downed host.",
+			NewLogFieldIP("host_addr", h.ConnectAddress()),
+			NewLogFieldInt("host_port", h.Port()),
+			NewLogFieldString("host_id", h.HostID()))
+		// we let the pool call handleNodeConnected to change the host state
+		s.pool.addHost(h)
+	}
+}
+
+// hasUnfilteredDownHost reports whether any host the HostFilter accepts is not UP.
+//
+// A filtered host can sit DOWN in the ring - the control connection adds its
+// host before filtering, and a DOWN sets state before checking the filter -
+// but is never pooled, so it must not keep a ring refresh going on an
+// otherwise healthy ring.
+//
+// Parameters:
+//   - hosts: a ring snapshot
+//
+// Returns:
+//   - bool: true when an accepted host is DOWN
+func (s *Session) hasUnfilteredDownHost(hosts []*HostInfo) bool {
+	for _, h := range hosts {
+		if !h.IsUp() && !s.cfg.filterHost(h) {
+			return true
+		}
+	}
+	return false
 }
 
 // Query generates a new query object for interacting with the database.

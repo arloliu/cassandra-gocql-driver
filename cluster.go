@@ -227,6 +227,14 @@ type ClusterConfig struct {
 
 	// If not zero, gocql attempt to reconnect known DOWN nodes in every ReconnectInterval.
 	//
+	// While a node is DOWN, every interval also re-reads the peers table over the
+	// control connection, so a node that rejoined at a different address is found
+	// without relying on server events; nothing is read while every node is UP.
+	// With DisableInitialHostLookup that re-read can be the first ring refresh of the
+	// session, which is when placeholder host IDs are replaced by the real ones and
+	// the affected pools are rebuilt; that used to wait for the first event- or
+	// reconnect-driven refresh.
+	//
 	// Setting it to zero disables that sweep, and no other component takes the job over: a
 	// host the driver has convicted then stays down until the server sends an UP event for
 	// it. Leave it set unless something outside the driver owns recovery.
