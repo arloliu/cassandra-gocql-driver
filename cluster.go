@@ -366,6 +366,10 @@ type ClusterConfig struct {
 	testRingRefreshHook func()
 	testRingRefreshDone func(err error)
 
+	// testInitPublishHook is called by Session.init immediately before it publishes
+	// the initial hosts to the selection policy (internal, for testing); nil in production.
+	testInitPublishHook func()
+
 	// Metadata configures driver's internal metadata caching and event listening.
 	Metadata MetadataConfig
 }

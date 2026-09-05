@@ -368,6 +368,26 @@ func TestControlHostPublishesLogicalDialTarget(t *testing.T) {
 func startLocalHostFixture(t *testing.T, contactPoint string, tune func(*ClusterConfig, string)) (*localHostServer, *TestServer, int, *Session) {
 	t.Helper()
 
+	script, srv, serverPort := startLocalHostServer(t)
+	cluster := newLocalHostCluster(t, contactPoint, srv.Address, tune)
+
+	session, err := cluster.CreateSession()
+	require.NoError(t, err, "CreateSession")
+	t.Cleanup(session.Close)
+
+	return script, srv, serverPort, session
+}
+
+// startLocalHostServer starts the scripted fake node on its own,
+// for a test that must drive the script before CreateSession returns.
+//
+// Returns:
+//   - *localHostServer: the script driving system.local
+//   - *TestServer: the running fake node
+//   - int: the port the fake node actually listens on
+func startLocalHostServer(t *testing.T) (*localHostServer, *TestServer, int) {
+	t.Helper()
+
 	script := newLocalHostServer("127.0.0.1")
 	srv := newTestServerOpts{
 		addr:                 "127.0.0.1:0",
@@ -382,8 +402,24 @@ func startLocalHostFixture(t *testing.T, contactPoint string, tune func(*Cluster
 	require.NoError(t, err, "parse the test server port")
 	require.NotEqual(t, 9042, serverPort, "the fixture must not land on the default port")
 
+	return script, srv, serverPort
+}
+
+// newLocalHostCluster builds the cluster config startLocalHostFixture uses,
+// without creating the session.
+//
+// Parameters:
+//   - contactPoint: the address handed to NewCluster; "" means the server's own
+//   - serverAddress: where the fake node listens; every dial is redirected there
+//   - tune: optional last-minute config changes
+//
+// Returns:
+//   - *ClusterConfig: ready for CreateSession
+func newLocalHostCluster(t *testing.T, contactPoint, serverAddress string, tune func(*ClusterConfig, string)) *ClusterConfig {
+	t.Helper()
+
 	if contactPoint == "" {
-		contactPoint = srv.Address
+		contactPoint = serverAddress
 	}
 	cluster := NewCluster(contactPoint)
 	cluster.ProtoVersion = int(defaultProto)
@@ -393,7 +429,7 @@ func startLocalHostFixture(t *testing.T, contactPoint string, tune func(*Cluster
 	// Every dial is redirected to the address the fake node actually listens on, so a
 	// contact point the test made up - and any address a translator produced - still
 	// reaches the server and the test fails on its assertion, not on a refused dial.
-	cluster.HostDialer = &redirectHostDialer{target: srv.Address}
+	cluster.HostDialer = &redirectHostDialer{target: serverAddress}
 	// The fixture serves no schema_version,
 	// so schema agreement would never converge and every refresh would burn its 10s budget.
 	// The ring refresh under test does not read schema metadata.
@@ -401,14 +437,10 @@ func startLocalHostFixture(t *testing.T, contactPoint string, tune func(*Cluster
 	require.Equal(t, 9042, cluster.Port, "the fixture relies on the default cfg.Port")
 
 	if tune != nil {
-		tune(cluster, srv.Address)
+		tune(cluster, serverAddress)
 	}
 
-	session, err := cluster.CreateSession()
-	require.NoError(t, err, "CreateSession")
-	t.Cleanup(session.Close)
-
-	return script, srv, serverPort, session
+	return cluster
 }
 
 // offsetLastOctet returns addr with its last octet incremented.

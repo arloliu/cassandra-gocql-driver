@@ -112,12 +112,22 @@ type Session struct {
 
 	logger StructuredLogger
 
+	// hostPublishMu serialises every membership and state transition of a ring
+	// host in the selection policy (AddHost, RemoveHost, HostUp, HostDown)
+	// with removeHost's un-publication of that host.
+	// withOwnedHost re-checks ring ownership inside the critical section,
+	// so a transition that lost the race to a removal does nothing.
+	hostPublishMu sync.Mutex
+
 	// Per-instance test hooks, invoked immediately after ring.owns returned true
 	// in handleHostDown / handleNodeConnected so tests can replace the ring entry
 	// inside the check-to-mutation window.
 	// Default nil (no-op).
 	testAfterOwnsDown      func()
 	testAfterOwnsConnected func()
+	// testAfterNodeConnected runs when handleNodeConnected returns, on every path,
+	// so a test can join that asynchronous callback. Default nil (no-op).
+	testAfterNodeConnected func(host *HostInfo)
 }
 
 func addrsToHosts(addrs []string, defaultPort int, logger StructuredLogger) ([]*HostInfo, error) {
@@ -408,13 +418,33 @@ func (s *Session) init() error {
 	type bulkAddHosts interface {
 		AddHosts([]*HostInfo)
 	}
-	if v, ok := s.policy.(bulkAddHosts); ok {
-		v.AddHosts(hosts)
-	} else {
-		for _, host := range hosts {
-			s.policy.AddHost(host)
-		}
+	// The control connection's heartbeat is already running,
+	// so a reconnect-driven ring refresh can replace one of these objects before this point.
+	// Publish only what the ring still owns, and do it under hostPublishMu,
+	// so that such a removal either precedes this (and the object is skipped)
+	// or follows it (and un-publishes the object again).
+	if s.cfg.testInitPublishHook != nil {
+		s.cfg.testInitPublishHook()
 	}
+	func() {
+		// Scoped so the deferred unlock covers a panicking policy without holding
+		// the mutex across the connection wait that follows.
+		s.hostPublishMu.Lock()
+		defer s.hostPublishMu.Unlock()
+		owned := make([]*HostInfo, 0, len(hosts))
+		for _, host := range hosts {
+			if s.ring.owns(host) {
+				owned = append(owned, host)
+			}
+		}
+		if v, ok := s.policy.(bulkAddHosts); ok {
+			v.AddHosts(owned)
+		} else {
+			for _, host := range owned {
+				s.policy.AddHost(host)
+			}
+		}
+	}()
 
 	readyPolicy, _ := s.policy.(ReadyPolicy)
 	// now loop over connectedCh until it's closed (meaning we've connected to all)
@@ -658,11 +688,61 @@ func (s *Session) executeQuery(qry *internalQuery) (it *Iter) {
 	return iter
 }
 
+// removeHost takes h out of the ring, the selection policy and the pool, in that order.
+//
+// The ring goes first so that no later pool admission or policy publication
+// of h can pass its ownership check (policyConnPool.addHost, withOwnedHost).
+// The policy un-publication runs under hostPublishMu,
+// so a publication that already passed its ownership check either completes before it
+// (and is undone here) or finds the ring changed (and does nothing).
+// The pool is pointer-checked, so an admission that raced ahead of the ring removal
+// registered h's own pool, and this call removes exactly that.
+//
+// Parameters:
+//   - h: the ring object to remove
 func (s *Session) removeHost(h *HostInfo) {
 	s.logger.Warning("Removing host.", NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", h.HostID()))
-	s.policy.RemoveHost(h)
-	s.pool.removeHost(h)
 	s.ring.removeHost(h.HostID())
+	s.unpublishHost(h)
+	s.pool.removeHost(h)
+}
+
+// unpublishHost removes h from the selection policy under hostPublishMu.
+//
+// The unlock is deferred: the policy is application code,
+// and a panic in it is recovered by the calling goroutine's recoverGoroutine,
+// which must not leave every later host transition blocked on this mutex.
+//
+// Parameters:
+//   - h: the object to remove from the policy
+func (s *Session) unpublishHost(h *HostInfo) {
+	s.hostPublishMu.Lock()
+	defer s.hostPublishMu.Unlock()
+	s.policy.RemoveHost(h)
+}
+
+// withOwnedHost runs fn under hostPublishMu, but only if host is the ring's current
+// object for its host ID at that moment.
+//
+// Every membership or state transition of a host in the selection policy goes
+// through here, and removeHost un-publishes under the same mutex after taking the
+// host out of the ring, so a transition and a removal of the same host cannot
+// interleave: whichever runs second sees the other's result.
+//
+// Parameters:
+//   - host: the object the caller holds
+//   - fn: the transition to apply to an owned host
+//
+// Returns:
+//   - bool: true when fn ran
+func (s *Session) withOwnedHost(host *HostInfo, fn func()) bool {
+	s.hostPublishMu.Lock()
+	defer s.hostPublishMu.Unlock()
+	if !s.ring.owns(host) {
+		return false
+	}
+	fn()
+	return true
 }
 
 // hostPoolEmpty reports whether host is the current ring object and its

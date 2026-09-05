@@ -232,33 +232,60 @@ func (s *Session) handleNodeUp(eventIp net.IP, eventPort int) {
 	s.startPoolFill(host)
 }
 
+// startPoolFill admits host's pool and publishes host to the selection policy.
+//
+// Both steps follow ring ownership: the pool admission checks it under the
+// pool's own lock, and the publication runs under hostPublishMu with a fresh
+// check, so a caller that still holds an object refreshRing has since replaced
+// neither registers a pool for it nor puts it back into the policy.
+//
+// Parameters:
+//   - host: the ring object to fill and publish
 func (s *Session) startPoolFill(host *HostInfo) {
+	if !s.ring.owns(host) {
+		return
+	}
 	// we let the pool call handleNodeConnected to change the host state
 	s.pool.addHost(host)
-	s.policy.AddHost(host)
+	s.withOwnedHost(host, func() {
+		s.policy.AddHost(host)
+	})
 }
 
 func (s *Session) handleNodeConnected(host *HostInfo) {
+	if s.testAfterNodeConnected != nil {
+		defer s.testAfterNodeConnected(host)
+	}
 	if !s.ring.owns(host) {
 		return
 	}
 	if s.testAfterOwnsConnected != nil {
 		s.testAfterOwnsConnected()
 	}
-	if _, ok := s.pool.getPoolFor(host); !ok {
-		// The pool was removed or replaced after the fill succeeded; the
-		// host stays in its current state and the replacement's own fill
-		// (or reconnectDownedHosts) owns recovery.
-		return
-	}
 
-	s.logger.Debug("Pool connected to node.",
-		NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldInt("port", host.Port()), NewLogFieldString("host_id", host.HostID()))
+	// The ownership and pool checks, the state change and the policy
+	// publication form one transition under hostPublishMu,
+	// so a removal or a DOWN of the same host cannot interleave with it.
+	published := false
+	s.withOwnedHost(host, func() {
+		if _, ok := s.pool.getPoolFor(host); !ok {
+			// The pool was removed or replaced after the fill succeeded; the
+			// host stays in its current state and the replacement's own fill
+			// (or reconnectDownedHosts) owns recovery.
+			return
+		}
 
-	host.setState(NodeUp)
+		s.logger.Debug("Pool connected to node.",
+			NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldInt("port", host.Port()), NewLogFieldString("host_id", host.HostID()))
 
-	if !s.cfg.filterHost(host) {
-		s.policy.HostUp(host)
+		host.setState(NodeUp)
+
+		if !s.cfg.filterHost(host) {
+			s.policy.HostUp(host)
+			published = true
+		}
+	})
+	if published {
 		s.hostListeners.OnHostUp(HostUpEvent{Host: host})
 	}
 }
@@ -307,14 +334,25 @@ func (s *Session) handleHostDown(host *HostInfo) {
 // Parameters:
 //   - host: the resolved ring object
 func (s *Session) markHostDown(host *HostInfo) {
-	host.setState(NodeDown)
-	if s.cfg.filterHost(host) {
-		return
-	}
+	// State, policy and pool change as one transition under hostPublishMu,
+	// so a late fill success for the same host cannot leave it UP with no pool.
+	// An object the ring no longer owns is left untouched: its state no longer
+	// matters, and reporting it DOWN to a policy that keys by address could
+	// evict a replacement that took the same address.
+	notified := false
+	s.withOwnedHost(host, func() {
+		host.setState(NodeDown)
+		if s.cfg.filterHost(host) {
+			return
+		}
 
-	s.policy.HostDown(host)
-	s.pool.removeHost(host)
-	s.hostListeners.OnHostDown(HostDownEvent{Host: host})
+		s.policy.HostDown(host)
+		s.pool.removeHost(host)
+		notified = true
+	})
+	if notified {
+		s.hostListeners.OnHostDown(HostDownEvent{Host: host})
+	}
 }
 
 const (

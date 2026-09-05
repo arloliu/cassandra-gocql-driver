@@ -429,8 +429,10 @@ func TestHandleHostDown_RespectsHostFilter(t *testing.T) {
 //
 // The replacement's own UP is the barrier — handleNodeConnected only runs once
 // its first connection is registered, so observing it proves the pool exists and is non-empty.
-// What must not appear is a DOWN naming the replacement;
-// the DOWN naming the stale object is expected and documented.
+// Nothing may be reported DOWN: not the replacement, and not the stale object either.
+// markHostDown re-checks ownership inside its critical section and leaves an object
+// the ring no longer owns untouched, because reporting it DOWN to a policy that
+// keys by address could evict a replacement that took the same address.
 func TestHandleHostDown_ReplacementAfterOwnershipCheck(t *testing.T) {
 	session, stale, collector := newPauseRecoverySession(t, nil)
 	replacement := newReplacementHost(t, stale)
@@ -461,9 +463,10 @@ func TestHandleHostDown_ReplacementAfterOwnershipCheck(t *testing.T) {
 	require.NotZero(t, pool.Size(), "the replacement's pool must still hold connections")
 
 	// handleHostDown returned before these assertions, so every effect of the
-	// stale DOWN has already been applied.
-	require.Equal(t, []*HostInfo{stale}, drainHosts(collector.down), "only the stale object may be reported DOWN")
-	require.Equal(t, []*HostInfo{stale}, drainHosts(collector.listenerDown), "only the stale object may reach the listeners")
+	// stale DOWN has already been applied - and there must be none.
+	require.Empty(t, drainHosts(collector.down), "a replaced object must not be reported DOWN to the policy")
+	require.Empty(t, drainHosts(collector.listenerDown), "a replaced object must not reach the listeners")
+	require.Equal(t, NodeUp, stale.State(), "a replaced object is left untouched")
 }
 
 // TestHandleNodeConnected_ReplacementAfterOwnershipCheck closes the mirror window on the UP path:
