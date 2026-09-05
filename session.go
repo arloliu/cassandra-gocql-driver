@@ -1367,12 +1367,43 @@ func (q *Query) Idempotent(value bool) *Query {
 	return q
 }
 
-// Bind sets query arguments of query. This can also be used to rebind new query arguments
-// to an existing query instance.
+// Bind sets query arguments of query.
+// This can also be used to rebind new query arguments to an existing query instance.
+//
+// Binding a value set clears any callback previously set by [Session.Bind] or
+// [Query.Binding]: a query draws its arguments from exactly one of the two.
 //
 // For supported Go to CQL type conversions for query parameters, see Session.Query documentation.
+//
+// Parameters:
+//   - v: query argument values, positional, one per bind marker in the statement
+//
+// Returns:
+//   - *Query: the same query, for chaining
 func (q *Query) Bind(v ...interface{}) *Query {
 	q.values = v
+	q.binding = nil
+	return q
+}
+
+// Binding sets a callback that generates this query's arguments at execution time.
+//
+// The callback receives the prepared statement's metadata and returns the argument
+// values to marshal.
+// It replaces any callback set earlier by [Session.Bind] or a previous Binding call,
+// and clears values previously set by [Query.Bind]:
+// a query draws its arguments from exactly one of the two.
+//
+// The callback is invoked only for statements the driver prepares; see [Session.Bind].
+//
+// Parameters:
+//   - binding: callback returning the argument values, or an error to fail the query
+//
+// Returns:
+//   - *Query: the same query, for chaining
+func (q *Query) Binding(binding func(q *QueryInfo) ([]any, error)) *Query {
+	q.values = nil
+	q.binding = binding
 	return q
 }
 

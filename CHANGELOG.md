@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Query.Binding` sets a query's binding callback after construction,
+  so a query built with `Session.Query` can be switched to a callback
+  and a reusable query's callback can be replaced between executions.
+  It clears any values set by `Query.Bind`:
+  a query draws its arguments from exactly one of the two.
+  Adopted from upstream CASSGO-130 (commit `d452f7b`).
+
+### Fixed
+
+- `Query.Bind` now clears any binding callback the query was carrying.
+  A query obtained from `Session.Bind` and then re-bound with `Bind` kept its callback,
+  and the prepared path lets a callback override bound values unconditionally,
+  so the values you passed to `Bind` were silently discarded
+  and the statement ran with the old callback's arguments instead —
+  operating on whatever row that callback named, with no error raised.
+  Because the routing key was still computed from the discarded values,
+  such a query could additionally prioritise replicas for one partition key
+  while executing another,
+  losing token-aware locality and adding a coordinator hop.
+  `ObserveQuery` also reported the discarded values rather than the executed ones.
+
 ## [2.3.1-otter] - 2026-09-04
 
 This release makes a paused or wedged node recoverable.

@@ -403,3 +403,90 @@ func TestRetryType_IgnoreRethrow(t *testing.T) {
 		resetObserved()
 	}
 }
+
+// TestStaticQueryInfo_OverrideBindingFunction covers switching a reusable query between a
+// binding callback and a static value set in both directions.
+// Adapted from upstream CASSGO-130 (commit d452f7b), which only covered
+// Session.Bind -> Query.Binding; the Query.Bind and second Query.Binding steps are added
+// here because otherwise the test passes even when Bind fails to clear the callback.
+func TestStaticQueryInfo_OverrideBindingFunction(t *testing.T) {
+	session := createSession(t)
+	defer session.Close()
+
+	if err := createTable(session, "CREATE TABLE IF NOT EXISTS gocql_test.static_query_info_override (id int, value text, PRIMARY KEY (id))"); err != nil {
+		t.Fatalf("failed to create table with error '%v'", err)
+	}
+
+	for id, value := range map[int]string{1: "foo", 2: "bar"} {
+		if err := session.Query("INSERT INTO static_query_info_override (id, value) VALUES (?, ?)", id, value).Exec(); err != nil {
+			t.Fatalf("insert into static_query_info_override failed, err '%v'", err)
+		}
+	}
+
+	const stmt = "SELECT id, value FROM static_query_info_override WHERE id = ?"
+
+	// bindingFor returns a callback selecting id, and a counter of how many times the
+	// driver invoked it. The counters are what catch a callback that outlives its setter.
+	bindingFor := func(id int, calls *int) func(q *QueryInfo) ([]any, error) {
+		return func(q *QueryInfo) ([]any, error) {
+			*calls++
+			return []any{id}, nil
+		}
+	}
+
+	assertSelects := func(t *testing.T, qry *Query, wantID int, wantValue string) {
+		t.Helper()
+
+		var id int
+		var value string
+
+		iter := qry.Iter()
+		iter.Scan(&id, &value)
+		if err := iter.Close(); err != nil {
+			t.Fatalf("query failed, err '%v'", err)
+		}
+		if id != wantID {
+			t.Errorf("Expected id %d, but got %d", wantID, id)
+		}
+		if value != wantValue {
+			t.Errorf("Expected value %s, but got %s", wantValue, value)
+		}
+	}
+
+	firstCalls, secondCalls, thirdCalls := 0, 0, 0
+
+	// 1. A query built by Session.Bind runs its callback.
+	qry := session.Bind(stmt, bindingFor(1, &firstCalls))
+	assertSelects(t, qry, 1, "foo")
+
+	// 2. Query.Binding replaces the callback.
+	qry.Binding(bindingFor(2, &secondCalls))
+	assertSelects(t, qry, 2, "bar")
+
+	if firstCalls != 1 {
+		t.Errorf("the replaced callback ran %d times, want 1", firstCalls)
+	}
+
+	// 3. Query.Bind switches back to static values.
+	// Without Bind clearing the callback, the driver would invoke it again and select
+	// row 2, because the prepared path lets a callback override bound values.
+	qry.Bind(1)
+	assertSelects(t, qry, 1, "foo")
+
+	if secondCalls != 1 {
+		t.Errorf("the callback ran %d times, want 1: Bind did not clear it", secondCalls)
+	}
+
+	// 4. Query.Binding switches back to a callback.
+	// A result assertion alone cannot police this direction, since a callback overrides
+	// values on the wire regardless, so the query's own state is checked too.
+	qry.Binding(bindingFor(2, &thirdCalls))
+	if qry.Values() != nil {
+		t.Errorf("Binding left values in place: %v", qry.Values())
+	}
+	assertSelects(t, qry, 2, "bar")
+
+	if thirdCalls != 1 {
+		t.Errorf("the third callback ran %d times, want 1", thirdCalls)
+	}
+}
