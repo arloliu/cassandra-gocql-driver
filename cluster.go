@@ -370,6 +370,10 @@ type ClusterConfig struct {
 	// the initial hosts to the selection policy (internal, for testing); nil in production.
 	testInitPublishHook func()
 
+	// testRingSnapshotHook is called by ringDescriber.GetHosts between its
+	// system.local and its peers read (internal, for testing); nil in production.
+	testRingSnapshotHook func()
+
 	// Metadata configures driver's internal metadata caching and event listening.
 	Metadata MetadataConfig
 }

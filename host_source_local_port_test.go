@@ -23,6 +23,7 @@ package gocql
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strconv"
@@ -66,6 +67,49 @@ type localHostServer struct {
 
 	// broadcastAddress is the value served for the broadcast_address column.
 	broadcastAddress atomic.Pointer[string]
+
+	// peers holds the rows served for the peers table; nil means no peers.
+	peers atomic.Pointer[[]peerRow]
+}
+
+// peerRow is one scripted row of system.peers.
+type peerRow struct {
+	peer           string
+	hostID         string
+	dataCenter     string
+	rack           string
+	releaseVersion string
+	rpcAddress     string
+	tokens         []string
+}
+
+// peerRowColumns lists the columns writePeerRows serves; tokens is a set<text>,
+// the rest are text and parsed by hostInfoFromIter (host_id via ParseUUID,
+// the addresses via net.ParseIP).
+var peerRowColumns = []string{
+	"peer",
+	"host_id",
+	"data_center",
+	"rack",
+	"release_version",
+	"rpc_address",
+	"tokens",
+}
+
+// newPeerRow builds a valid peer row at addr with the given host id and one token.
+//
+// Returns:
+//   - peerRow: passes isValidPeer
+func newPeerRow(hostID, addr string) peerRow {
+	return peerRow{
+		peer:           addr,
+		hostID:         hostID,
+		dataCenter:     "dc1",
+		rack:           "rack1",
+		releaseVersion: "3.11.0",
+		rpcAddress:     addr,
+		tokens:         []string{"-9223372036854775808"},
+	}
 }
 
 // redirectHostDialer dials one fixed address whatever host it is handed.
@@ -478,6 +522,69 @@ func writeEmptyRows(f *framer, stream int) {
 	f.writeInt(0) // rows count
 }
 
+// setPeers changes the rows served by later peers reads.
+//
+// Parameters:
+//   - rows: the rows to serve; nil serves none
+func (s *localHostServer) setPeers(rows []peerRow) {
+	s.peers.Store(&rows)
+}
+
+// writePeerRows writes the scripted peers table.
+//
+// Parameters:
+//   - f: the response frame
+//   - stream: the request's stream id
+func (s *localHostServer) writePeerRows(f *framer, stream int) {
+	var rows []peerRow
+	if p := s.peers.Load(); p != nil {
+		rows = *p
+	}
+
+	f.writeHeader(0, opResult, stream)
+	f.writeInt(resultKindRows)
+	f.writeInt(int32(flagGlobalTableSpec))
+	f.writeInt(int32(len(peerRowColumns)))
+	f.writeString("system")
+	f.writeString("peers")
+	for _, name := range peerRowColumns {
+		f.writeString(name)
+		if name == "tokens" {
+			f.writeShort(uint16(TypeSet))
+			f.writeShort(uint16(TypeVarchar))
+			continue
+		}
+		f.writeShort(uint16(TypeVarchar))
+	}
+	f.writeInt(int32(len(rows)))
+	for _, row := range rows {
+		f.writeBytes([]byte(row.peer))
+		f.writeBytes([]byte(row.hostID))
+		f.writeBytes([]byte(row.dataCenter))
+		f.writeBytes([]byte(row.rack))
+		f.writeBytes([]byte(row.releaseVersion))
+		f.writeBytes([]byte(row.rpcAddress))
+		f.writeBytes(encodeTextSet(row.tokens))
+	}
+}
+
+// encodeTextSet encodes a set<text> value as protocol v3+ does:
+// a 4-byte element count, then each element as a 4-byte length and its bytes.
+//
+// Returns:
+//   - []byte: the collection payload
+func encodeTextSet(values []string) []byte {
+	buf := make([]byte, 4, 4+8*len(values))
+	binary.BigEndian.PutUint32(buf, uint32(len(values)))
+	for _, v := range values {
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(v)))
+		buf = append(buf, n[:]...)
+		buf = append(buf, v...)
+	}
+	return buf
+}
+
 // setBroadcastAddress changes the broadcast_address served by later system.local reads.
 //
 // Parameters:
@@ -522,6 +629,10 @@ func (s *localHostServer) handle(_ *TestServer, reqFrame, respFrame *framer) err
 		}
 		if strings.Contains(query, "system.local") {
 			s.writeLocalRow(respFrame, stream)
+			return nil
+		}
+		if strings.Contains(query, "system.peers") {
+			s.writePeerRows(respFrame, stream)
 			return nil
 		}
 		writeEmptyRows(respFrame, stream)

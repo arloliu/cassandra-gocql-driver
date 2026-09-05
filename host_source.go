@@ -45,6 +45,9 @@ const connectAddressSourceCaller = "connect_address"
 var (
 	ErrCannotFindHost    = errors.New("cannot find host")
 	ErrHostAlreadyExists = errors.New("host already exists")
+
+	// errDuplicateHostID reports a ring snapshot that lists one host_id at two addresses.
+	errDuplicateHostID = errors.New("gocql: duplicate host_id in ring snapshot")
 )
 
 type nodeState int32
@@ -748,16 +751,16 @@ func (s *Session) hostInfoFromIter(iter *Iter, connectAddress net.IP, defaultPor
 	return host, nil
 }
 
-// Ask the control node for the local host info
-func (r *ringDescriber) getLocalHostInfo() (*HostInfo, error) {
-	if r.session.control == nil {
-		return nil, errNoControl
-	}
-
-	iter := r.session.control.withConnHost(func(ch *connHost) *Iter {
-		return ch.conn.querySystemLocal(context.TODO())
-	})
-
+// getLocalHostInfo reads system.local over the given control connection.
+//
+// Parameters:
+//   - ch: the control connection the whole snapshot is read from
+//
+// Returns:
+//   - *HostInfo: the control host as system.local describes it
+//   - error: if the row could not be read or parsed
+func (r *ringDescriber) getLocalHostInfo(ch *connHost) (*HostInfo, error) {
+	iter := ch.conn.querySystemLocal(context.TODO())
 	if iter == nil {
 		return nil, errNoControl
 	}
@@ -790,16 +793,17 @@ func (r *ringDescriber) getLocalHostInfo() (*HostInfo, error) {
 	return host, nil
 }
 
-// Ask the control node for host info on all it's known peers
-func (r *ringDescriber) getClusterPeerInfo(localHost *HostInfo) ([]*HostInfo, error) {
-	if r.session.control == nil {
-		return nil, errNoControl
-	}
-
-	iter := r.session.control.withConnHost(func(ch *connHost) *Iter {
-		return ch.conn.querySystemPeers(context.TODO(), localHost.version)
-	})
-
+// getClusterPeerInfo reads the peers table over the given control connection.
+//
+// Parameters:
+//   - ch: the control connection the whole snapshot is read from
+//   - localHost: the control host, whose version selects the peers table
+//
+// Returns:
+//   - []*HostInfo: every valid peer row; invalid rows are logged and skipped
+//   - error: if the rows could not be read
+func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([]*HostInfo, error) {
+	iter := ch.conn.querySystemPeers(context.TODO(), localHost.version)
 	if iter == nil {
 		return nil, errNoControl
 	}
@@ -844,22 +848,80 @@ func isValidPeer(host *HostInfo) bool {
 		len(host.tokens) == 0)
 }
 
-// GetHosts returns a list of hosts found via queries to system.local and system.peers
+// duplicateHostID finds the first host_id that appears twice in hosts.
+//
+// Parameters:
+//   - hosts: the assembled snapshot, control host first
+//
+// Returns:
+//   - *HostInfo: the earlier occurrence
+//   - *HostInfo: the later occurrence
+//   - bool: true when a duplicate was found
+func duplicateHostID(hosts []*HostInfo) (*HostInfo, *HostInfo, bool) {
+	seen := make(map[string]*HostInfo, len(hosts))
+	for _, host := range hosts {
+		if first, ok := seen[host.HostID()]; ok {
+			return first, host, true
+		}
+		seen[host.HostID()] = host
+	}
+	return nil, nil, false
+}
+
+// GetHosts reads one node's view of the ring: its system.local row and its peers table.
+//
+// Both reads go to the control connection that is current on entry,
+// so a control-connection switch between them cannot pair one node's local row
+// with another node's peer table (which lists the first node and omits the second),
+// a mix that reconciliation would act on by removing the healthy new control host.
+// If that connection dies between the reads the peers query fails
+// and the whole snapshot is rejected; no partial snapshot is returned.
+//
+// A snapshot that lists one host_id twice is rejected as well:
+// refreshRing assumes one row per host_id,
+// and would otherwise apply the earlier rows and then abort part-way through,
+// or pick one of two addresses on no evidence.
+//
+// Returns:
+//   - []*HostInfo: the control host first, then the peers; on error the previous snapshot
+//   - string: the partitioner; on error the previous one
+//   - error: no control connection, a failed read, or a duplicated host_id
 func (r *ringDescriber) GetHosts() ([]*HostInfo, string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	localHost, err := r.getLocalHostInfo()
-	if err != nil {
-		return r.prevHosts, r.prevPartitioner, err
+	if r.session.control == nil {
+		return r.prevHosts, r.prevPartitioner, errNoControl
 	}
 
-	peerHosts, err := r.getClusterPeerInfo(localHost)
+	var (
+		localHost *HostInfo
+		peerHosts []*HostInfo
+		err       error
+	)
+	noConn := r.session.control.withConnHost(func(ch *connHost) *Iter {
+		localHost, err = r.getLocalHostInfo(ch)
+		if err != nil {
+			return nil
+		}
+		if r.session.cfg.testRingSnapshotHook != nil {
+			r.session.cfg.testRingSnapshotHook()
+		}
+		peerHosts, err = r.getClusterPeerInfo(ch, localHost)
+		return nil
+	})
+	if noConn != nil {
+		return r.prevHosts, r.prevPartitioner, noConn.err
+	}
 	if err != nil {
 		return r.prevHosts, r.prevPartitioner, err
 	}
 
 	hosts := append([]*HostInfo{localHost}, peerHosts...)
+	if first, again, dup := duplicateHostID(hosts); dup {
+		return r.prevHosts, r.prevPartitioner, fmt.Errorf("host %s listed at %s and at %s: %w",
+			first.HostID(), first.ConnectAddress(), again.ConnectAddress(), errDuplicateHostID)
+	}
 	var partitioner string
 	if len(hosts) > 0 {
 		partitioner = hosts[0].Partitioner()
