@@ -5,7 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.4.2-otter] - 2026-09-06
+
+This release makes a node that moved to a new address rediscoverable without server events (#1884)
+and closes the two gaps 2.4.1-otter left in retries under `HostPoolHostPolicy` (#812).
+Every reconnect tick that finds a DOWN host now also re-reads the peers tables,
+so a rejoined node is found within `ReconnectInterval` even when the topology event was lost.
+Chasing that fix surfaced three latent defects in the same paths, all fixed here:
+a control-connection reconnect that could wait on itself and hang `Session.Close`,
+pool admission and policy publication that could act on a host object the ring had already replaced,
+and a ring snapshot read across two control connections that could evict the healthy new control host.
+On the query side, a one-shot selection policy now gets its retry across hosts also when speculative execution is configured,
+and a first sample with no usable connection no longer ends the query with zero attempts;
+the selection budget is one selection per up, pooled host for the whole query.
+Nothing exported changes.
 
 ### Fixed
 
