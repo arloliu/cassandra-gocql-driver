@@ -57,14 +57,22 @@ type writeFailure struct {
 type faultingDialer struct {
 	target string
 
-	mu        sync.Mutex
-	statement []byte
-	refuse    bool
-	armNew    bool
-	armed     map[*faultConn]bool
-	conns     []*faultConn
-	dialTimes []time.Time
-	failures  []writeFailure
+	mu             sync.Mutex
+	statement      []byte
+	refuse         bool
+	armNew         bool
+	gateRegister   bool
+	registerParked chan *faultConn
+	parkDials      bool
+	dialParked     chan struct{}
+	dialGate       chan struct{}
+	dialCanceled   atomic.Int64
+	dialAttempts   atomic.Int64
+	peersReads     atomic.Int64
+	armed          map[*faultConn]bool
+	conns          []*faultConn
+	dialTimes      []time.Time
+	failures       []writeFailure
 
 	// heartbeats counts OPTIONS frames written through after a connection's
 	// STARTUP, on any connection: connection setup sends OPTIONS before STARTUP,
@@ -91,11 +99,29 @@ func (d *faultingDialer) setFailingStatement(substring string) {
 
 // DialHost dials the fixed target and wraps the connection.
 func (d *faultingDialer) DialHost(ctx context.Context, host *HostInfo) (*DialedHost, error) {
+	d.dialAttempts.Add(1)
 	d.mu.Lock()
 	refuse := d.refuse
 	d.mu.Unlock()
 	if refuse {
 		return nil, errGatedDialerClosed
+	}
+
+	d.mu.Lock()
+	park, parked, gate := d.parkDials, d.dialParked, d.dialGate
+	d.mu.Unlock()
+	if park {
+		select {
+		case parked <- struct{}{}:
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			d.dialCanceled.Add(1)
+			return nil, ctx.Err()
+		case <-gate:
+			// released; dial for real
+		}
 	}
 
 	var dialer net.Dialer
@@ -111,8 +137,31 @@ func (d *faultingDialer) DialHost(ctx context.Context, host *HostInfo) (*DialedH
 	if d.armNew {
 		d.armed[fc] = true
 	}
+	if d.gateRegister {
+		fc.registerGate = make(chan struct{})
+		fc.registerParkedCh = d.registerParked
+	}
 	d.mu.Unlock()
 	return &DialedHost{Conn: fc}, nil
+}
+
+// setGateRegisterNew makes every connection dialled from now on park its REGISTER
+// write until releaseRegisterGates is called; a parked connection is sent on ch.
+func (d *faultingDialer) setGateRegisterNew(ch chan *faultConn) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.gateRegister = true
+	d.registerParked = ch
+}
+
+// releaseRegisterGates opens the REGISTER gate on every gated connection.
+func (d *faultingDialer) releaseRegisterGates() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.gateRegister = false
+	for _, fc := range d.conns {
+		fc.releaseRegisterGate()
+	}
 }
 
 // dials returns when each connection was dialled, in order.
@@ -151,11 +200,45 @@ func (d *faultingDialer) setRefuse(on bool) {
 	d.refuse = on
 }
 
+// parkNextDials makes every dial from now on park until the dial context is
+// cancelled or releaseDials is called; a parked dial is signalled on parked.
+//
+// Returns:
+//   - parked: receives once per dial that has parked
+func (d *faultingDialer) parkNextDials() (parked <-chan struct{}) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.parkDials = true
+	d.dialParked = make(chan struct{}, 8)
+	d.dialGate = make(chan struct{})
+	return d.dialParked
+}
+
+// releaseDials stops parking and lets any parked dial proceed.
+func (d *faultingDialer) releaseDials() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.parkDials {
+		d.parkDials = false
+		close(d.dialGate)
+	}
+}
+
 // dialCount returns how many connections were dialled so far.
 func (d *faultingDialer) dialCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return len(d.conns)
+}
+
+// lastConn returns the most recently dialled connection, or nil if none.
+func (d *faultingDialer) lastConn() *faultConn {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.conns) == 0 {
+		return nil
+	}
+	return d.conns[len(d.conns)-1]
 }
 
 // recordedFailures returns a copy of the failed writes.
@@ -188,10 +271,51 @@ type faultConn struct {
 
 	// started is set once STARTUP was written on this connection.
 	started atomic.Bool
+
+	// registerGate, when non-nil, parks a REGISTER write until releaseRegisterGate
+	// or Close, so a test can hold a candidate inside setupConn. registerParkedCh
+	// receives the connection once such a write has parked.
+	registerGate     chan struct{}
+	registerParkedCh chan *faultConn
+	releaseOnce      sync.Once
+	// transportCloseInvoked is set when Close was called on this connection.
+	// It marks that a close was initiated, not that the OS socket is fully torn
+	// down, which is why tests assert on it rather than on Conn.Closed().
+	transportCloseInvoked atomic.Bool
 }
 
-// Write fails the writes the dialer names and counts post-STARTUP OPTIONS writes.
+// releaseRegisterGate opens this connection's REGISTER gate; safe to call twice.
+func (c *faultConn) releaseRegisterGate() {
+	if c.registerGate != nil {
+		c.releaseOnce.Do(func() { close(c.registerGate) })
+	}
+}
+
+// Close records that the connection was closed and unblocks any parked write.
+func (c *faultConn) Close() error {
+	c.transportCloseInvoked.Store(true)
+	c.releaseRegisterGate()
+	return c.Conn.Close()
+}
+
+// Write fails the writes the dialer names, parks an armed REGISTER write, and
+// counts post-STARTUP OPTIONS writes.
 func (c *faultConn) Write(p []byte) (int, error) {
+	if len(p) >= 9 && frameOp(p[4]) == opQuery && bytes.Contains(p, []byte("system.peers")) {
+		c.dialer.peersReads.Add(1)
+	}
+	if gate := c.registerGate; gate != nil && len(p) >= 9 && frameOp(p[4]) == opRegister {
+		if c.registerParkedCh != nil {
+			select {
+			case c.registerParkedCh <- c:
+			default:
+			}
+		}
+		<-gate
+		if c.transportCloseInvoked.Load() {
+			return 0, errInjectedWrite
+		}
+	}
 	if c.dialer.shouldFail(c, p) {
 		return 0, errInjectedWrite
 	}

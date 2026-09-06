@@ -1002,6 +1002,17 @@ func (pool *hostConnPool) fillingStopped(err error) {
 	host := pool.host
 	pool.mu.Unlock()
 
+	// A fill cancelled by session shutdown must not convict its host: the session
+	// context is cancelled before the refreshers are joined in Close, so a fill in
+	// flight then fails, and marking the host DOWN here would fire the user's
+	// HostDown callback during shutdown. Only ctx cancellation is skipped; every
+	// other failure still convicts as before. fillingStopped already did not check
+	// pool.closed, so a post-shutdown conviction was possible before this; the
+	// cancel is one more trigger, not the first.
+	if pool.session.ctx.Err() != nil {
+		return
+	}
+
 	// if we errored and the size is now zero, make sure the host is marked as down
 	// see https://github.com/apache/cassandra-gocql-driver/issues/1614
 	pool.logger.Debug("Logging number of connections of pool after filling stopped.",

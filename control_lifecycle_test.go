@@ -236,6 +236,51 @@ func TestSchemaRefreshAfterReconnectIsDebounced(t *testing.T) {
 	require.NoError(t, f.awaitSchemaDone(t, "the debounced schema refresh's result"))
 }
 
+// TestControlConnHeartbeatReconnectsAfterRecoveredFailure proves the control
+// heartbeat recovers a failed OPTIONS through its own reconnect path, not the
+// transport error handler.
+//
+// The scripted node answers a post-startup OPTIONS (a heartbeat) with an error
+// frame, so the heartbeat's writeFrame reaches its "case error" arm and goes to
+// reconn, which reconnects; the reconnect's own startup OPTIONS still succeeds.
+// The test joins the reconnect's completion event rather than polling, and
+// asserts the heartbeat-failure log was written and no control-connection-error
+// warning was.
+func TestControlConnHeartbeatReconnectsAfterRecoveredFailure(t *testing.T) {
+	reconnectDone := make(chan struct{}, 8)
+	f := newSnapshotFixture(t, func(cluster *ClusterConfig) {
+		cluster.testControlReconnectDone = func() {
+			select {
+			case reconnectDone <- struct{}{}:
+			default:
+			}
+		}
+	})
+	f.drain()
+
+	before := f.session.control.getConn()
+	require.NotNil(t, before)
+	errorsBefore := len(f.logger.withMessage("Control connection error."))
+
+	// Fail the heartbeat's OPTIONS, then join the reconnect it drives. Disarm as
+	// soon as one reconnect completed, before the new connection's own heartbeat
+	// fails and storms.
+	f.script.failHeartbeatOptions.Store(true)
+	select {
+	case <-reconnectDone:
+	case <-time.After(lifecycleBudget):
+		t.Fatal("the heartbeat did not drive a reconnect after its OPTIONS failed")
+	}
+	f.script.failHeartbeatOptions.Store(false)
+
+	require.NotSame(t, before, f.session.control.getConn(),
+		"the heartbeat's reconnect must have replaced the control connection")
+	require.NotEmpty(t, f.logger.withMessage("Control connection heartbeat failed."),
+		"the heartbeat-failure path must have been taken")
+	require.Len(t, f.logger.withMessage("Control connection error."), errorsBefore,
+		"the transport error handler must not have been the entry point")
+}
+
 // TestSchemaRefreshFailureLogsWarning proves a schema refresh that nobody waits
 // for still logs its failure: the node fails the keyspace metadata fetch, the
 // refresh fails inside the flusher, and the warning is the only trace.

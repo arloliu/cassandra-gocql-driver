@@ -242,12 +242,18 @@ func (s *Session) handleNodeUp(eventIp net.IP, eventPort int) {
 // Parameters:
 //   - host: the ring object to fill and publish
 func (s *Session) startPoolFill(host *HostInfo) {
+	if s.cfg.testStartPoolFillStart != nil {
+		s.cfg.testStartPoolFillStart(host)
+	}
 	// we let the pool call handleNodeConnected to change the host state
 	s.pool.addHost(host)
 	s.withOwnedHost(host, func() bool {
 		s.policy.AddHost(host)
 		return true
 	})
+	if s.cfg.testStartPoolFillDone != nil {
+		s.cfg.testStartPoolFillDone(host)
+	}
 }
 
 func (s *Session) handleNodeConnected(host *HostInfo) {

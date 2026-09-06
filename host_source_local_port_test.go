@@ -79,6 +79,51 @@ type localHostServer struct {
 	// schema metadata fetch (its statements are prepared) without touching the
 	// raw reads a ring refresh and a schema agreement wait issue.
 	failExecutes atomic.Bool
+
+	// failHeartbeatOptions makes a post-startup OPTIONS (a control heartbeat)
+	// answer with a server error frame, through heartbeatOptionsResp, which the
+	// server calls only after that connection completed startup. The heartbeat
+	// then reaches its own reconnect path rather than the transport-write path,
+	// and a reconnect's own startup OPTIONS still succeeds.
+	failHeartbeatOptions atomic.Bool
+
+	// hangQuery, when set, makes a query whose text contains it never answered:
+	// the server signals hangEntered and blocks on its context, so the client
+	// query waits for a response that never comes until the connection is closed.
+	hangQuery   atomic.Pointer[string]
+	hangEntered chan struct{}
+}
+
+// setHangQuery makes queries whose text contains substr hang unanswered, and
+// returns the channel that receives once such a query has parked server-side.
+//
+// Parameters:
+//   - substr: the query substring to hang on
+//
+// Returns:
+//   - <-chan struct{}: receives once a matching query has parked
+func (s *localHostServer) setHangQuery(substr string) <-chan struct{} {
+	s.hangEntered = make(chan struct{}, 1)
+	s.hangQuery.Store(&substr)
+	return s.hangEntered
+}
+
+// heartbeatOptionsResp fails a post-startup OPTIONS when armed.
+//
+// Parameters:
+//   - respFrame: the response frame to write
+//   - stream: the request's stream id
+//
+// Returns:
+//   - bool: true if it wrote a response (the caller must not write another)
+func (s *localHostServer) heartbeatOptionsResp(respFrame *framer, stream int) bool {
+	if !s.failHeartbeatOptions.Load() {
+		return false
+	}
+	respFrame.writeHeader(0, opError, stream)
+	respFrame.writeInt(ErrCodeServer)
+	respFrame.writeString("scripted heartbeat options failure")
+	return true
 }
 
 // peerRow is one scripted row of system.peers.
@@ -89,6 +134,7 @@ type peerRow struct {
 	rack           string
 	releaseVersion string
 	rpcAddress     string
+	schemaVersion  string
 	tokens         []string
 }
 
@@ -102,8 +148,14 @@ var peerRowColumns = []string{
 	"rack",
 	"release_version",
 	"rpc_address",
+	"schema_version",
 	"tokens",
 }
+
+// localSchemaVersion is the schema_version the fixture serves for its own node
+// and, by default, for every peer, so a schema agreement wait converges unless a
+// test deliberately serves a peer on a different version.
+const localSchemaVersion = "5f0e2a2e-0000-4000-8000-00000000cafe"
 
 // newPeerRow builds a valid peer row at addr with the given host id and one token.
 //
@@ -117,6 +169,7 @@ func newPeerRow(hostID, addr string) peerRow {
 		rack:           "rack1",
 		releaseVersion: "3.11.0",
 		rpcAddress:     addr,
+		schemaVersion:  localSchemaVersion,
 		tokens:         []string{"-9223372036854775808"},
 	}
 }
@@ -172,7 +225,7 @@ func newLocalHostServer(rpcAddress string) *localHostServer {
 		rpcAddress:     rpcAddress,
 	}
 	srv.setBroadcastAddress(rpcAddress)
-	srv.setSchemaVersion("5f0e2a2e-0000-4000-8000-00000000cafe")
+	srv.setSchemaVersion(localSchemaVersion)
 	return srv
 }
 
@@ -474,6 +527,7 @@ func startLocalHostServer(t *testing.T) (*localHostServer, *TestServer, int) {
 		addr:                 "127.0.0.1:0",
 		protocol:             defaultProto,
 		customRequestHandler: script.handle,
+		optionsRespFn:        script.heartbeatOptionsResp,
 	}.newServer(t, testServerContext(t))
 	t.Cleanup(srv.Stop)
 
@@ -586,12 +640,15 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 	f.writeString("peers")
 	for _, name := range peerRowColumns {
 		f.writeString(name)
-		if name == "tokens" {
+		switch name {
+		case "tokens":
 			f.writeShort(uint16(TypeSet))
 			f.writeShort(uint16(TypeVarchar))
-			continue
+		case "schema_version":
+			f.writeShort(uint16(TypeUUID))
+		default:
+			f.writeShort(uint16(TypeVarchar))
 		}
-		f.writeShort(uint16(TypeVarchar))
 	}
 	f.writeInt(int32(len(rows)))
 	for _, row := range rows {
@@ -601,8 +658,28 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 		f.writeBytes([]byte(row.rack))
 		f.writeBytes([]byte(row.releaseVersion))
 		f.writeBytes([]byte(row.rpcAddress))
+		f.writeBytes(encodeUUIDColumn(row.schemaVersion))
 		f.writeBytes(encodeTextSet(row.tokens))
 	}
+}
+
+// encodeUUIDColumn encodes a UUID string as the 16-byte CQL uuid value, or an
+// empty value when the string is empty so the peer reads as having no version.
+//
+// Parameters:
+//   - v: the UUID string, or empty
+//
+// Returns:
+//   - []byte: the 16-byte encoding, or nil for an empty string
+func encodeUUIDColumn(v string) []byte {
+	if v == "" {
+		return nil
+	}
+	u, err := ParseUUID(v)
+	if err != nil {
+		panic(fmt.Sprintf("invalid scripted schema_version %q: %v", v, err))
+	}
+	return u.Bytes()
 }
 
 // encodeTextSet encodes a set<text> value as protocol v3+ does:
@@ -642,7 +719,7 @@ func (s *localHostServer) setBroadcastAddress(addr string) {
 //
 // Returns:
 //   - error: if the request body could not be read
-func (s *localHostServer) handle(_ *TestServer, reqFrame, respFrame *framer) error {
+func (s *localHostServer) handle(srv *TestServer, reqFrame, respFrame *framer) error {
 	stream := reqFrame.header.stream
 
 	switch reqFrame.header.op {
@@ -652,6 +729,19 @@ func (s *localHostServer) handle(_ *TestServer, reqFrame, respFrame *framer) err
 		respFrame.writeHeader(0, opSupported, stream)
 		respFrame.writeShort(0)
 	case opPrepare:
+		if h := s.hangQuery.Load(); h != nil {
+			if q, err := reqFrame.readLongString(); err == nil && strings.Contains(q, *h) {
+				select {
+				case s.hangEntered <- struct{}{}:
+				default:
+				}
+				// Park until the server stops, then write a late, ignored response.
+				<-srv.ctx.Done()
+				respFrame.writeHeader(0, opResult, stream)
+				respFrame.writeInt(resultKindVoid)
+				return nil
+			}
+		}
 		respFrame.writeHeader(0, opResult, stream)
 		respFrame.writeInt(resultKindPrepared)
 		respFrame.writeShortBytes([]byte{0, 0, 0, 0, 0, 0, 0, 1})
@@ -672,6 +762,19 @@ func (s *localHostServer) handle(_ *TestServer, reqFrame, respFrame *framer) err
 		query, err := reqFrame.readLongString()
 		if err != nil {
 			return err
+		}
+		if h := s.hangQuery.Load(); h != nil && strings.Contains(query, *h) {
+			select {
+			case s.hangEntered <- struct{}{}:
+			default:
+			}
+			// Park until the server stops, then write a (now-ignored) late response
+			// so process does not touch an empty frame. The client has long since
+			// seen its connection close by then.
+			<-srv.ctx.Done()
+			respFrame.writeHeader(0, opResult, stream)
+			respFrame.writeInt(resultKindVoid)
+			return nil
 		}
 		if strings.Contains(query, "schema_version") && strings.Contains(query, "system.local") {
 			s.writeSchemaVersionRow(respFrame, stream)

@@ -119,6 +119,17 @@ type Session struct {
 	// so a transition that lost the race to a removal does nothing.
 	hostPublishMu sync.Mutex
 
+	// hostPublishClosed gates host publication on shutdown. Close stores true
+	// before it cancels the session context, and withOwnedHost reads it inside
+	// hostPublishMu, so a policy publication scheduled by a late pool fill is
+	// rejected. The narrow property this buys: Close itself takes no
+	// hostPublishMu, so it cannot block on, or self-deadlock against, an
+	// application policy callback that this path would run under that mutex. It
+	// does not make Close independent of every callback: an already-admitted
+	// callback still runs to completion, and an existing flusher join elsewhere
+	// in Close can still wait on a callback or its mutex dependencies.
+	hostPublishClosed atomic.Bool
+
 	// Per-instance test hooks, invoked immediately after ring.owns returned true
 	// in handleHostDown / handleNodeConnected so tests can replace the ring entry
 	// inside the check-to-mutation window.
@@ -678,6 +689,31 @@ func (s *Session) Close() {
 	s.isClosing = true
 	s.sessionStateMu.Unlock()
 
+	// Reject host publications not yet admitted, before anything else in Close
+	// so a late pool fill cannot re-publish a host as it tears down.
+	s.hostPublishClosed.Store(true)
+
+	// Latch the control connection closing and snapshot what it must close, then
+	// cancel the session context, then do the physical closes. The order matters:
+	// latchAndSnapshot only latches and reads memory, so it cannot block; the
+	// cancel unwinds any cooperative in-flight work (dials, TLS, startup, schema
+	// agreement waits) before the refreshers are joined below, so a reconnect
+	// running on a flusher's goroutine cannot hold the join forever; and the
+	// physical closes run after the cancel because Conn.Close can reach the
+	// application logger synchronously.
+	var controlSnap controlSnapshot
+	if s.control != nil {
+		controlSnap = s.control.latchAndSnapshot()
+	}
+
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	if s.control != nil {
+		s.control.closeSnapshot(controlSnap)
+	}
+
 	if s.pool != nil {
 		s.pool.Close()
 	}
@@ -686,20 +722,12 @@ func (s *Session) Close() {
 		s.schemaDescriber.schemaRefresher.stop()
 	}
 
-	if s.control != nil {
-		s.control.close()
-	}
-
 	if s.nodeEvents != nil {
 		s.nodeEvents.stop()
 	}
 
 	if s.ringRefresher != nil {
 		s.ringRefresher.stop()
-	}
-
-	if s.cancel != nil {
-		s.cancel()
 	}
 
 	s.sessionStateMu.Lock()
@@ -771,13 +799,21 @@ func (s *Session) unpublishHost(h *HostInfo) {
 	s.policy.RemoveHost(h)
 }
 
-// withOwnedHost runs fn under hostPublishMu, but only if host is the ring's current
-// object for its host ID at that moment.
+// withOwnedHost runs fn under hostPublishMu, but only if the session is not
+// shutting down and host is the ring's current object for its host ID at that
+// moment.
 //
 // Every membership or state transition of a host in the selection policy goes
 // through here, and removeHost un-publishes under the same mutex after taking the
 // host out of the ring, so a transition and a removal of the same host cannot
 // interleave: whichever runs second sees the other's result.
+//
+// The shutdown gate rejects any transition not yet admitted once Close has set
+// hostPublishClosed: a pool fill that finishes after Close and reaches here does
+// not re-publish its host. An already-admitted callback (past this check, still
+// running) is not interrupted. Close does not take hostPublishMu, so it does not
+// wait on this path's callback; it makes no claim about callbacks awaited by an
+// existing flusher join elsewhere in Close.
 //
 // Parameters:
 //   - host: the object the caller holds
@@ -788,6 +824,9 @@ func (s *Session) unpublishHost(h *HostInfo) {
 func (s *Session) withOwnedHost(host *HostInfo, fn func() bool) bool {
 	s.hostPublishMu.Lock()
 	defer s.hostPublishMu.Unlock()
+	if s.hostPublishClosed.Load() {
+		return false
+	}
 	if !s.ring.owns(host) {
 		return false
 	}

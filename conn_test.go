@@ -1279,6 +1279,18 @@ func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, star
 	}
 	respFrame := newFramer(nil, version, GlobalTypes)
 
+	// A post-startup OPTIONS (a control heartbeat) can be intercepted here even
+	// when a customRequestHandler is set, so a test can fail heartbeats while
+	// leaving each connection's own startup OPTIONS negotiation to succeed.
+	// Only on the custom-handler path: the default path below runs optionsRespFn
+	// itself, so calling it here too would double-invoke it.
+	if srv.customRequestHandler != nil && head.op == opOptions &&
+		startupCompleted != nil && *startupCompleted && srv.optionsRespFn != nil {
+		if srv.optionsRespFn(respFrame, head.stream) {
+			goto finish
+		}
+	}
+
 	if srv.customRequestHandler != nil {
 		if err := srv.customRequestHandler(srv, reqFrame, respFrame); err != nil {
 			srv.errorLocked(err)

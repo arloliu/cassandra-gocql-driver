@@ -32,6 +32,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -58,13 +59,36 @@ type controlConn struct {
 	// early (e.g. via a recovered panic). The receiver only reads it once
 	// from the heartBeat select.
 	quit chan struct{}
+
+	// lifecycleMu serialises the terminal close latch, the candidate set and
+	// the publication of a connection, so that a setup racing Session.Close
+	// either publishes before close latched (and close then owns and closes the
+	// published connection) or finds the closing state (and does not publish).
+	lifecycleMu sync.Mutex
+	// candidates holds every connection dialled for the control connection that
+	// has neither been published nor closed by its caller yet, so that a
+	// concurrent close can close the ones still in flight. Guarded by lifecycleMu.
+	candidates map[*Conn]struct{}
+}
+
+// errControlConnClosing reports that the control connection is closing, so a
+// reconnect must stop rather than dial another host or fall back to contact
+// points. A connection returned alongside it is already closed.
+var errControlConnClosing = errors.New("gocql: control connection is closing")
+
+// controlSnapshot is what close() latched: the published connection, if any,
+// and every candidate still in flight, so both can be closed outside lifecycleMu.
+type controlSnapshot struct {
+	published  *connHost
+	candidates []*Conn
 }
 
 func createControlConn(session *Session) *controlConn {
 	control := &controlConn{
-		session: session,
-		quit:    make(chan struct{}, 1),
-		retry:   &SimpleRetryPolicy{NumRetries: 3},
+		session:    session,
+		quit:       make(chan struct{}, 1),
+		retry:      &SimpleRetryPolicy{NumRetries: 3},
+		candidates: map[*Conn]struct{}{},
 	}
 
 	control.conn.Store((*connHost)(nil))
@@ -83,6 +107,8 @@ func (c *controlConn) heartBeat() {
 	// Session.Close, but reconnects still work.
 	defer recoverGoroutine(c.session.logger, "controlConn.heartBeat", nil)
 
+	// If close() latched controlConnClosing before this goroutine started, the
+	// CAS fails and the heartbeat exits at once; the terminal state stands.
 	if !atomic.CompareAndSwapInt32(&c.state, controlConnStarting, controlConnStarted) {
 		return
 	}
@@ -276,25 +302,10 @@ func (c *controlConn) connect(hosts []*HostInfo, sessionInit bool) error {
 	var conn *Conn
 	var err error
 	for _, host := range hosts {
-		conn, err = c.session.dial(c.session.ctx, host, &cfg, c)
-		if err != nil {
-			c.session.logger.Info("Control connection failed to establish a connection to host.",
-				NewLogFieldIP("host_addr", host.ConnectAddress()),
-				NewLogFieldInt("port", host.Port()),
-				NewLogFieldString("host_id", host.HostID()),
-				NewLogFieldError("err", err))
-			continue
-		}
-		err = c.setupConn(conn, sessionInit)
+		conn, err = c.setupCandidate(host, &cfg, sessionInit)
 		if err == nil {
 			break
 		}
-		c.session.logger.Info("Control connection setup failed after connecting to host.",
-			NewLogFieldIP("host_addr", host.ConnectAddress()),
-			NewLogFieldInt("port", host.Port()),
-			NewLogFieldString("host_id", host.HostID()),
-			NewLogFieldError("err", err))
-		conn.Close()
 		conn = nil
 	}
 	if conn == nil {
@@ -312,6 +323,57 @@ func (c *controlConn) connect(hosts []*HostInfo, sessionInit bool) error {
 type connHost struct {
 	conn *Conn
 	host *HostInfo
+}
+
+// setupCandidate dials host with cfg for the initial connect and runs setupConn.
+//
+// It mirrors attemptReconnectToHost's ownership discipline for the init path: on
+// any non-success exit, including a panic in setupConn or its logging, the
+// candidate is closed and released before this returns, in that fixed order,
+// under a deferred cleanup. NewSession calls Session.Close only when init returns
+// an error, not when it panics, so without this a panicking init would leak the
+// candidate.
+//
+// Parameters:
+//   - host: the host to dial and set up
+//   - cfg: the connection config to dial with (init disables coalescing)
+//   - sessionInit: whether this is running during Session initialization
+//
+// Returns:
+//   - *Conn: the connection when setup succeeded, already published
+//   - error: the dial or setup failure, nil on success
+func (c *controlConn) setupCandidate(host *HostInfo, cfg *ConnConfig, sessionInit bool) (*Conn, error) {
+	conn, err := c.dialCandidate(host, cfg)
+	if err != nil {
+		c.session.logger.Info("Control connection failed to establish a connection to host.",
+			NewLogFieldIP("host_addr", host.ConnectAddress()),
+			NewLogFieldInt("port", host.Port()),
+			NewLogFieldString("host_id", host.HostID()),
+			NewLogFieldError("err", err))
+		return nil, err
+	}
+
+	setupOK := false
+	defer func() {
+		if !setupOK {
+			if c.session.cfg.testControlAfterSetupFailure != nil {
+				c.session.cfg.testControlAfterSetupFailure()
+			}
+			conn.Close()
+			c.releaseCandidate(conn)
+		}
+	}()
+
+	if err = c.setupConn(conn, sessionInit); err == nil {
+		setupOK = true
+		return conn, nil
+	}
+	c.session.logger.Info("Control connection setup failed after connecting to host.",
+		NewLogFieldIP("host_addr", host.ConnectAddress()),
+		NewLogFieldInt("port", host.Port()),
+		NewLogFieldString("host_id", host.HostID()),
+		NewLogFieldError("err", err))
+	return nil, err
 }
 
 func (c *controlConn) setupConn(conn *Conn, sessionInit bool) error {
@@ -363,7 +425,13 @@ func (c *controlConn) setupConn(conn *Conn, sessionInit bool) error {
 		host: host,
 	}
 
-	c.conn.Store(ch)
+	if c.session.cfg.testControlBeforePublish != nil {
+		c.session.cfg.testControlBeforePublish(host)
+	}
+
+	if !c.publish(ch) {
+		return errControlConnClosing
+	}
 
 	c.session.logger.Info("Control connection connected to host.",
 		NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldString("host_id", host.HostID()))
@@ -429,7 +497,7 @@ func (c *controlConn) registerEvents(conn *Conn) error {
 }
 
 func (c *controlConn) reconnect() {
-	if atomic.LoadInt32(&c.state) == controlConnClosing {
+	if c.closing() {
 		return
 	}
 	if !atomic.CompareAndSwapInt32(&c.reconnecting, 0, 1) {
@@ -444,8 +512,10 @@ func (c *controlConn) reconnect() {
 
 	_, err := c.attemptReconnect()
 	if err != nil {
-		c.session.logger.Error("Unable to reconnect control connection.",
-			NewLogFieldError("err", err))
+		if !errors.Is(err, errControlConnClosing) {
+			c.session.logger.Error("Unable to reconnect control connection.",
+				NewLogFieldError("err", err))
+		}
 		return
 	}
 
@@ -485,13 +555,35 @@ func (c *controlConn) attemptReconnect() (*Conn, error) {
 	if conn != nil {
 		return conn, err
 	}
+	if errors.Is(err, errControlConnClosing) {
+		return nil, err
+	}
+
+	if c.session.cfg.testControlBeforeFallback != nil {
+		c.session.cfg.testControlBeforeFallback()
+	}
+
+	// A shutdown may have arrived after the loop returned an ordinary error and
+	// before the fallback: do not admit the contact-point walk once closing.
+	if c.closing() {
+		return nil, errControlConnClosing
+	}
 
 	c.session.logger.Error("Unable to connect to any ring node, control connection falling back to initial contact points.", NewLogFieldError("err", err))
 	// Fallback to initial contact points, as it may be the case that all known initialHosts
 	// changed their IPs while keeping the same hostname(s).
+	if c.session.cfg.testControlBeforeResolve != nil {
+		c.session.cfg.testControlBeforeResolve()
+	}
 	initialHosts, resolvErr := addrsToHosts(c.session.cfg.Hosts, c.session.cfg.Port, c.session.logger)
+	// A shutdown seen during the admitted resolution is expected: report the
+	// sentinel rather than an ordinary resolution failure (which would also be
+	// logged as an error by reconnect).
+	if c.closing() {
+		return nil, errControlConnClosing
+	}
 	if resolvErr != nil {
-		return nil, fmt.Errorf("resolve contact points' hostnames: %v", resolvErr)
+		return nil, fmt.Errorf("resolve contact points' hostnames: %w", resolvErr)
 	}
 
 	return c.attemptReconnectToAnyOfHosts(initialHosts)
@@ -501,29 +593,82 @@ func (c *controlConn) attemptReconnectToAnyOfHosts(hosts []*HostInfo) (*Conn, er
 	var conn *Conn
 	var err error
 	for _, host := range hosts {
-		conn, err = c.session.connect(c.session.ctx, host, c)
-		if err != nil {
-			c.convictOnDialFailure(host, err)
-			c.session.logger.Info("During reconnection, control connection failed to establish a connection to host.",
-				NewLogFieldIP("host_addr", host.ConnectAddress()),
-				NewLogFieldInt("port", host.Port()),
-				NewLogFieldString("host_id", host.HostID()),
-				NewLogFieldError("err", err))
-			continue
+		if c.closing() {
+			return nil, errControlConnClosing
 		}
-		err = c.setupConn(conn, false)
+		conn, err = c.attemptReconnectToHost(host)
 		if err == nil {
-			break
+			return conn, nil
 		}
-		c.session.logger.Info("During reconnection, control connection setup failed after connecting to host.",
+		if errors.Is(err, errControlConnClosing) {
+			return nil, err
+		}
+	}
+	if c.closing() {
+		return nil, errControlConnClosing
+	}
+	return conn, err
+}
+
+// attemptReconnectToHost dials host and runs setupConn on the connection.
+//
+// On any failure the candidate connection is closed and released before this
+// returns, under a deferred cleanup so a panic in setupConn tears it down too;
+// the caller can then move on to the next host with nothing left in flight.
+// A shutdown observed during the attempt is reported as errControlConnClosing
+// without convicting the host or logging the failure, since it is expected.
+//
+// Parameters:
+//   - host: the host to dial and set up
+//
+// Returns:
+//   - *Conn: the connection when setup succeeded, already published
+//   - error: nil on success, errControlConnClosing on shutdown, else the failure
+func (c *controlConn) attemptReconnectToHost(host *HostInfo) (*Conn, error) {
+	conn, err := c.dialCandidate(host, c.session.connCfg)
+	if err != nil {
+		// A shutdown that raced the dial is expected, not a host to convict.
+		if errors.Is(err, errControlConnClosing) || c.closing() {
+			return nil, errControlConnClosing
+		}
+		c.convictOnDialFailure(host, err)
+		c.session.logger.Info("During reconnection, control connection failed to establish a connection to host.",
 			NewLogFieldIP("host_addr", host.ConnectAddress()),
 			NewLogFieldInt("port", host.Port()),
 			NewLogFieldString("host_id", host.HostID()),
 			NewLogFieldError("err", err))
-		conn.Close()
-		conn = nil
+		return nil, err
 	}
-	return conn, err
+
+	// Close and release the candidate on every non-success exit, including a
+	// setup panic, in that fixed order. A concurrent close that snapshotted this
+	// candidate first calls Close again, which is idempotent.
+	setupOK := false
+	defer func() {
+		if !setupOK {
+			if c.session.cfg.testControlAfterSetupFailure != nil {
+				c.session.cfg.testControlAfterSetupFailure()
+			}
+			conn.Close()
+			c.releaseCandidate(conn)
+		}
+	}()
+
+	if err = c.setupConn(conn, false); err == nil {
+		setupOK = true
+		return conn, nil
+	}
+	// A shutdown seen after a setup failure is expected: report the sentinel
+	// rather than logging the failure.
+	if errors.Is(err, errControlConnClosing) || c.closing() {
+		return nil, errControlConnClosing
+	}
+	c.session.logger.Info("During reconnection, control connection setup failed after connecting to host.",
+		NewLogFieldIP("host_addr", host.ConnectAddress()),
+		NewLogFieldInt("port", host.Port()),
+		NewLogFieldString("host_id", host.HostID()),
+		NewLogFieldError("err", err))
+	return nil, err
 }
 
 // convictOnDialFailure routes a control-connection dial failure through the
@@ -648,25 +793,142 @@ func (c *controlConn) query(statement string, values ...interface{}) (iter *Iter
 
 func (c *controlConn) awaitSchemaAgreement() error {
 	return c.withConn(func(conn *Conn) *Iter {
-		return newErrIter(conn.awaitSchemaAgreement(context.TODO()), &queryMetrics{}, "", nil, nil)
+		return newErrIter(conn.awaitSchemaAgreement(c.session.ctx), &queryMetrics{}, "", nil, nil)
 	}).err
 }
 
 func (c *controlConn) awaitSchemaAgreementWithTimeout(timeout time.Duration) error {
 	return c.withConn(func(conn *Conn) *Iter {
-		return newErrIter(conn.awaitSchemaAgreementWithTimeout(context.TODO(), timeout), &queryMetrics{}, "", nil, nil)
+		return newErrIter(conn.awaitSchemaAgreementWithTimeout(c.session.ctx, timeout), &queryMetrics{}, "", nil, nil)
 	}).err
 }
 
-func (c *controlConn) close() {
-	if atomic.CompareAndSwapInt32(&c.state, controlConnStarted, controlConnClosing) {
-		c.quit <- struct{}{}
+// closing reports whether the control connection is shutting down, either
+// because close() has latched the terminal state or the session context is done.
+//
+// Returns:
+//   - bool: true once shutdown has begun
+func (c *controlConn) closing() bool {
+	return atomic.LoadInt32(&c.state) == controlConnClosing || c.session.ctx.Err() != nil
+}
+
+// dialCandidate dials host with cfg and registers the connection as a control
+// candidate, so a concurrent close can close it while it is still in flight.
+//
+// cfg is passed through rather than assumed, because the two dial sites differ:
+// connect dials a copy of connCfg with coalescing disabled, and a reconnect
+// dials connCfg itself. The connection is registered only if the controller is
+// not yet closing; if it is, the connection is closed and errControlConnClosing
+// is returned so the caller stops rather than proceeding to set it up.
+//
+// Parameters:
+//   - host: the host to dial
+//   - cfg: the connection config to dial with
+//
+// Returns:
+//   - *Conn: the dialled connection, registered as a candidate, on success
+//   - error: the dial error, or errControlConnClosing if the controller is closing
+func (c *controlConn) dialCandidate(host *HostInfo, cfg *ConnConfig) (*Conn, error) {
+	conn, err := c.session.dial(c.session.ctx, host, cfg, c)
+	if err != nil {
+		return nil, err
 	}
 
-	ch := c.getConn()
-	if ch != nil {
-		ch.conn.Close()
+	c.lifecycleMu.Lock()
+	if atomic.LoadInt32(&c.state) == controlConnClosing {
+		c.lifecycleMu.Unlock()
+		conn.Close()
+		return nil, errControlConnClosing
 	}
+	c.candidates[conn] = struct{}{}
+	c.lifecycleMu.Unlock()
+	return conn, nil
+}
+
+// releaseCandidate drops conn from the candidate set once its caller has closed it.
+//
+// Parameters:
+//   - conn: the candidate to drop
+func (c *controlConn) releaseCandidate(conn *Conn) {
+	c.lifecycleMu.Lock()
+	delete(c.candidates, conn)
+	c.lifecycleMu.Unlock()
+}
+
+// publish makes ch the current control connection, moving it from the candidate
+// set to published in one step under lifecycleMu, unless the controller is
+// closing.
+//
+// Publishing under the same mutex close() latches on closes the window in which
+// a connection is neither a candidate nor published: a close either latches
+// before this (and this returns false so the caller closes ch) or after (and
+// close() snapshots ch as the published connection and closes it).
+//
+// Parameters:
+//   - ch: the connection and its host to publish
+//
+// Returns:
+//   - bool: true if published; false if the controller is closing
+func (c *controlConn) publish(ch *connHost) bool {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if atomic.LoadInt32(&c.state) == controlConnClosing {
+		return false
+	}
+	delete(c.candidates, ch.conn)
+	c.conn.Store(ch)
+	return true
+}
+
+// latchAndSnapshot moves the control connection into the terminal closing state
+// and returns what has to be closed: the published connection and every
+// candidate still in flight.
+//
+// It only latches and reads memory, so it never blocks on application code and
+// can run before Session.Close cancels the session context. The physical
+// Conn.Close calls are left to closeSnapshot, after the cancel.
+//
+// Returns:
+//   - controlSnapshot: the published connection and the in-flight candidates
+func (c *controlConn) latchAndSnapshot() controlSnapshot {
+	c.lifecycleMu.Lock()
+	prev := atomic.SwapInt32(&c.state, controlConnClosing)
+	snap := controlSnapshot{published: c.getConn()}
+	for conn := range c.candidates {
+		snap.candidates = append(snap.candidates, conn)
+	}
+	c.candidates = map[*Conn]struct{}{}
+	c.lifecycleMu.Unlock()
+
+	// Only the first latch signals the heartbeat; quit is buffered 1.
+	if prev != controlConnClosing {
+		c.quit <- struct{}{}
+	}
+	return snap
+}
+
+// closeSnapshot closes the connections latchAndSnapshot returned.
+//
+// Conn.Close may synchronously reach the application logger through HandleError,
+// so this runs outside lifecycleMu, and Session.Close runs it after cancelling
+// the session context.
+//
+// Parameters:
+//   - snap: the published connection and candidates to close
+func (c *controlConn) closeSnapshot(snap controlSnapshot) {
+	if snap.published != nil {
+		snap.published.conn.Close()
+	}
+	for _, conn := range snap.candidates {
+		conn.Close()
+	}
+}
+
+// close latches the terminal state and closes the control connection and every
+// candidate still in flight. Session.Close instead calls latchAndSnapshot and
+// closeSnapshot around its context cancel; every other caller uses this.
+func (c *controlConn) close() {
+	c.closeSnapshot(c.latchAndSnapshot())
 }
 
 var errNoControl = errors.New("gocql: no control connection available")

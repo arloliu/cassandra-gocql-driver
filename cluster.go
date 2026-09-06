@@ -392,6 +392,40 @@ type ClusterConfig struct {
 	// after it has released its reconnecting claim (internal, for testing); nil in production.
 	testControlReconnectDone func()
 
+	// testControlBeforePublish is called by controlConn.setupConn after events are
+	// registered and before the connection is published, with the host being set up
+	// (internal, for testing); nil in production.
+	testControlBeforePublish func(host *HostInfo)
+
+	// testControlBeforeFallback is called by controlConn.attemptReconnect after the
+	// ring walk failed with an ordinary error and before the contact-point fallback
+	// is admitted (internal, for testing); nil in production.
+	testControlBeforeFallback func()
+
+	// testControlBeforeResolve is called by controlConn.attemptReconnect just before
+	// it resolves the contact points with addrsToHosts, after the pre-fallback
+	// shutdown check has admitted the fallback (internal, for testing); nil in
+	// production.
+	// A test asserts it never fired to prove resolution was skipped.
+	testControlBeforeResolve func()
+
+	// testControlAfterSetupFailure is called by the control connection's per-attempt
+	// cleanup when a candidate's setup failed, while the candidate is still in the
+	// set and before it is closed, so a test can latch a shutdown into that window
+	// (internal, for testing); nil in production.
+	testControlAfterSetupFailure func()
+
+	// testStartPoolFillStart is called at the start of Session.startPoolFill,
+	// before pool admission and the withOwnedHost publication, so a test can gate
+	// that goroutine before it reaches the shutdown gate (internal, for testing);
+	// nil in production.
+	testStartPoolFillStart func(host *HostInfo)
+
+	// testStartPoolFillDone is called at the end of Session.startPoolFill, after the
+	// withOwnedHost publication attempt, so a test can join that goroutine
+	// (internal, for testing); nil in production.
+	testStartPoolFillDone func(host *HostInfo)
+
 	// schemaRefreshDebounce overrides the schema refresh debounce interval (internal, for testing);
 	// zero selects the schemaRefreshDebounceTime constant.
 	schemaRefreshDebounce time.Duration
