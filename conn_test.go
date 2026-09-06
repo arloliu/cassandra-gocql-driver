@@ -1312,6 +1312,29 @@ func (srv *TestServer) errorLocked(err interface{}) {
 	srv.t.Error(err)
 }
 
+// scriptedTraceID is the trace id writeTracedResultHeader returns; any 16 bytes will
+// do, the driver only checks the length.
+var scriptedTraceID = bytes.Repeat([]byte{1}, 16)
+
+// writeTracedResultHeader writes a result header, echoing the request's tracing flag
+// with a scripted trace id so a test can observe the driver's Tracer callbacks.
+//
+// Cassandra answers a traced request with the tracing flag set and the session id at
+// the head of the body; without that echo a Tracer set on a query is never called.
+//
+// Parameters:
+//   - respFrame: the response frame to write the header into
+//   - head: the request's header, whose flags decide whether to trace
+func writeTracedResultHeader(respFrame *framer, head *frameHeader) {
+	if head.flags&flagTracing != flagTracing {
+		respFrame.writeHeader(0, opResult, head.stream)
+		return
+	}
+
+	respFrame.writeHeader(flagTracing, opResult, head.stream)
+	respFrame.buf = append(respFrame.buf, scriptedTraceID...)
+}
+
 func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, startupCompleted *bool, optionCount *atomic.Int64) {
 	head := reqFrame.header
 	if head == nil {
@@ -1457,7 +1480,7 @@ func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, star
 			// opExecute default branch will respond with
 			// ErrCodeUnprepared. This drives the re-prepare retry loop
 			// in Conn.executeQuery — used by the recursion-cap test.
-			respFrame.writeHeader(0, opResult, head.stream)
+			writeTracedResultHeader(respFrame, head)
 			respFrame.writeInt(resultKindPrepared)
 			respFrame.writeShortBytes(binary.BigEndian.AppendUint64(nil, 99))
 			respFrame.writeInt(0)
@@ -1468,7 +1491,7 @@ func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, star
 			respFrame.writeInt(int32(flagNoMetaData))
 			respFrame.writeInt(0)
 		case "nometadata":
-			respFrame.writeHeader(0, opResult, head.stream)
+			writeTracedResultHeader(respFrame, head)
 			respFrame.writeInt(resultKindPrepared)
 			// <id>
 			respFrame.writeShortBytes(binary.BigEndian.AppendUint64(nil, 1))
@@ -1482,7 +1505,7 @@ func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, star
 			respFrame.writeInt(int32(flagNoMetaData)) // <flags>
 			respFrame.writeInt(0)
 		case "metadata":
-			respFrame.writeHeader(0, opResult, head.stream)
+			writeTracedResultHeader(respFrame, head)
 			respFrame.writeInt(resultKindPrepared)
 			// <id>
 			respFrame.writeShortBytes(binary.BigEndian.AppendUint64(nil, 2))

@@ -38,13 +38,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authoritative description of detection timing lives in the package documentation, under
   "Detecting a node that stops answering, and the limits of a caller context", not here.
 
+### Fixed
+
+- **A query's context now bounds how long it waits for a prepared statement.** A caller
+  waiting on the PREPARE of a cold statement used to ignore its own context entirely and wait
+  for the request to finish, so a 3-second deadline against an unresponsive node did not take
+  effect until `Timeout` elapsed. The caller now returns its own `context.Canceled` or
+  `context.DeadlineExceeded` on its deadline, and the executor treats that as a caller's
+  cancellation rather than as a host failure: the query is not retried on another node.
+
+  The PREPARE itself is unchanged and deliberately so — it is shared with every concurrent
+  caller of the same statement, so it runs to completion and fills the cache even after the
+  caller that started it gave up. The next caller hits the cache instead of issuing a second
+  PREPARE. That request is bounded by `Timeout`, or by the connection's lifetime when
+  `Timeout` is zero, which is what every other in-flight request does under that setting.
+
+  Two consequences worth knowing. A `Tracer` set on a query that gives up is still called,
+  from the shared PREPARE, after `Exec`/`Iter` has returned — the `Tracer` documentation now
+  says so, and an implementation must be safe to call from another goroutine. And the
+  routing-metadata cache still behaves the way the prepared-statement cache used to: it is
+  deliberately left alone, having never been measured as a problem, and the package
+  documentation lists it among the things a caller's context does not bound.
+
 ### Documentation
 
 - The package documentation gains a section on how a silent node is detected and which work a
   caller's context does not bound: the control connection's ring refresh and reconnect, the
   protocol stream a cancelled in-flight request holds until its late response or the
-  connection close, and the pool-fill wait when `Timeout` is zero and the context has no
-  deadline.
+  connection close, the pool-fill wait when `Timeout` is zero and the context has no deadline,
+  and the shared PREPARE a caller's context does not cancel.
 
 ## [2.4.2-otter] - 2026-09-06
 

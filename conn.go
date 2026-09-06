@@ -1766,10 +1766,57 @@ type preparedStatment struct {
 	response         resultMetadata
 }
 
+// prepResult carries a shared prepare load's outcome back to the caller that
+// started it, so the caller can stop waiting without stopping the load.
+type prepResult struct {
+	info *preparedStatment
+	err  error
+}
+
+// prepareStatement returns the prepared statement for stmt on this connection,
+// preparing it once and sharing that result with every concurrent caller.
+//
+// The caller's context bounds how long this call waits, not how long the prepare
+// itself runs: the load is shared, so it completes and populates the cache even
+// after the caller that started it has given up.
+//
+// The returned error must stay unwrapped. queryExecutor classifies a request's
+// error by comparing it against context.Canceled and context.DeadlineExceeded by
+// equality, so wrapping a caller-context error would make the executor treat a
+// caller's cancellation as a host failure and retry the query on another host.
+//
+// Parameters:
+//   - ctx: the caller's context; may be nil, which waits indefinitely
+//   - stmt: the CQL statement to prepare
+//   - tracer: optional tracer for the PREPARE request
+//   - keyspace: the keyspace the statement is prepared against
+//
+// Returns:
+//   - *preparedStatment: the prepared statement, from the cache or a fresh load
+//   - error: the caller's ctx.Err() when it gave up waiting, otherwise the load's error
 func (c *Conn) prepareStatement(ctx context.Context, stmt string, tracer Tracer, keyspace string) (*preparedStatment, error) {
 	cacheKey := c.session.stmtsLRU.keyFor(c.host.HostID(), keyspace, stmt)
 
-	loader := otter.LoaderFunc[preparedKey, *preparedStatment](func(loadCtx context.Context, _ preparedKey) (*preparedStatment, error) {
+	// Serve a warm statement without entering the cancellable slow path below.
+	// That path needs a goroutine and a channel per call, and this is the hottest
+	// path in the driver: an already-prepared statement must not pay for machinery
+	// only a real load needs. Correctness does not depend on this shortcut —
+	// GetIfPresent and Get share the same hit semantics, including expiry and
+	// recency accounting — but performance does.
+	if info, ok := c.session.stmtsLRU.get(cacheKey); ok {
+		return info, nil
+	}
+
+	var ctxDone <-chan struct{}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			// An already-cancelled caller must not start a load goroutine.
+			return nil, err
+		}
+		ctxDone = ctx.Done()
+	}
+
+	loader := otter.LoaderFunc[preparedKey, *preparedStatment](func(_ context.Context, _ preparedKey) (*preparedStatment, error) {
 		prep := &writePrepareFrame{
 			statement: stmt,
 		}
@@ -1777,10 +1824,42 @@ func (c *Conn) prepareStatement(ctx context.Context, stmt string, tracer Tracer,
 			prep.keyspace = keyspace
 		}
 
-		// Use connection context for the actual network call to ensure the prepare
-		// completes even if the caller's context is canceled (other waiters need the result).
-		framer, err := c.exec(c.ctx, prep, tracer)
+		// Use a connection-scoped context for the actual network call to ensure the
+		// prepare completes even if the caller's context is canceled (other waiters
+		// need the result).
+		//
+		// The deadline below is load-bearing, not defensive. Waiters that share this
+		// load park in otter's context-free WaitGroup, so their goroutines live
+		// exactly as long as this call does; removing the deadline removes their only
+		// upper bound. It also makes explicit a bound that used to arrive as a side
+		// effect of execInternal arming its request timer for a deadline-less context.
+		//
+		// When Session.Timeout is 0 the user asked for no request timeout, so this
+		// load gets none either and lives until the connection closes — the same as
+		// every other in-flight request under that configuration. Deriving a zero
+		// timeout here would instead produce an already-expired context and fail
+		// every prepare outright.
+		loadCtx := c.ctx
+		if requestTimeout := time.Duration(c.requestTimeout.Load()); requestTimeout > 0 {
+			var cancel context.CancelFunc
+			loadCtx, cancel = context.WithTimeout(c.ctx, requestTimeout)
+			defer cancel()
+		}
+
+		framer, err := c.exec(loadCtx, prep, tracer)
 		if err != nil {
+			// execInternal defers to a context deadline instead of arming its own
+			// request timer, so the bound above surfaces as context.DeadlineExceeded
+			// rather than ErrTimeoutNoResponse. Otter shares a load's error with every
+			// waiter, including ones whose own context is still alive, and the executor
+			// reads a bare context error as a caller cancellation that must not be
+			// retried elsewhere. Translate it back to the error the request timer would
+			// have produced, so a node that really timed out is not mistaken for a
+			// caller that gave up. c.ctx carries no deadline of its own, so a deadline
+			// here can only be ours.
+			if errors.Is(err, context.DeadlineExceeded) && c.ctx.Err() == nil {
+				return nil, ErrTimeoutNoResponse
+			}
 			return nil, err
 		}
 		defer framer.release()
@@ -1812,7 +1891,33 @@ func (c *Conn) prepareStatement(ctx context.Context, stmt string, tracer Tracer,
 		}
 	})
 
-	return c.session.stmtsLRU.getOrLoad(ctx, cacheKey, loader)
+	// Buffered so the load goroutine can always deliver and exit, even when the
+	// caller has already stopped waiting.
+	done := make(chan prepResult, 1)
+	go func() {
+		// Deliberately not the caller's context: otter hands this straight to the
+		// loader, which ignores it, and the caller's cancellation is handled by the
+		// select below. Passing the connection's context keeps "this context has
+		// nothing to do with the caller" explicit, so a later change that makes the
+		// loader honour it cannot silently cancel a load other waiters depend on.
+		info, err := c.session.stmtsLRU.getOrLoad(c.ctx, cacheKey, loader)
+		done <- prepResult{info: info, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		// select chooses at random when both cases are ready, so re-check the
+		// caller's context: returning a result past its deadline would make
+		// "the caller's deadline is honoured" a probabilistic guarantee.
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		return res.info, res.err
+	case <-ctxDone:
+		return nil, ctx.Err()
+	}
 }
 
 func marshalQueryValue(typ TypeInfo, value interface{}, dst *queryValues) error {

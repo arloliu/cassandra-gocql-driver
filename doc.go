@@ -233,6 +233,17 @@
 //     HeartbeatTimeout bounds how long that lasts.
 //   - When ClusterConfig.Timeout is zero and the caller's context has no
 //     deadline, a query waiting for a pool fill waits on the context alone.
+//   - A caller's context bounds how long it waits for a prepared statement, not
+//     the PREPARE itself. That request is shared with every concurrent caller of
+//     the same statement, so it runs to completion and fills the cache even after
+//     the caller that started it has given up; it is bounded by
+//     ClusterConfig.Timeout, or by the connection's lifetime when that is zero.
+//     A [Tracer] set on the abandoning query is therefore still called, from the
+//     shared request, after that query has returned.
+//   - The routing-metadata cache behaves the way the prepared-statement cache used
+//     to: a caller waiting on another caller's in-flight metadata load waits for
+//     that load, not for its own context. A token-aware query can reach this
+//     before it reaches the prepared-statement cache at all.
 //
 // # Compression
 //

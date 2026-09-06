@@ -23,6 +23,7 @@ package gocql
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -389,4 +390,109 @@ func execAsync(qry *Query) <-chan error {
 	result := make(chan error, 1)
 	go func() { result <- qry.Exec() }()
 	return result
+}
+
+// prepareGate parks PREPARE requests at the test server and counts every PREPARE
+// the server sees, per statement.
+//
+// It is installed as fillHarnessOpts.recvHook, so it runs in the server's receive
+// loop before the request is answered: a parked PREPARE is a request in flight from
+// the driver's point of view, and the connection answers nothing else until the gate
+// is released. Once released, the request falls through to the server's normal
+// PREPARE handling, so a caller that shares the load still gets a usable statement.
+type prepareGate struct {
+	// park, when non-nil, is the statement substring whose PREPARE is held.
+	park atomic.Pointer[string]
+
+	mu     sync.Mutex
+	counts map[string]int
+
+	// started receives the server address of each parked PREPARE, before it parks.
+	started chan string
+	// release is closed to let every parked and future PREPARE through.
+	release chan struct{}
+	once    sync.Once
+}
+
+// newPrepareGate returns a gate that parks nothing and counts every PREPARE.
+//
+// Returns:
+//   - *prepareGate: the gate
+func newPrepareGate() *prepareGate {
+	return &prepareGate{
+		counts:  map[string]int{},
+		started: make(chan string, 64),
+		release: make(chan struct{}),
+	}
+}
+
+// parkStatements holds every later PREPARE whose statement contains substr.
+//
+// Parameters:
+//   - substr: the statement substring to park on
+func (g *prepareGate) parkStatements(substr string) {
+	g.park.Store(&substr)
+}
+
+// hook is the fillHarnessOpts.recvHook.
+//
+// It peeks at the statement without consuming it: the server's own handler re-reads
+// the same body afterwards.
+func (g *prepareGate) hook(ip string, f *framer) {
+	if f.header == nil || f.header.op != opPrepare {
+		return
+	}
+
+	buf := f.buf
+	stmt, err := f.readLongString()
+	f.buf = buf
+	if err != nil {
+		return
+	}
+
+	g.mu.Lock()
+	g.counts[stmt]++
+	g.mu.Unlock()
+
+	park := g.park.Load()
+	if park == nil || !strings.Contains(stmt, *park) {
+		return
+	}
+
+	select {
+	case g.started <- ip:
+	default:
+	}
+	<-g.release
+}
+
+// awaitParked blocks until one PREPARE has parked, and reports where.
+//
+// Returns:
+//   - string: the connect address of the server that parked it
+func (g *prepareGate) awaitParked(t *testing.T, what string) string {
+	t.Helper()
+
+	select {
+	case ip := <-g.started:
+		return ip
+	case <-time.After(fillEventBudget):
+		t.Fatalf("timed out after %v waiting for %s", fillEventBudget, what)
+		return ""
+	}
+}
+
+// releaseAll lets every parked and future PREPARE through.
+func (g *prepareGate) releaseAll() {
+	g.once.Do(func() { close(g.release) })
+}
+
+// count returns how many PREPARE requests the server saw for stmt.
+//
+// Returns:
+//   - int: the number of PREPARE requests
+func (g *prepareGate) count(stmt string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.counts[stmt]
 }

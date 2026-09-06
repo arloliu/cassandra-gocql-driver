@@ -2640,6 +2640,11 @@ func (r *routingKeyInfoLRU) get(key routingCacheKey) (*StatementMetadata, bool) 
 
 // getOrLoad retrieves routing metadata from the cache, loading it if not present.
 // Otter handles deduplication of concurrent loads for the same key.
+//
+// Waiters are not bound by ctx: otter parks them in a context-free WaitGroup, so a
+// caller whose context expires still waits for the load to finish. Conn.prepareStatement
+// works around the same limitation for the prepared-statement cache; this cache is
+// deliberately left alone, because nothing has yet measured it as a problem here.
 func (r *routingKeyInfoLRU) getOrLoad(
 	ctx context.Context,
 	key routingCacheKey,
@@ -2673,6 +2678,14 @@ func (r *routingKeyInfoLRU) clear() {
 // the execution of a query from Cassandra. Gathering this information might
 // be essential for debugging and optimizing queries, but this feature should
 // not be used on production systems with very high load.
+//
+// Trace is usually called before the query it belongs to returns, but it is not
+// guaranteed to be: the PREPARE of a statement is shared with every concurrent
+// caller of that statement and runs to completion even after the caller that
+// started it has given up on its context, so that caller's Tracer can be called
+// after its Query.Exec or Query.Iter has returned. An implementation must
+// therefore be safe to call from another goroutine and must not assume the
+// destination it writes to is still owned by the caller.
 type Tracer interface {
 	Trace(traceId []byte)
 }
