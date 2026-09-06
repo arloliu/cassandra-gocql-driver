@@ -515,6 +515,12 @@ type ringDescriber struct {
 	prevHosts        []*HostInfo
 	prevPartitioner  string
 	firstRingRefresh int32
+
+	// invalidRowRounds counts, per host id, the consecutive accepted snapshots that
+	// described that host with a row the snapshot could not accept. Guarded by mu.
+	// An entry is cleared by a valid row and dropped when the host leaves the ring
+	// or is replaced by a new ring object under the same id.
+	invalidRowRounds map[string]invalidRowCount
 }
 
 // Returns true if we are using system_schema.keyspaces instead of system.schema_keyspaces
@@ -625,7 +631,14 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 					return nil, fmt.Errorf(assertErrorMsg, "host_id", value)
 				}
 			}
-			host.hostId = hostId.String()
+			// A NULL uuid column scans as the zero UUID, which is not an identity -
+			// and, rendered, is a perfectly well-formed string that every consumer
+			// downstream would treat as one. Leaving hostId empty is what makes
+			// isValidPeer reject such a row, and what lets a caller that needs to name
+			// the row fall back to its address.
+			if hostId != (UUID{}) {
+				host.hostId = hostId.String()
+			}
 		case "release_version":
 			version, ok := value.(string)
 			if !ok {
@@ -859,15 +872,47 @@ func rowIP(row map[string]interface{}, column string) net.IP {
 // Returns:
 //   - string: the canonical host_id, or "" when it was absent or unparseable
 func rowHostID(row map[string]interface{}) string {
+	var hostID UUID
 	switch v := row["host_id"].(type) {
 	case UUID:
-		return v.String()
+		hostID = v
 	case string:
-		if hostID, err := ParseUUID(v); err == nil {
-			return hostID.String()
+		parsed, err := ParseUUID(v)
+		if err != nil {
+			return ""
 		}
+		hostID = parsed
+	default:
+		return ""
 	}
-	return ""
+	// A NULL uuid column scans as the zero UUID. Rendered it is a well-formed
+	// identity string, and a caller that took it at face value would attribute this
+	// row to a host that does not exist - and so never to the host it was about.
+	if hostID == (UUID{}) {
+		return ""
+	}
+	return hostID.String()
+}
+
+// attributableNodeAddress returns the address a host can be attributed by, or "" when
+// it has none.
+//
+// HostInfo.nodeToNodeAddress falls back to the unspecified address when neither
+// column is usable, and that is not an identity: every host lacking one would answer
+// to it, so a row carrying it would be charged to whichever of them happened to be
+// indexed first.
+//
+// Parameters:
+//   - host: the host to name
+//
+// Returns:
+//   - string: the address, or "" when the host has no usable one
+func attributableNodeAddress(host *HostInfo) string {
+	addr := host.nodeToNodeAddress()
+	if !validIpAddr(addr) {
+		return ""
+	}
+	return addr.String()
 }
 
 // rowNodeToNodeAddress reads the address a row's host would be indexed by,
@@ -964,6 +1009,62 @@ func (r *ringDescriber) getLocalHostInfo(ch *connHost) (*HostInfo, error) {
 	return host, nil
 }
 
+// invalidPeerRowGrace is how many consecutive accepted snapshots may describe a host
+// with a row that cannot be accepted before the host is treated as gone.
+//
+// A single bad row is not evidence a node left the cluster. A rack that a snitch has
+// not filled in yet, or a token set on a node that is still joining, produces one -
+// and evicting the host on it closes a working pool and, on a healthy quiet ring,
+// nothing looks at the peers table again on its own to undo it.
+//
+// It is a count of observations, not a duration: the interval between refreshes is
+// whatever cluster activity makes it. Three of them in a row is evidence a bad row
+// is not transient.
+const invalidPeerRowGrace = 3
+
+// invalidPeerRow is one row of the peers table a snapshot could not accept, and the
+// identity that could still be read from it.
+//
+// It has two producers with different shapes. A row that could not be converted into
+// a HostInfo at all yields whatever the row map held; a row that converted and was
+// then rejected by isValidPeer yields what the HostInfo carries. Either can come out
+// without a host_id.
+type invalidPeerRow struct {
+	// hostID is the row's host_id, or "" when it was absent or unparseable.
+	hostID string
+	// nodeToNodeAddr is the address the ring would index this host by, or "".
+	nodeToNodeAddr string
+}
+
+// invalidRowCount is how many consecutive accepted snapshots described one ring
+// object with a row that could not be accepted.
+//
+// The ring object is held alongside the count, not just its host id: a host can be
+// removed and re-admitted between two snapshots - a control connection setting itself
+// up re-adds its own host directly - so a count keyed by id alone would carry over
+// onto a ring entry that is a different object, and could evict it on its first bad
+// row. Identity is pointer equality, the same rule ring.owns uses.
+type invalidRowCount struct {
+	host   *HostInfo
+	rounds int
+}
+
+// ringSnapshot is one control node's view of the ring, as GetHosts read it.
+type ringSnapshot struct {
+	// hosts is the control host followed by every valid peer.
+	hosts []*HostInfo
+	// partitioner is the control host's partitioner.
+	partitioner string
+	// membershipComplete reports whether every row in the snapshot could be
+	// attributed to a host. When it is false the snapshot proves nothing about who
+	// left, so refreshRing must not act on an absence.
+	membershipComplete bool
+	// underGrace holds the hosts an invalid row named in this snapshot that have not
+	// yet used up invalidPeerRowGrace. They are absent from hosts, and must survive
+	// the sweep anyway.
+	underGrace map[string]bool
+}
+
 // getClusterPeerInfo reads the peers table over the given control connection.
 //
 // Parameters:
@@ -971,12 +1072,13 @@ func (r *ringDescriber) getLocalHostInfo(ch *connHost) (*HostInfo, error) {
 //   - localHost: the control host, whose version selects the peers table
 //
 // Returns:
-//   - []*HostInfo: every valid peer row; invalid rows are logged and skipped
+//   - []*HostInfo: every valid peer row
+//   - []invalidPeerRow: one entry per row that was logged and skipped
 //   - error: if the rows could not be read
-func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([]*HostInfo, error) {
+func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([]*HostInfo, []invalidPeerRow, error) {
 	iter := ch.conn.querySystemPeers(context.TODO(), localHost.version)
 	if iter == nil {
-		return nil, errNoControl
+		return nil, nil, errNoControl
 	}
 	// Release on every path. The loop below deliberately keeps the iterator open
 	// across a row it could not convert, so a panic from the Warning it logs there,
@@ -991,13 +1093,20 @@ func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([
 		r.session.cfg.testHostMetadataIter(iter)
 	}
 
-	var peers []*HostInfo
+	var (
+		peers   []*HostInfo
+		invalid []invalidPeerRow
+	)
 	for {
 		// extract all available info about the peer
 		host, err := r.session.hostInfoFromIter(iter, nil, r.session.cfg.Port)
 		if err != nil {
 			var rowErr *peerRowError
 			if errors.As(err, &rowErr) {
+				invalid = append(invalid, invalidPeerRow{
+					hostID:         rowErr.hostID,
+					nodeToNodeAddr: rowErr.nodeToNodeAddr,
+				})
 				// Deliberately not closed here. The iterator is still open and
 				// positioned on this row, so the loop skips it and reads the next one.
 				// Closing it and continuing is the bug itself: Close releases the framer
@@ -1008,7 +1117,7 @@ func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([
 				continue
 			}
 			// Any other error came from the iterator, which hostInfoFromIter closed.
-			return nil, fmt.Errorf("unable to fetch peer host info: %w", err)
+			return nil, nil, fmt.Errorf("unable to fetch peer host info: %w", err)
 		}
 		// if nil then none left
 		if host == nil {
@@ -1016,6 +1125,14 @@ func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([
 		}
 		if !isValidPeer(host) {
 			// If it's not a valid peer
+			//
+			// The row converted cleanly, so its identity is whatever the HostInfo
+			// carries: a host_id if the row had one, else the address the ring would
+			// index it by.
+			invalid = append(invalid, invalidPeerRow{
+				hostID:         host.HostID(),
+				nodeToNodeAddr: attributableNodeAddress(host),
+			})
 			r.session.logger.Warning("Found invalid peer "+
 				"likely due to a gossip or snitch issue, this host will be ignored.", NewLogFieldStringer("host", host))
 			continue
@@ -1024,7 +1141,7 @@ func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([
 		peers = append(peers, host)
 	}
 
-	return peers, nil
+	return peers, invalid, nil
 }
 
 // Return true if the host is a valid peer
@@ -1075,40 +1192,169 @@ func duplicateHostID(hosts []*HostInfo) (*HostInfo, *HostInfo, bool) {
 //   - string: the partitioner; on error the previous one
 //   - error: no control connection, a failed read, or a duplicated host_id
 func (r *ringDescriber) GetHosts() ([]*HostInfo, string, error) {
+	snapshot, err := r.snapshot()
+	return snapshot.hosts, snapshot.partitioner, err
+}
+
+// snapshot reads one node's view of the ring and folds its invalid rows into the
+// per-host observation counts.
+//
+// The counts are durable across rounds and live here, under r.mu, which is held for
+// the whole read. Everything a round decides from them is not durable - it belongs
+// to this snapshot - so it is returned rather than left behind for refreshRing to
+// read under a second lock. refreshRing calls user code (HostFilter, the listeners,
+// the policy) and must hold no lock of ours while it does.
+//
+// Returns:
+//   - ringSnapshot: the hosts, the partitioner, and what this round may conclude
+//     from an absence; on error the previous snapshot, with membership marked
+//     incomplete so a failed read can never authorise an eviction
+//   - error: no control connection, a failed read, or a duplicated host_id
+func (r *ringDescriber) snapshot() (ringSnapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Every error path returns the previous hosts with membership marked incomplete:
+	// a snapshot that was never read is not evidence anybody left.
+	failed := func(err error) (ringSnapshot, error) {
+		return ringSnapshot{hosts: r.prevHosts, partitioner: r.prevPartitioner}, err
+	}
+
 	if r.session.control == nil {
-		return r.prevHosts, r.prevPartitioner, errNoControl
+		return failed(errNoControl)
 	}
 
 	ch, err := r.session.control.acquireConn()
 	if err != nil {
-		return r.prevHosts, r.prevPartitioner, err
+		return failed(err)
 	}
 	localHost, err := r.getLocalHostInfo(ch)
 	if err != nil {
-		return r.prevHosts, r.prevPartitioner, err
+		return failed(err)
 	}
 	if r.session.cfg.testRingSnapshotHook != nil {
 		r.session.cfg.testRingSnapshotHook()
 	}
-	peerHosts, err := r.getClusterPeerInfo(ch, localHost)
+	peerHosts, invalid, err := r.getClusterPeerInfo(ch, localHost)
 	if err != nil {
-		return r.prevHosts, r.prevPartitioner, err
+		return failed(err)
 	}
 
 	hosts := append([]*HostInfo{localHost}, peerHosts...)
 	if first, again, dup := duplicateHostID(hosts); dup {
-		return r.prevHosts, r.prevPartitioner, fmt.Errorf("host %s listed at %s and at %s: %w",
-			first.HostID(), first.ConnectAddress(), again.ConnectAddress(), errDuplicateHostID)
+		// Deliberately before the counts are touched: a snapshot listing one host_id
+		// twice carries no trustworthy membership information at all, so it is not an
+		// observation of anything.
+		return failed(fmt.Errorf("host %s listed at %s and at %s: %w",
+			first.HostID(), first.ConnectAddress(), again.ConnectAddress(), errDuplicateHostID))
 	}
 	var partitioner string
 	if len(hosts) > 0 {
 		partitioner = hosts[0].Partitioner()
 	}
 
-	return hosts, partitioner, nil
+	complete, underGrace := r.observeInvalidRowsLocked(hosts, invalid)
+	return ringSnapshot{
+		hosts:              hosts,
+		partitioner:        partitioner,
+		membershipComplete: complete,
+		underGrace:         underGrace,
+	}, nil
+}
+
+// observeInvalidRowsLocked folds one accepted snapshot's invalid rows into the
+// per-host counts. Call with r.mu held.
+//
+// Every invalid row is resolved to exactly one host id before it is counted. An
+// address is only a usable identity when exactly one ring member is indexed by it;
+// the ring's address index cannot prove that on its own, since it holds one host id
+// per address, so the ring is scanned. Counting an unresolved row under its address
+// instead would split one host's history across two keys, and a valid round that
+// cleared the id key would leave the address key untouched - an eviction on evidence
+// that was already contradicted.
+//
+// Parameters:
+//   - hosts: the accepted snapshot, control host first
+//   - invalid: the rows this snapshot could not accept
+//
+// Returns:
+//   - bool: false when some row could not be attributed to a host
+//   - map[string]bool: the hosts named by an invalid row that still have grace left
+func (r *ringDescriber) observeInvalidRowsLocked(hosts []*HostInfo, invalid []invalidPeerRow) (bool, map[string]bool) {
+	if r.invalidRowRounds == nil {
+		r.invalidRowRounds = make(map[string]invalidRowCount)
+	}
+
+	// A host that left the ring, or that came back as a different object, starts from
+	// zero. Pruning here rather than in refreshRing keeps the whole count under r.mu.
+	ringHosts := r.session.ring.allHosts()
+	present := make(map[string]*HostInfo, len(ringHosts))
+	byAddress := make(map[string][]string, len(ringHosts))
+	for _, host := range ringHosts {
+		present[host.HostID()] = host
+		if addr := attributableNodeAddress(host); addr != "" {
+			byAddress[addr] = append(byAddress[addr], host.HostID())
+		}
+	}
+	for hostID, count := range r.invalidRowRounds {
+		if present[hostID] != count.host {
+			delete(r.invalidRowRounds, hostID)
+		}
+	}
+
+	// A valid row is the stronger evidence: a host described both ways in one
+	// snapshot counts as seen, not as missed.
+	valid := make(map[string]bool, len(hosts))
+	for _, host := range hosts {
+		valid[host.HostID()] = true
+		delete(r.invalidRowRounds, host.HostID())
+	}
+
+	complete := true
+	blamed := make(map[string]bool, len(invalid))
+	for _, row := range invalid {
+		hostID := row.hostID
+		if hostID == "" {
+			if owners := byAddress[row.nodeToNodeAddr]; len(owners) == 1 {
+				hostID = owners[0]
+			}
+		}
+		if hostID == "" {
+			// The row named nobody: no host_id, and no address that resolves to exactly
+			// one ring member. Some host is described by a row we could not read and we
+			// cannot say which, so this round's absences prove nothing about anybody.
+			complete = false
+			continue
+		}
+		if present[hostID] == nil {
+			// Attributable, but to a host the ring does not hold - a node still
+			// joining, say, whose token set is empty. There is nothing to protect and
+			// nothing to count, and membership is still fully accounted for: every row
+			// in this snapshot is attributed. Suppressing the sweep here would keep a
+			// genuinely departed member in the ring for the whole duration of an
+			// unrelated node's bootstrap.
+			continue
+		}
+		if valid[hostID] {
+			// Already counted as seen above.
+			continue
+		}
+		blamed[hostID] = true
+	}
+
+	underGrace := make(map[string]bool, len(blamed))
+	for hostID := range blamed {
+		// At most one observation per host per snapshot: blamed is a set, however many
+		// bad rows named the same host.
+		count := r.invalidRowRounds[hostID]
+		count.host = present[hostID]
+		count.rounds++
+		r.invalidRowRounds[hostID] = count
+		if count.rounds < invalidPeerRowGrace {
+			underGrace[hostID] = true
+		}
+	}
+	return complete, underGrace
 }
 
 // runRingRefresh is the ring refresher's refresh function.
@@ -1179,10 +1425,11 @@ func (s *Session) refreshRing() error {
 }
 
 func refreshRing(r *ringDescriber) error {
-	hosts, partitioner, err := r.GetHosts()
+	snapshot, err := r.snapshot()
 	if err != nil {
 		return err
 	}
+	hosts, partitioner := snapshot.hosts, snapshot.partitioner
 
 	prevHosts := r.session.ring.currentHosts()
 	hostStateListener := r.session.hostListeners
@@ -1268,9 +1515,26 @@ func refreshRing(r *ringDescriber) error {
 		delete(prevHosts, h.HostID())
 	}
 
-	for _, host := range prevHosts {
-		r.session.removeHost(host)
-		hostStateListener.OnRemovedHost(RemovedHostEvent{Host: host})
+	// Everything above acts on positive evidence: a host this snapshot described. The
+	// sweep below acts on an absence, which is only evidence when the snapshot could
+	// account for every row it carried, and only for hosts whose grace has run out.
+	//
+	// Deliberately narrow: an endpoint change above is still reconciled in a round
+	// whose membership is incomplete, because that has full identity evidence and
+	// suppressing it would undo the port-change reconciliation.
+	if snapshot.membershipComplete {
+		for _, host := range prevHosts {
+			if snapshot.underGrace[host.HostID()] {
+				r.session.logger.Info("Keeping a host described by a row that could not be accepted.",
+					NewLogFieldIP("host_addr", host.ConnectAddress()),
+					NewLogFieldString("host_id", host.HostID()))
+				continue
+			}
+			r.session.removeHost(host)
+			hostStateListener.OnRemovedHost(RemovedHostEvent{Host: host})
+		}
+	} else {
+		r.session.logger.Warning("Skipping the ring sweep: a row in this snapshot could not be attributed to a host.")
 	}
 
 	r.session.metadata.setPartitioner(partitioner)

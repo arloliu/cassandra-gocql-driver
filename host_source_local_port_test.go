@@ -153,9 +153,15 @@ type peerRow struct {
 	tokens         []string
 	// nativePort, when non-zero, is served as the row's native_port.
 	nativePort int
+	// nullRack serves rack as NULL, which is the shape isValidPeer rejects: a row
+	// that converts into a HostInfo cleanly and still cannot be accepted.
+	nullRack bool
 	// nullNativePort serves native_port as NULL while the column is present, which
 	// is not the same as the column being absent.
 	nullNativePort bool
+	// nullHostID serves host_id as NULL, which is not the same as the column being
+	// absent either.
+	nullHostID bool
 }
 
 // peerRowColumns lists the columns writePeerRows serves; tokens is a set<text>,
@@ -687,7 +693,9 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 		case "tokens":
 			f.writeShort(uint16(TypeSet))
 			f.writeShort(uint16(TypeVarchar))
-		case "schema_version":
+		case "schema_version", "host_id":
+			// host_id is a uuid column on a real node, not text. That matters: a NULL
+			// uuid does not read back the way a NULL text column does.
 			f.writeShort(uint16(TypeUUID))
 		case peerNativePortColumn:
 			f.writeShort(uint16(TypeInt))
@@ -698,9 +706,17 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 	f.writeInt(int32(len(rows)))
 	for _, row := range rows {
 		f.writeBytes([]byte(row.peer))
-		f.writeBytes([]byte(row.hostID))
+		if row.nullHostID {
+			f.writeBytes(nil)
+		} else {
+			f.writeBytes(encodeUUIDColumn(row.hostID))
+		}
 		f.writeBytes([]byte(row.dataCenter))
-		f.writeBytes([]byte(row.rack))
+		if row.nullRack {
+			f.writeBytes(nil)
+		} else {
+			f.writeBytes([]byte(row.rack))
+		}
 		f.writeBytes([]byte(row.releaseVersion))
 		f.writeBytes([]byte(row.rpcAddress))
 		f.writeBytes(encodeUUIDColumn(row.schemaVersion))
