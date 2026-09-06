@@ -719,8 +719,11 @@ func (t *tokenAwareHostPolicy) Pick(qry ExecutableStatement) NextHost {
 
 	var replicas []*HostInfo
 	if ht == nil {
-		host, _ := meta.tokenRing.GetHostForToken(token)
-		replicas = []*HostInfo{host}
+		// A ring with no tokens has no primary; leave replicas empty so the
+		// classification below is skipped and only the fallback iterates.
+		if host, _ := meta.tokenRing.GetHostForToken(token); host != nil {
+			replicas = []*HostInfo{host}
+		}
 	} else {
 		replicas = ht.hosts
 	}
