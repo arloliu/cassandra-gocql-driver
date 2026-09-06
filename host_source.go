@@ -1051,20 +1051,50 @@ func (r *ringDescriber) GetHosts() ([]*HostInfo, string, error) {
 // a debounced or triggered refresh has no listener,
 // so its error would otherwise vanish.
 //
+// It also turns a panic out of refreshRing into a failed round.
+// Without that, the panic reaches refreshDebouncer.flusher,
+// whose recover-and-stop is terminal: the flusher exits,
+// every later refresh fails fast, and the ring is frozen for the rest of the session.
+// A single unparseable row or a panicking user callback is not worth that.
+//
+// The guarantee is narrow on purpose. It is that the flusher survives and the next
+// round still runs - NOT that the ring was repaired. A panic that lands after
+// addHostIfMissing inserted a host leaves that host in the ring without its pool or
+// its policy publication, and the next round sees an unchanged endpoint and only
+// calls HostInfo.update, so the missed publication is not made up.
+//
 // Returns:
-//   - error: refreshRing's error, after logging it
-func (s *Session) runRingRefresh() error {
+//   - error: refreshRing's error, or the recovered panic as an error, after logging it
+func (s *Session) runRingRefresh() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// The shared handler logs with the original stack and has its own
+			// outermost barrier, so it cannot propagate.
+			handleRecoveredPanic(s.logger, "Session.runRingRefresh", r, nil)
+			err = fmt.Errorf("gocql: ring refresh panicked: %v", r)
+		}
+		// Reporting the outcome calls user code twice, and both calls run inside the
+		// handler that just produced err. handleRecoveredPanic's barrier covers only
+		// its own call, not the statements after it, so a panic from either of these
+		// would escape to the flusher's recover-and-stop - the very outcome the
+		// recover above exists to prevent. Isolate each one separately.
+		safely(s.logger, "Session.runRingRefresh.report", func() {
+			if err != nil {
+				s.logger.Warning("Ring refresh failed.", NewLogFieldError("err", err))
+			}
+		})
+		safely(s.logger, "Session.runRingRefresh.done", func() {
+			if s.cfg.testRingRefreshDone != nil {
+				s.cfg.testRingRefreshDone(err)
+			}
+		})
+	}()
+	// Deliberately after the defer above: a test that injects a panic here is
+	// asserting that the round fails, not that the flusher dies.
 	if s.cfg.testRingRefreshHook != nil {
 		s.cfg.testRingRefreshHook()
 	}
-	err := refreshRing(s.hostSource)
-	if err != nil {
-		s.logger.Warning("Ring refresh failed.", NewLogFieldError("err", err))
-	}
-	if s.cfg.testRingRefreshDone != nil {
-		s.cfg.testRingRefreshDone(err)
-	}
-	return err
+	return refreshRing(s.hostSource)
 }
 
 // debounceRingRefresh submits a ring refresh request to the ring refresh debouncer.

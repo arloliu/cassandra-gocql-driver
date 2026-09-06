@@ -59,6 +59,22 @@ func recoverGoroutine(logger StructuredLogger, name string, teardown func(panicE
 	}
 }
 
+// safely runs fn and absorbs a panic out of it, logging it like any other
+// recovered panic.
+//
+// It is for the short stretches of a deferred handler that call user code after the
+// handler has already recovered: handleRecoveredPanic's barrier protects only its own
+// call, so anything that runs after it is unguarded and would propagate.
+//
+// Parameters:
+//   - logger: the logger to report a recovered panic on
+//   - name: the name reported for the panic
+//   - fn: the call to isolate
+func safely(logger StructuredLogger, name string, fn func()) {
+	defer func() { handleRecoveredPanic(logger, name, recover(), nil) }()
+	fn()
+}
+
 // handleRecoveredPanic is the shared post-recover handler for both
 // recoverGoroutine and call sites that need to use their own inline
 // `if r := recover(); r != nil` (because they need to capture mutating

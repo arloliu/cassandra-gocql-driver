@@ -211,6 +211,10 @@ func TestHostMetadataItersAreReleasedOnEveryPath(t *testing.T) {
 		translator.armed.Store(true)
 		require.Error(t, session.refreshRing(), "a panicking translator must fail the refresh")
 		rec.requireAllReleased(t, 2, "translator panic")
+
+		// The refresher survived it: the next round still reads both tables.
+		require.NoError(t, session.refreshRing(), "the next round must still run")
+		rec.requireAllReleased(t, 2, "the round after the translator panic")
 	})
 
 	t.Run("a panicking logger unwinds the skipped-row warning", func(t *testing.T) {
@@ -233,5 +237,9 @@ func TestHostMetadataItersAreReleasedOnEveryPath(t *testing.T) {
 		logger.armed.Store(true)
 		require.Error(t, session.refreshRing(), "a panicking logger must fail the refresh")
 		rec.requireAllReleased(t, 2, "warning panic")
+
+		// The refresher survived it: the next round still reads both tables.
+		require.NoError(t, session.refreshRing(), "the next round must still run")
+		rec.requireAllReleased(t, 2, "the round after the warning panic")
 	})
 }
