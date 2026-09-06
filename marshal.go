@@ -164,10 +164,13 @@ func Unmarshal(info TypeInfo, data []byte, value interface{}) error {
 			if valueElemRef.NumMethod() == 0 && data == nil {
 				// once we have a reflect.Type of interface{} we lose the underlying type
 				// inside the interface, so we need to call Elem() on the value itself
-				// first before calling Type() but first we make sure that it's not
-				// an empty interface
-				if valueElemRef.IsValid() {
-					valueElemRef = valueElemRef.Elem()
+				// first before calling Type().
+				// A nil interface has no underlying value:
+				// Elem() returns the zero Value, whose Type() panics,
+				// and nil is already the right representation of NULL.
+				valueElemRef = valueElemRef.Elem()
+				if !valueElemRef.IsValid() {
+					return nil
 				}
 				valueRef.Elem().Set(reflect.Zero(valueElemRef.Type()))
 				return nil
