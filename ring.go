@@ -55,11 +55,33 @@ func (r *ring) rrHost() *HostInfo {
 	return r.hostList[pos%len(r.hostList)]
 }
 
+// getHostByIP looks a host up by the address the ring indexes it under.
+//
+// The answer comes from the host map, not from the index: an index entry can outlive
+// the host it named, because the address a host is keyed by can move after it was
+// inserted (a contact point gains a broadcast_address on the first refresh) and
+// removeHost then deletes the key derived from the current value. Reporting a hit on
+// such an entry hands the caller a nil host it goes on to dereference.
+//
+// The stale key is deliberately not cleaned up here: this runs under a read lock, and
+// upgrading it for a rare bookkeeping fix is not worth the contention. removeHost owns
+// that cleanup.
+//
+// Parameters:
+//   - ip: the node-to-node address to look up
+//
+// Returns:
+//   - *HostInfo: the host, or nil
+//   - bool: true only when a host was actually found
 func (r *ring) getHostByIP(ip string) (*HostInfo, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	hi, ok := r.hostIPToUUID[ip]
-	return r.hosts[hi], ok
+	hostID, ok := r.hostIPToUUID[ip]
+	if !ok {
+		return nil, false
+	}
+	host, ok := r.hosts[hostID]
+	return host, ok
 }
 
 func (r *ring) getHost(hostID string) (host *HostInfo, ok bool) {

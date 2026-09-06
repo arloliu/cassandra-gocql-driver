@@ -63,3 +63,35 @@ func TestRing_AddHostIfMissing_Existing(t *testing.T) {
 		t.Fatalf("returned host same pointer: %p != %p", h1, host)
 	}
 }
+
+// TestRingGetHostByIPRejectsAStaleIndexEntry pins F-stability-4.
+//
+// getHostByIP took its ok from the address index alone, so an index entry whose host
+// is no longer in the ring answered (nil, true). Every caller reads that as "found"
+// and dereferences the host: handleNodeUp calls host.Version() on it and panics on
+// the event-handling goroutine.
+//
+// The index and the host map fall out of step whenever the address a host is keyed
+// by changes after it was inserted. A contact point starts with only a connect
+// address, so it is keyed by the zero node-to-node address; the first refresh fills
+// in broadcast_address, and removeHost then deletes the key derived from the new
+// value, leaving the original one behind.
+func TestRingGetHostByIPRejectsAStaleIndexEntry(t *testing.T) {
+	r := &ring{}
+	host := &HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), hostId: "id1"}
+	r.addHostIfMissing(host)
+	staleKey := host.nodeToNodeAddress().String()
+
+	// HostInfo.update fills in fields the entry did not have, which moves the address
+	// the host would be keyed by without moving the key.
+	host.update(&HostInfo{broadcastAddress: net.IPv4(10, 0, 0, 1), hostId: "id1"})
+	r.removeHost("id1")
+
+	got, ok := r.getHostByIP(staleKey)
+	if ok {
+		t.Fatalf("a stale index entry must not report a hit: got (%v, %v)", got, ok)
+	}
+	if got != nil {
+		t.Fatalf("a miss must not carry a host: got %v", got)
+	}
+}
