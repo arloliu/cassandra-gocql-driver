@@ -201,6 +201,7 @@ func connConfig(cfg *ClusterConfig) (*ConnConfig, error) {
 	if phase == nil {
 		phase = defaultHeartbeatPhase
 	}
+	hbTimeout := resolveHeartbeatTimeout(cfg.HeartbeatTimeout)
 
 	return &ConnConfig{
 		ProtoVersion:      cfg.ProtoVersion,
@@ -218,6 +219,7 @@ func connConfig(cfg *ClusterConfig) (*ConnConfig, error) {
 		Logger:            cfg.Logger,
 		heartbeatInterval: interval,
 		heartbeatPhase:    phase,
+		heartbeatTimeout:  hbTimeout,
 	}, nil
 }
 

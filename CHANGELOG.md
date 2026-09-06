@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ClusterConfig.HeartbeatTimeout` bounds each heartbeat OPTIONS round-trip on a data
+  connection. Zero or negative selects the 5-second default; a positive value is used as
+  given, with no floor applied. `NewCluster` sets it to 5 seconds.
+
+### Changed
+
+- **The heartbeat timeout no longer derives from `ClusterConfig.Timeout`, and default failure
+  detection is roughly twice as fast.** It used to be `max(5s, Session.Timeout)`, so the
+  shipped default of `Timeout = 11s` took about 66 to 71 seconds to notice a node that keeps
+  its sockets open and answers nothing; it is now 30 to 35 seconds. Raising the query timeout
+  to tolerate slow queries no longer slows failure detection.
+
+  **Migration.** If you set `Timeout` above 5 seconds *because* you wanted a longer heartbeat
+  round-trip — a cross-region link where a multi-second OPTIONS is normal is the case this
+  protected — that no longer follows: set `HeartbeatTimeout` explicitly to the value you
+  relied on. Everyone else needs no change. A configured `HeartbeatTimeout` below 5 seconds is
+  now honoured rather than raised to the floor, so a short value can turn transient jitter
+  into the six-strike threshold (upstream issue #1919); the floor that used to prevent this is
+  gone because the heartbeat no longer inherits a timeout nobody chose for it.
+
+  This supersedes the heartbeat statements in the released entries below, which described the
+  behaviour accurately when they were written and are kept as history: the 2.3.1-otter formula
+  `phase + 6*heartbeatTimeout + 5*max(0, interval - heartbeatTimeout)` and its "the heartbeat
+  timeout floor are unchanged" note; the 2.2.1-otter note that `Conn.requestTimeout` drives
+  "heartbeat OPTIONS"; and the 2.2.0-otter note that `connReader.timeout` is read "on every
+  heartbeat-goroutine call to `c.r.GetTimeout()`". The heartbeat now reads neither. The
+  authoritative description of detection timing lives in the package documentation, under
+  "Detecting a node that stops answering, and the limits of a caller context", not here.
+
+### Documentation
+
+- The package documentation gains a section on how a silent node is detected and which work a
+  caller's context does not bound: the control connection's ring refresh and reconnect, the
+  protocol stream a cancelled in-flight request holds until its late response or the
+  connection close, and the pool-fill wait when `Timeout` is zero and the context has no
+  deadline.
+
 ## [2.4.2-otter] - 2026-09-06
 
 This release makes a node that moved to a new address rediscoverable without server events (#1884)

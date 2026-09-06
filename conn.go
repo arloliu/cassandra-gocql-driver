@@ -161,6 +161,10 @@ type ConnConfig struct {
 	// heartbeatPhase returns the wait before a new connection's first
 	// heartbeat; connConfig resolves nil to defaultHeartbeatPhase.
 	heartbeatPhase func(interval time.Duration) time.Duration
+	// heartbeatTimeout bounds each heartbeat OPTIONS round-trip; connConfig
+	// resolves a zero or negative ClusterConfig value to
+	// heartbeatDefaultTimeout.
+	heartbeatTimeout time.Duration
 }
 
 // ConnErrorHandler handles connection errors and state changes for connections.
@@ -182,14 +186,14 @@ type Conn struct {
 	w contextWriter
 
 	writeTimeout time.Duration
-	// requestTimeout bounds request round-trips: the execInternal call timer,
-	// heartbeat OPTIONS, and startup handshake. It is deliberately decoupled
+	// requestTimeout bounds request round-trips: the execInternal call timer
+	// and the startup handshake. It is deliberately decoupled
 	// from the connReader read deadline. Idle frame/segment reads disable the
 	// read deadline (SetTimeout(0)) so an idle connection does not trip it and
 	// reconnect; that transient zero must not disarm request timers (CASSGO-125).
 	// Stored as atomic.Int64 (nanoseconds) because it is written at init and by
-	// the integration suite on live connections, and read by the heartbeat and
-	// request goroutines — the same access pattern as connReader.timeout.
+	// the integration suite on live connections, and read by the request
+	// goroutines — the same access pattern as connReader.timeout.
 	requestTimeout atomic.Int64
 	cfg            *ConnConfig
 	frameObserver  FrameHeaderObserver
@@ -747,27 +751,44 @@ func (p *protocolError) Error() string {
 
 // heartbeatInterval is the steady-state, start-to-start spacing of heartbeat OPTIONS frames on every connection,
 // independent of the connection's age and of whether the previous heartbeat succeeded.
-// With the failure threshold in Conn.heartBeat,
-// a dead connection is closed within phase + 6*heartbeatTimeout + 5*max(0, interval-heartbeatTimeout).
+// With the failure threshold in Conn.heartBeat, a connection that stops being
+// answered is closed within delta + 5*max(interval, T) + T, where T is the
+// per-attempt heartbeat timeout and delta is the wait until the connection's
+// next heartbeat, in (0, interval]. A connection whose very first heartbeat
+// fails starts from a phase in [interval/2, interval) instead.
 const heartbeatInterval = 5 * time.Second
 
-// heartbeatMinTimeout is the floor for per-OPTIONS heartbeat exec timeouts.
-// Heartbeats run on a heartbeatInterval cadence, so capping the round-trip
-// at a sub-second Session.Timeout (common for low-latency reads) would trip
-// the failure threshold under any GC pause / TCP retransmit / brief
-// coordinator hiccup and close otherwise-healthy connections (upstream #1919).
-// 5 seconds matches the steady-state heartbeat interval.
-const heartbeatMinTimeout = 5 * time.Second
+// heartbeatDefaultTimeout is the per-OPTIONS heartbeat exec timeout selected by
+// a zero (or negative) ClusterConfig.HeartbeatTimeout. It matches the
+// steady-state heartbeat interval.
+//
+// It used to be a floor applied to Session.Timeout: a sub-second Session.Timeout
+// (common for low-latency reads) capped every heartbeat at the same value, so a
+// GC pause, TCP retransmit or brief coordinator hiccup could trip the failure
+// threshold and close otherwise-healthy connections (upstream #1919). The
+// heartbeat no longer derives its timeout from Session.Timeout at all, so the
+// floor is gone; a configured HeartbeatTimeout is used as given, and its risks
+// are documented on the field rather than corrected here.
+const heartbeatDefaultTimeout = 5 * time.Second
 
-// heartbeatTimeout returns the per-attempt timeout for the heartbeat OPTIONS
-// frame. It floors at heartbeatMinTimeout so short Session.Timeout values
-// cannot cause heartbeat-driven connection storms; operators who deliberately
-// configure a longer timeout (e.g. 30s for cross-region links) keep it.
-func heartbeatTimeout(connTimeout time.Duration) time.Duration {
-	if connTimeout > heartbeatMinTimeout {
-		return connTimeout
+// resolveHeartbeatTimeout returns the per-attempt heartbeat OPTIONS timeout for
+// a configured ClusterConfig.HeartbeatTimeout.
+//
+// Zero or negative selects heartbeatDefaultTimeout; every positive value is
+// returned as given, including one below the heartbeat interval. A negative
+// duration would otherwise produce an already-expired context and fail every
+// heartbeat at once, so it is treated as unset rather than honoured.
+//
+// Parameters:
+//   - configured: the value from ClusterConfig.HeartbeatTimeout
+//
+// Returns:
+//   - time.Duration: the effective per-attempt timeout, always positive
+func resolveHeartbeatTimeout(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return heartbeatDefaultTimeout
 	}
-	return heartbeatMinTimeout
+	return configured
 }
 
 // defaultHeartbeatPhase returns a random first heartbeat wait in [interval/2, interval).
@@ -828,7 +849,7 @@ func (c *Conn) heartBeat(ctx context.Context) {
 		// The phase is used for the first wait only and is never re-applied.
 		timer.Reset(interval)
 
-		hbCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout(time.Duration(c.requestTimeout.Load())))
+		hbCtx, cancel := context.WithTimeout(ctx, c.cfg.heartbeatTimeout)
 		framer, err := c.exec(hbCtx, &writeOptionsFrame{}, nil)
 		cancel()
 		if err != nil {
@@ -1157,10 +1178,9 @@ type ConnReader interface {
 // connReader implements ConnReader.
 // It retries to read data up to 5 times or returns error.
 //
-// timeout is accessed concurrently: Read runs on the receive goroutine,
-// GetTimeout runs on the heartbeat goroutine, and SetTimeout is called both
-// at connection-init time and by the integration test suite on live
-// connections. atomic.Int64 keeps the field race-free without taking a lock
+// timeout is accessed concurrently: Read and GetTimeout run on the receive
+// goroutine, and SetTimeout is called both at connection-init time and by the
+// integration test suite on live connections. atomic.Int64 keeps the field race-free without taking a lock
 // on every read.
 type connReader struct {
 	conn    net.Conn

@@ -1172,6 +1172,51 @@ type TestServer struct {
 	// preserving all other default handling. Returns true if it wrote a
 	// response; false to fall through to the default opSupported reply.
 	optionsRespFn func(respFrame *framer, stream int) bool
+
+	// swallowPostStartupOptions makes process drop every OPTIONS received after
+	// a connection completed its startup negotiation, without writing a reply.
+	// The startup OPTIONS itself is always answered, so CreateSession still
+	// completes; only heartbeats go unanswered, which is what a node that stops
+	// responding looks like from the driver's side.
+	swallowPostStartupOptions atomic.Bool
+
+	// firstOptionCount counts the swallowed post-startup OPTIONS of the FIRST
+	// accepted connection only. It is assigned once, under mu, by that
+	// connection's serve goroutine; a replacement connection opened after the
+	// first one is closed gets its own counter and cannot disturb this one.
+	// Read it through firstOptionCounter, never by indexing a slice: the
+	// pointer is published under mu while other connections may be accepted
+	// concurrently.
+	firstOptionCount *atomic.Int64
+}
+
+// optionCounterForConn returns the OPTIONS counter for a newly accepted
+// connection, publishing the first one as firstOptionCount.
+//
+// Returns:
+//   - *atomic.Int64: a counter owned by the caller's serve goroutine
+func (srv *TestServer) optionCounterForConn() *atomic.Int64 {
+	counter := new(atomic.Int64)
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.firstOptionCount == nil {
+		srv.firstOptionCount = counter
+	}
+
+	return counter
+}
+
+// firstOptionCounter returns the counter published for the first accepted
+// connection, or nil when no connection has been accepted yet.
+//
+// Returns:
+//   - *atomic.Int64: the first connection's counter, nil before the first accept
+func (srv *TestServer) firstOptionCounter() *atomic.Int64 {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	return srv.firstOptionCount
 }
 
 func (srv *TestServer) closeWatch() {
@@ -1194,6 +1239,7 @@ func (srv *TestServer) serve() {
 		go func(conn net.Conn) {
 			var startupCompleted bool
 			var useProtoV5 bool
+			optionCount := srv.optionCounterForConn()
 
 			defer conn.Close()
 			for !srv.isClosed() {
@@ -1228,7 +1274,7 @@ func (srv *TestServer) serve() {
 					srv.onRecv(framer)
 				}
 
-				srv.process(conn, framer, &useProtoV5, &startupCompleted)
+				srv.process(conn, framer, &useProtoV5, &startupCompleted, optionCount)
 			}
 		}(conn)
 	}
@@ -1266,10 +1312,23 @@ func (srv *TestServer) errorLocked(err interface{}) {
 	srv.t.Error(err)
 }
 
-func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, startupCompleted *bool) {
+func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, startupCompleted *bool, optionCount *atomic.Int64) {
 	head := reqFrame.header
 	if head == nil {
 		srv.errorLocked("process frame with a nil header")
+		return
+	}
+
+	// Drop a post-startup OPTIONS without replying, and return so this
+	// connection's read loop keeps consuming the heartbeats that follow.
+	// Blocking here instead would park the loop on the first heartbeat and no
+	// further attempt would ever be observed.
+	if head.op == opOptions && startupCompleted != nil && *startupCompleted &&
+		srv.swallowPostStartupOptions.Load() {
+		if optionCount != nil {
+			optionCount.Add(1)
+		}
+
 		return
 	}
 	// use the configured version unless it wasn't specified

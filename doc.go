@@ -199,6 +199,41 @@
 //     (fewer retries/shorter intervals). The latter approach provides faster recovery while maintaining predictable timing
 //   - Monitoring: Enable logging to observe reconnection behavior and tune settings
 //
+// # Detecting a node that stops answering, and the limits of a caller context
+//
+// A node that keeps its sockets open but answers nothing — a paused container, a
+// partitioned host, a frozen process — is noticed by the heartbeat, not by a
+// query timeout. Every data connection sends an OPTIONS frame on a fixed
+// 5-second start-to-start interval and closes itself after six consecutive
+// failures. With T the effective ClusterConfig.HeartbeatTimeout, the time from
+// the node going silent to the connection closing is
+//
+//	delta + 5*max(5s, T) + T
+//
+// where delta is the wait until that connection's next heartbeat, anywhere in
+// (0, 5s]. A connection whose very first heartbeat fails starts from a random
+// phase in [2.5s, 5s) instead, which is what spreads a pool's heartbeats rather
+// than letting them fail in lockstep.
+//
+// At the 5-second default that is 30 to 35 seconds. Because the interval is
+// fixed at 5 seconds it dominates the sum once T drops below it, so lowering
+// HeartbeatTimeout alone cannot bring detection much under 25 seconds. The
+// heartbeat timeout does not derive from ClusterConfig.Timeout: raising the
+// query timeout to tolerate slow queries no longer slows failure detection.
+//
+// A context passed to a query bounds that query. It does not bound every piece
+// of work the driver does on its behalf, and these are the exceptions:
+//
+//   - The control connection's ring refresh and reconnect run on the session's
+//     own context, not a caller's.
+//   - A request whose caller context is cancelled while it is in flight keeps
+//     its protocol stream until the late response arrives or the connection is
+//     closed. Under a total freeze no response ever arrives, so those streams
+//     are held until the heartbeat tears the connection down — a shorter
+//     HeartbeatTimeout bounds how long that lasts.
+//   - When ClusterConfig.Timeout is zero and the caller's context has no
+//     deadline, a query waiting for a pool fill waits on the context alone.
+//
 // # Compression
 //
 // The driver supports Snappy and LZ4 compression of protocol frames.

@@ -40,8 +40,8 @@ const (
 	pauseConnTimeout = 2 * time.Second
 
 	// pauseHeartbeatInterval is the start-to-start heartbeat spacing of the pause/resume session.
-	// Together with the heartbeat timeout floor (5s), the six-failure threshold and a zero phase,
-	// a connection to a paused node is closed after 0 + 6*5s + 5*max(0, 1s-5s) = 30s,
+	// Together with the default heartbeat timeout (5s), the six-failure threshold and a zero phase,
+	// a connection to a paused node is closed after 0 + 5*max(1s, 5s) + 5s = 30s,
 	// and both connections of a pool drain within one interval of each other.
 	pauseHeartbeatInterval = time.Second
 

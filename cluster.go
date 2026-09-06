@@ -130,6 +130,32 @@ type ClusterConfig struct {
 	// ConnectTimeout has a default value of 11 seconds.
 	ConnectTimeout time.Duration
 
+	// HeartbeatTimeout bounds each heartbeat OPTIONS round-trip on a data connection.
+	//
+	// Zero or negative selects the 5-second default; a positive value is used as
+	// given, including one below the 5-second heartbeat interval. This setting is
+	// independent of Timeout: a longer query timeout no longer slows failure
+	// detection.
+	//
+	// A connection closes after six consecutive heartbeat failures, so with T the
+	// effective timeout resolved above, the time to notice a node that stops
+	// answering is roughly
+	//
+	//	delta + 5*max(5s, T) + T
+	//
+	// where delta is the wait until the connection's next heartbeat, in (0, 5s].
+	// A connection whose very first heartbeat fails starts from a phase in
+	// [2.5s, 5s) instead. The 5-second heartbeat interval dominates once T drops
+	// below it, so values under 5s buy little: 5s gives 30-35s and the achievable
+	// floor is about 25s.
+	//
+	// On a link where a multi-second OPTIONS round-trip is normal, a short value
+	// turns transient jitter into the six-strike threshold and closes healthy
+	// connections (upstream #1919).
+	//
+	// HeartbeatTimeout has a default value of 5 seconds.
+	HeartbeatTimeout time.Duration
+
 	// WriteTimeout limits the time the driver waits to write a request to a network connection.
 	// WriteTimeout should be lower than or equal to Timeout.
 	// WriteTimeout defaults to the value of Timeout.
@@ -458,6 +484,7 @@ func NewCluster(hosts ...string) *ClusterConfig {
 		CQLVersion:             "3.0.0",
 		Timeout:                11 * time.Second,
 		ConnectTimeout:         11 * time.Second,
+		HeartbeatTimeout:       heartbeatDefaultTimeout,
 		Port:                   9042,
 		NumConns:               2,
 		Consistency:            Quorum,
