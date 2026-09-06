@@ -1040,12 +1040,47 @@ func (s *singleHostReadyPolicy) Ready() bool {
 	return true
 }
 
-// ConvictionPolicy interface is used by gocql to determine if a host should be
-// marked as DOWN based on the error and host info
+// ConvictionPolicy decides whether a host that failed should be marked DOWN.
+//
+// It is consulted on exactly two paths, and on both of them the host's pool is
+// already empty: a connection pool whose fill left it with no connections
+// (hostConnPool.fillingStopped), and a control-connection dial that failed against a
+// host with no pooled connections either (controlConn.convictHost). It is not a
+// general error hook - an error on a host that still has a working connection never
+// reaches it.
+//
+// # Refusing conviction leaves the host UP with no connections
+//
+// Returning false does not mean "keep this host working". It means the host stays
+// marked UP while its pool is empty, and that state is stable:
+//
+//   - the selection policy goes on offering the host, and every query routed to it
+//     fails to find a connection;
+//   - the reconnect tick only dials hosts that are not UP, so it never retries this
+//     one;
+//   - nothing else refills the pool, because a refill is what just failed.
+//
+// The host therefore stays in that state until a topology or status event, or a
+// control-connection reconnect, causes it to be re-evaluated. An implementation that
+// wants a host to be retried should convict it: DOWN is the state the reconnect path
+// acts on.
+//
+// A policy that returns false to smooth over a single transient failure is
+// reasonable only if it eventually returns true for a host that keeps failing.
+//
+// # Reset
+//
+// Reset is part of the interface but the driver does not currently call it. An
+// implementation that accumulates per-host state must therefore bound or expire that
+// state itself rather than waiting to be told a host recovered.
 type ConvictionPolicy interface {
-	// Implementations should return `true` if the host should be convicted, `false` otherwise.
+	// AddFailure reports one failure against host and returns true if the host
+	// should be convicted - that is, marked DOWN. See the notes above on what
+	// returning false leaves behind.
 	AddFailure(error error, host *HostInfo) bool
-	// Implementations should clear out any convictions or state regarding the host.
+	// Reset should clear out any convictions or state regarding the host.
+	//
+	// The driver does not currently call it.
 	Reset(host *HostInfo)
 }
 
