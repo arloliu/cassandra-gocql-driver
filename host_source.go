@@ -179,19 +179,24 @@ type HostInfo struct {
 	preferredIP      net.IP
 	connectAddress   net.IP
 	port             int
-	dataCenter       string
-	rack             string
-	missingRack      bool
-	hostId           string
-	workload         string
-	graph            bool
-	dseVersion       string
-	partitioner      string
-	clusterName      string
-	version          cassVersion
-	state            nodeState
-	schemaVersion    string
-	tokens           []string
+	// portNamed reports whether port was named by a source rather than defaulted.
+	// True when a caller handed over the endpoint this host is reached on, or when
+	// the row itself carried a usable native_port. False when port is only
+	// ClusterConfig.Port, which no source confirmed.
+	portNamed     bool
+	dataCenter    string
+	rack          string
+	missingRack   bool
+	hostId        string
+	workload      string
+	graph         bool
+	dseVersion    string
+	partitioner   string
+	clusterName   string
+	version       cassVersion
+	state         nodeState
+	schemaVersion string
+	tokens        []string
 }
 
 // NewHostInfoFromAddrPort creates HostInfo with provided connectAddress and port.
@@ -395,6 +400,17 @@ func (h *HostInfo) Port() int {
 	return h.port
 }
 
+// PortNamed reports whether this host's port was named by a source rather than
+// defaulted from ClusterConfig.Port.
+//
+// Returns:
+//   - bool: true when the port is evidence, false when it is only a default
+func (h *HostInfo) portIsNamed() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.portNamed
+}
+
 func (h *HostInfo) update(from *HostInfo) {
 	if h == from {
 		return
@@ -552,6 +568,29 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 
 	host := &HostInfo{connectAddress: defaultAddr, port: defaultPort, missingRack: true}
 
+	// Where this host's endpoint comes from, decided before the row is read.
+	//
+	// Nothing in the row below writes connectAddress, so this is exactly the
+	// condition under which connectAddressLocked reports connectAddressSourceCaller -
+	// the same predicate that keeps the AddressTranslator away from this host further
+	// down. It has to be captured here anyway, because native_port is read before that
+	// point and the two halves of an endpoint travel together.
+	//
+	// True means the caller handed over the logical dial target: the address and port
+	// the driver is already connected through, and the pair a custom HostDialer is
+	// handed on the next dial. Neither half of it is the row's to overrule.
+	//
+	// It is deliberately not "the caller passed a port". Peer rows are read with a nil
+	// address and ClusterConfig.Port as a mere default, so keying on a non-zero port
+	// would disable the port correction for peers - the only reason native_port is
+	// read at all.
+	callerSuppliedEndpoint := validIpAddr(defaultAddr)
+
+	// The port the row itself named, if any. Assigned after the loop rather than in
+	// the case below, because the translation further down reads host.port and the
+	// row is walked in map order.
+	var rowPort int
+
 	// Process all fields from the row
 	for key, value := range row {
 		switch key {
@@ -668,7 +707,9 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 			if !ok {
 				return nil, fmt.Errorf(assertErrorMsg, "native_port", value)
 			}
-			host.port = native_port
+			// A NULL native_port scans as 0, which is not a port. Recorded either way;
+			// what to do with it is decided below.
+			rowPort = native_port
 		case "workload":
 			host.workload, ok = value.(string)
 			if !ok {
@@ -698,6 +739,19 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 		}
 	}
 
+	// The endpoint's two halves are settled together, before anything reads either.
+	//
+	// A caller-supplied endpoint is the logical dial target and the row cannot
+	// overrule either half of it. Otherwise the row is the only source, and its port
+	// counts only if it named one: a peers table without a native_port column
+	// (legacy system.peers), or with a NULL in it, leaves ClusterConfig.Port standing
+	// as a default that no source confirmed. Recording which of the two happened is
+	// what stops a defaulted port from being mistaken later for a port that changed.
+	if !callerSuppliedEndpoint && rowPort > 0 {
+		host.port = rowPort
+	}
+	host.portNamed = callerSuppliedEndpoint || rowPort > 0
+
 	// this ensures that connectAddress gets a valid IP starting with host.connectAddress and if it's not valid
 	// then falls back to an address read from the system table
 	// it is important that a system table address is not picked up UNLESS connectAddress is nil or not valid
@@ -712,11 +766,23 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 	// turn 9042 into 19042 at discovery and then 19042 into 29042 on the next reconnect.
 	// The port travels with the address: it is the port that pair was reached on.
 	if s != nil && s.cfg.AddressTranslator != nil && addrSource != connectAddressSourceCaller {
+		// Same provenance test as callerSuppliedEndpoint above, reached the long way
+		// round because connectAddressLocked also reports which system-table column
+		// the address came from.
 		ip, port := s.cfg.translateAddressPort(host.ConnectAddress(), host.port, s.logger)
 		if !validIpAddr(ip) {
 			return nil, fmt.Errorf("invalid host address (before translation: %v:%v, after translation: %v:%v)", host.ConnectAddress(), host.port, ip.String(), port)
 		}
 		host.connectAddress = ip
+		// A translator that returned a different port chose that port, so it named it:
+		// a translator that starts mapping a node somewhere else is a real endpoint
+		// change, and a legacy peers row carries no native_port to say so. One that
+		// handed the port straight back named nothing, and promoting a default to
+		// evidence here would let an absent native_port replace a working endpoint -
+		// which is what an identity or address-only translator does on every row.
+		if port != host.port {
+			host.portNamed = true
+		}
 		host.port = port
 	}
 

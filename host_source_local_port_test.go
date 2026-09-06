@@ -51,6 +51,12 @@ var localHostColumns = []string{
 	"broadcast_address",
 }
 
+// localNativePortColumn is served in addition to localHostColumns when a test asks
+// for it. It is the one column of system.local that is not text, and the one that
+// can name a port disagreeing with the endpoint the control connection was dialled
+// with.
+const localNativePortColumn = "native_port"
+
 // localHostServer scripts the system.local row a TestServer answers with.
 //
 // The broadcast address is swappable at runtime because that is what makes
@@ -71,6 +77,11 @@ type localHostServer struct {
 	// localHostIDOverride, when set, replaces hostID in the served system.local row,
 	// so a test can serve a host_id the conversion rejects.
 	localHostIDOverride atomic.Pointer[string]
+
+	// localNativePort, when non-zero, adds a native_port column to the served
+	// system.local row. Releases without that column serve no port at all, which is
+	// why the driver has to have an answer for a row that does carry one.
+	localNativePort atomic.Int64
 
 	// peers holds the rows served for the peers table; nil means no peers.
 	peers atomic.Pointer[[]peerRow]
@@ -140,6 +151,8 @@ type peerRow struct {
 	rpcAddress     string
 	schemaVersion  string
 	tokens         []string
+	// nativePort, when non-zero, is served as the row's native_port.
+	nativePort int
 }
 
 // peerRowColumns lists the columns writePeerRows serves; tokens is a set<text>,
@@ -154,6 +167,7 @@ var peerRowColumns = []string{
 	"rpc_address",
 	"schema_version",
 	"tokens",
+	"native_port",
 }
 
 // localSchemaVersion is the schema_version the fixture serves for its own node
@@ -650,6 +664,8 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 			f.writeShort(uint16(TypeVarchar))
 		case "schema_version":
 			f.writeShort(uint16(TypeUUID))
+		case "native_port":
+			f.writeShort(uint16(TypeInt))
 		default:
 			f.writeShort(uint16(TypeVarchar))
 		}
@@ -664,6 +680,11 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 		f.writeBytes([]byte(row.rpcAddress))
 		f.writeBytes(encodeUUIDColumn(row.schemaVersion))
 		f.writeBytes(encodeTextSet(row.tokens))
+		if row.nativePort == 0 {
+			f.writeBytes(nil)
+			continue
+		}
+		f.writeBytes(encodeIntColumn(row.nativePort))
 	}
 }
 
@@ -723,6 +744,14 @@ func (s *localHostServer) localHostID() string {
 		return *override
 	}
 	return s.hostID
+}
+
+// setLocalNativePort makes later system.local reads carry a native_port column.
+//
+// Parameters:
+//   - port: the port to serve; 0 removes the column
+func (s *localHostServer) setLocalNativePort(port int) {
+	s.localNativePort.Store(int64(port))
 }
 
 // setBroadcastAddress changes the broadcast_address served by later system.local reads.
@@ -839,20 +868,44 @@ func (s *localHostServer) writeLocalRow(f *framer, stream int) {
 		"broadcast_address": *s.broadcastAddress.Load(),
 	}
 
+	columns := localHostColumns
+	nativePort := int(s.localNativePort.Load())
+	if nativePort != 0 {
+		columns = append(append([]string{}, columns...), localNativePortColumn)
+	}
+
 	f.writeHeader(0, opResult, stream)
 	f.writeInt(resultKindRows)
 	f.writeInt(int32(flagGlobalTableSpec))
-	f.writeInt(int32(len(localHostColumns)))
+	f.writeInt(int32(len(columns)))
 	f.writeString("system")
 	f.writeString("local")
-	for _, name := range localHostColumns {
+	for _, name := range columns {
 		f.writeString(name)
+		if name == localNativePortColumn {
+			f.writeShort(uint16(TypeInt))
+			continue
+		}
 		f.writeShort(uint16(TypeVarchar))
 	}
 	f.writeInt(1) // rows count
-	for _, name := range localHostColumns {
+	for _, name := range columns {
+		if name == localNativePortColumn {
+			f.writeBytes(encodeIntColumn(nativePort))
+			continue
+		}
 		f.writeBytes([]byte(values[name]))
 	}
+}
+
+// encodeIntColumn encodes a CQL int value.
+//
+// Returns:
+//   - []byte: the 4-byte big-endian encoding
+func encodeIntColumn(v int) []byte {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(int32(v)))
+	return b[:]
 }
 
 // DialHost dials the fixed target, whatever host the driver asked for.
