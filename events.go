@@ -41,6 +41,11 @@ type eventDebouncer struct {
 
 	callback func([]frame)
 
+	// onOverflow, when non-nil, is called once for every event the buffer had no
+	// room for. It is called with mu released, because it reaches components with
+	// locks of their own.
+	onOverflow func()
+
 	// firstPending is when the oldest event still waiting to be flushed arrived.
 	// Zero when nothing is pending. Guarded by mu.
 	firstPending time.Time
@@ -59,14 +64,28 @@ type eventDebouncer struct {
 	logger StructuredLogger
 }
 
-func newEventDebouncer(name string, eventHandler func([]frame), logger StructuredLogger) *eventDebouncer {
+// newEventDebouncer starts a debouncer that batches events into eventHandler.
+//
+// Parameters:
+//   - name: the name reported in logs
+//   - eventHandler: receives each batch, on its own goroutine
+//   - onOverflow: called once per event dropped for want of buffer space, or nil.
+//     It must not postpone whatever compensates for the drop: an overflowing
+//     cluster would then postpone it indefinitely, which is the same starvation
+//     the drop already caused.
+//   - logger: the logger to report on
+//
+// Returns:
+//   - *eventDebouncer: running, and stopped with stop()
+func newEventDebouncer(name string, eventHandler func([]frame), onOverflow func(), logger StructuredLogger) *eventDebouncer {
 	e := &eventDebouncer{
-		name:     name,
-		quit:     make(chan struct{}),
-		done:     make(chan struct{}),
-		timer:    time.NewTimer(eventDebounceTime),
-		callback: eventHandler,
-		logger:   logger,
+		name:       name,
+		quit:       make(chan struct{}),
+		done:       make(chan struct{}),
+		timer:      time.NewTimer(eventDebounceTime),
+		callback:   eventHandler,
+		onOverflow: onOverflow,
+		logger:     logger,
 	}
 	e.timer.Stop()
 	go e.flusher()
@@ -167,14 +186,23 @@ func (e *eventDebouncer) debounce(frame frame) {
 	e.resetTimerLocked(nextDebounceDeadline(now, e.firstPending))
 
 	// TODO: probably need a warning to track if this threshold is too low
+	var overflowed bool
 	if len(e.events) < eventBufferSize {
 		e.events = append(e.events, frame)
 	} else {
+		overflowed = true
 		e.logger.Warning("Event buffer full, dropping event frame.",
 			NewLogFieldString("event_name", e.name), NewLogFieldStringer("frame", frame))
 	}
 
 	e.mu.Unlock()
+
+	// A dropped event is a topology or status change nothing else will report, so the
+	// drop has to be compensated for. Called with mu released: it reaches components
+	// that take locks of their own.
+	if overflowed && e.onOverflow != nil {
+		e.onOverflow()
+	}
 }
 
 // resetTimerLocked arms the flush timer. Call with mu held.

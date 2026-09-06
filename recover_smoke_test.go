@@ -37,7 +37,7 @@ func TestRecover_Smoke_EventDebouncerStopSync(t *testing.T) {
 
 	e := newEventDebouncer("smoke", func(frames []frame) {
 		callbacks.Add(1)
-	}, &captureLogger{})
+	}, nil, &captureLogger{})
 
 	// Wrap the flusher exit observable: spawn a watcher that watches
 	// e.done and sets flusherExited just after.

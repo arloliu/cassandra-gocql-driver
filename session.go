@@ -205,7 +205,10 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	}
 	s.schemaDescriber = newSchemaDescriber(s, newRefreshDebouncer(schemaDebounce, s.runSchemaRefresh, s.logger))
 
-	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent, s.logger)
+	// The overflow callback is a method value, not s.ringRefresher.trigger: the
+	// refresher is not built until a few lines below this, so binding its method here
+	// would capture a nil receiver and panic on the first overflow.
+	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent, s.triggerRingRefresh, s.logger)
 
 	s.routingMetadataCache = newRoutingKeyInfoLRU(cfg.MaxRoutingKeyInfo)
 

@@ -1409,6 +1409,23 @@ func (s *Session) runRingRefresh() (err error) {
 	return refreshRing(s.hostSource)
 }
 
+// triggerRingRefresh asks for a ring refresh at once, without waiting for its result.
+//
+// Unlike debounceRingRefresh it never touches the debounce timer, so a caller firing
+// faster than the debounce interval cannot postpone the refresh it is asking for.
+// That is what a caller compensating for something it just lost - a dropped event -
+// needs: postponing the compensation would reproduce the starvation it exists to
+// undo.
+//
+// The nil check is for the window during Session.init in which the event debouncer
+// exists and the ring refresher does not yet.
+func (s *Session) triggerRingRefresh() {
+	if s.ringRefresher == nil {
+		return
+	}
+	s.ringRefresher.trigger()
+}
+
 // debounceRingRefresh submits a ring refresh request to the ring refresh debouncer.
 func (s *Session) debounceRingRefresh() {
 	s.ringRefresher.debounce()

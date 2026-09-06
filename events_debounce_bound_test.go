@@ -95,7 +95,7 @@ func TestEventDebouncerFlushesUnderSustainedChurn(t *testing.T) {
 		case done <- struct{}{}:
 		default:
 		}
-	}, &defaultLogger{})
+	}, nil, &defaultLogger{})
 	defer d.stop()
 
 	// Churn for longer than the hard bound, spaced well under the quiet period.
@@ -138,7 +138,7 @@ func TestEventDebouncerArmsTheHardDeadline(t *testing.T) {
 	)
 	var flushed atomic.Bool
 
-	d := newEventDebouncer("bound", func([]frame) { flushed.Store(true) }, &defaultLogger{})
+	d := newEventDebouncer("bound", func([]frame) { flushed.Store(true) }, nil, &defaultLogger{})
 	defer d.stop()
 	d.onResetTimer = func(delay time.Duration) {
 		mu.Lock()
@@ -166,4 +166,68 @@ func TestEventDebouncerArmsTheHardDeadline(t *testing.T) {
 	}
 	require.True(t, shortened,
 		"the hard deadline must have shortened at least one delay below the quiet period")
+}
+
+// TestEventBufferOverflowRequestsARingRefresh pins the compensation half of F-AH-3.
+//
+// An event that does not fit the buffer is dropped, and node events are the only
+// path that reports a node appearing or leaving, so nothing else will ever mention
+// what was dropped. A ring refresh is the compensation: it re-reads membership from
+// the system tables directly.
+//
+// This test drives the real Session wiring on purpose. The refresher is built after
+// the event debouncer, so a hand-assembled debouncer with a callback wired straight
+// to the refresher would bypass the nil receiver a naive method binding captures -
+// and would pass while the driver panicked on its first overflow.
+func TestEventBufferOverflowRequestsARingRefresh(t *testing.T) {
+	refreshes := make(chan error, 64)
+	_, _, _, session := startLocalHostFixture(t, "", func(cluster *ClusterConfig, _ string) {
+		cluster.testRingRefreshDone = func(err error) {
+			select {
+			case refreshes <- err:
+			default:
+			}
+		}
+	})
+
+	drain := func() {
+		for {
+			select {
+			case <-refreshes:
+			default:
+				return
+			}
+		}
+	}
+	overflow := func() {
+		for i := 0; i <= eventBufferSize; i++ {
+			session.nodeEvents.debounce(&statusChangeEventFrame{
+				change: "DOWN", host: net.IPv4(127, 0, 0, 1), port: 9042,
+			})
+		}
+	}
+
+	drain()
+	overflow()
+
+	// A triggered refresh is immediate. A debounced one would wait out the debounce
+	// interval, which is what makes this assertion discriminating.
+	select {
+	case <-refreshes:
+	case <-time.After(ringRefreshDebounceTime / 2):
+		t.Fatal("an overflowing event buffer must request a ring refresh at once")
+	}
+
+	// Sustained overflow must not postpone the compensation it is asking for. A
+	// debounced request would push the timer out on every drop, so a cluster
+	// overflowing continuously would never see the refresh it needs most.
+	for round := 0; round < 3; round++ {
+		drain()
+		overflow()
+		select {
+		case <-refreshes:
+		case <-time.After(ringRefreshDebounceTime / 2):
+			t.Fatalf("round %d: repeated overflow must not postpone the compensating refresh", round)
+		}
+	}
 }
