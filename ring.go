@@ -180,7 +180,16 @@ func (r *ring) removeHost(hostID string) bool {
 				break
 			}
 		}
-		delete(r.hostIPToUUID, h.nodeToNodeAddress().String())
+		// Only drop the index entry if it still names this host. Two ring entries can
+		// share one node-to-node address - a node replaced under a new host_id keeps
+		// the address, and addHostIfMissing points the key at the newcomer - and
+		// deleting it unconditionally here erases the survivor's only index entry, so
+		// every later status event for that address resolves to nothing and is
+		// silently dropped.
+		addr := h.nodeToNodeAddress().String()
+		if r.hostIPToUUID[addr] == hostID {
+			delete(r.hostIPToUUID, addr)
+		}
 	}
 	delete(r.hosts, hostID)
 	r.mu.Unlock()

@@ -95,3 +95,37 @@ func TestRingGetHostByIPRejectsAStaleIndexEntry(t *testing.T) {
 		t.Fatalf("a miss must not carry a host: got %v", got)
 	}
 }
+
+// TestRingRemoveHostKeepsAnIndexEntryTheSurvivorOwns pins F-AH-6, the ring half.
+//
+// removeHost deleted the address index entry unconditionally. Two ring entries can
+// share one node-to-node address - a node replaced under a new host_id keeps the
+// address, and addHostIfMissing repoints the key at the newcomer - so removing the
+// old entry erased the only index entry the survivor had. Every later status event
+// for that address then resolves to nothing and is dropped without a trace: the node
+// is in the ring, reachable, and unreachable to UP and DOWN handling.
+func TestRingRemoveHostKeepsAnIndexEntryTheSurvivorOwns(t *testing.T) {
+	r := &ring{}
+	shared := net.IPv4(10, 0, 0, 9)
+	departing := &HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), broadcastAddress: shared, hostId: "idA"}
+	survivor := &HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), broadcastAddress: shared, hostId: "idB"}
+
+	r.addHostIfMissing(departing)
+	r.addHostIfMissing(survivor) // repoints the shared key at idB
+
+	r.removeHost("idA")
+
+	got, ok := r.getHostByIP(shared.String())
+	if !ok {
+		t.Fatal("the survivor must still be reachable through the address index")
+	}
+	if got != survivor {
+		t.Fatalf("the index must resolve to the survivor: got %v", got)
+	}
+
+	// Removing the host the key does name still clears it.
+	r.removeHost("idB")
+	if _, ok := r.getHostByIP(shared.String()); ok {
+		t.Fatal("removing the indexed host must clear its entry")
+	}
+}
