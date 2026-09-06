@@ -960,7 +960,12 @@ func (pool *hostConnPool) fill() (handedOff bool) {
 
 		if err == nil && startCount > 0 {
 			// notify the session that this node is connected again
-			go pool.session.handleNodeConnected(pool.host)
+			// handleNodeConnected runs application HostUp callbacks,
+			// so it is recovered like the initial-fill notification above.
+			go func() {
+				defer recoverGoroutine(pool.logger, "Session.handleNodeConnected", nil)
+				pool.session.handleNodeConnected(pool.host)
+			}()
 		}
 	}()
 
