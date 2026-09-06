@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1-otter] - 2026-09-06
+
+Ring convergence. Several independent paths could make a live node disappear from the ring,
+or freeze ring maintenance altogether, with nothing on a healthy quiet cluster that would
+ever undo it. No exported API changes; nothing exported changes meaning.
+
+### Fixed
+
+- **An unparseable row in the peers table no longer stops ring maintenance for the life of
+  the session.** The reader closed its iterator on a per-row conversion error and then kept
+  reading from it; the close releases the framer and nils it, so the next read dereferenced
+  nil and panicked on the ring refresher's flusher, whose recover-and-stop is terminal. From
+  that point every refresh failed fast and the ring stayed frozen at whatever it last held.
+  Such a row is now skipped with the iterator left open, and a panic anywhere in a refresh is
+  reported as a failed round instead of reaching that flusher. The guarantee is narrow on
+  purpose: the flusher survives and the next round runs. It is not that the ring was
+  repaired - a panic after a host was inserted leaves it without its pool and policy
+  publication, and an unchanged endpoint on the next round does not make that up.
+
+- **The three readers of a host-metadata table no longer leak the framer of the iterator they
+  open.** Both single-row readers leaked it on their success path outright, and all three
+  leaked it whenever a panic - from a user-supplied `AddressTranslator`, `HostFilter` or
+  logger - unwound the call. `controlConn.setupConn` also gained the nil-iterator guard its
+  two siblings already had.
+
+- **A node that changes only its native transport port is reconciled again.** The endpoint
+  comparison ignored the port, so such a node took the "no change" branch and the new port was
+  discarded; the ring kept the old endpoint and every dial went to a port nothing was
+  listening on, permanently, for as long as its addresses stayed put.
+
+  Only a port a source actually named counts as a change. A `HostInfo`'s port is evidence when
+  the caller supplied the endpoint the driver is connected through, when the row carried a
+  usable `native_port`, or when an `AddressTranslator` returned a different port than it was
+  given. A peers table with no `native_port` column - what a control connection falls back to
+  when the `peers_v2` probe failed - or a NULL in that column leaves `ClusterConfig.Port`
+  standing as a default that no source confirmed, and reading that silence as a change would
+  remove a node reached on a non-default port and rebuild its pool against 9042.
+
+- **A single invalid peer row no longer evicts a healthy node.** A null rack from a snitch
+  that had not caught up, or an empty token set on a node still joining, was enough: the host
+  had no row in the snapshot, so the sweep removed it, closed its pool and told the selection
+  policy it was gone - and on a healthy quiet ring nothing reads the peers table again on its
+  own to undo that. It now takes three consecutive such observations, and any valid row resets
+  the count. A snapshot carrying a row that can be attributed to no host at all is treated as
+  incomplete membership information and its sweep is skipped entirely, while endpoint changes
+  in the same round are still reconciled.
+
+  Note: until the periodic full ring refresh lands, when a host retained this way reconverges
+  depends on what triggers the next refresh. A healthy, quiet ring has no autonomous
+  re-discovery.
+
+- **`ring.getHostByIP` no longer reports a removed host as found**, which handed callers a nil
+  host they went on to dereference, panicking the event-handling goroutine. And removing a
+  host no longer deletes an address index entry that a different, surviving host owns - which
+  left that host in the ring but invisible to UP and DOWN handling, with nothing to rebuild
+  the entry.
+
+- **Node event debouncing is bounded.** Every event restarted the quiet period, so events
+  arriving faster than one per second - a rolling restart, a flapping node - postponed the
+  flush for the whole burst, and node events are the only path that reports a node appearing
+  or leaving. A hard deadline now runs from the first event still waiting. An event dropped
+  for want of buffer space also asks for a ring refresh, since nothing else will ever mention
+  what was dropped.
+
+- **The reconnect tick no longer dials hosts the `HostFilter` rejects.** Such a host can sit
+  DOWN in the ring, and every dial was wasted work against a node the application excluded on
+  purpose.
+
+### Changed
+
+- `ConvictionPolicy` is documented rather than changed. Returning false from `AddFailure`
+  reads like "do not give up on this host", but both call sites reach it only when the host's
+  pool is already empty, so refusing conviction leaves the host UP with no connections - and
+  that state is stable, because the reconnect tick only dials hosts that are not UP. `Reset`
+  is part of the interface and the driver never calls it.
+
 ## [2.5.0-otter] - 2026-09-06
 
 This release makes `Session.Close` terminal, unblocks a control-connection reconnect that could
