@@ -153,6 +153,9 @@ type peerRow struct {
 	tokens         []string
 	// nativePort, when non-zero, is served as the row's native_port.
 	nativePort int
+	// nullNativePort serves native_port as NULL while the column is present, which
+	// is not the same as the column being absent.
+	nullNativePort bool
 }
 
 // peerRowColumns lists the columns writePeerRows serves; tokens is a set<text>,
@@ -167,8 +170,13 @@ var peerRowColumns = []string{
 	"rpc_address",
 	"schema_version",
 	"tokens",
-	"native_port",
 }
+
+// peerNativePortColumn is served in addition to peerRowColumns when any row in the
+// batch names a port. It is served conditionally because releases without it serve
+// no port at all, and because a null in it does not read back as "absent": the
+// column decodes to int(0), which newHostInfoFromRow would take as the peer's port.
+const peerNativePortColumn = "native_port"
 
 // localSchemaVersion is the schema_version the fixture serves for its own node
 // and, by default, for every peer, so a schema agreement wait converges unless a
@@ -650,13 +658,30 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 		rows = *p
 	}
 
+	// The column is either served for every row or for none: a row left at 0 while
+	// the column is present reads back as port 0, not as "no port", which is a silent
+	// way to test the wrong thing.
+	withPort := 0
+	for _, row := range rows {
+		if row.nativePort != 0 || row.nullNativePort {
+			withPort++
+		}
+	}
+	if withPort != 0 && withPort != len(rows) {
+		panic("localHostServer: either every scripted peer row sets nativePort or none does")
+	}
+	columns := peerRowColumns
+	if withPort != 0 {
+		columns = append(append([]string{}, columns...), peerNativePortColumn)
+	}
+
 	f.writeHeader(0, opResult, stream)
 	f.writeInt(resultKindRows)
 	f.writeInt(int32(flagGlobalTableSpec))
-	f.writeInt(int32(len(peerRowColumns)))
+	f.writeInt(int32(len(columns)))
 	f.writeString("system")
 	f.writeString("peers")
-	for _, name := range peerRowColumns {
+	for _, name := range columns {
 		f.writeString(name)
 		switch name {
 		case "tokens":
@@ -664,7 +689,7 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 			f.writeShort(uint16(TypeVarchar))
 		case "schema_version":
 			f.writeShort(uint16(TypeUUID))
-		case "native_port":
+		case peerNativePortColumn:
 			f.writeShort(uint16(TypeInt))
 		default:
 			f.writeShort(uint16(TypeVarchar))
@@ -680,11 +705,13 @@ func (s *localHostServer) writePeerRows(f *framer, stream int) {
 		f.writeBytes([]byte(row.rpcAddress))
 		f.writeBytes(encodeUUIDColumn(row.schemaVersion))
 		f.writeBytes(encodeTextSet(row.tokens))
-		if row.nativePort == 0 {
-			f.writeBytes(nil)
-			continue
+		if len(columns) > len(peerRowColumns) {
+			if row.nullNativePort {
+				f.writeBytes(nil)
+			} else {
+				f.writeBytes(encodeIntColumn(row.nativePort))
+			}
 		}
-		f.writeBytes(encodeIntColumn(row.nativePort))
 	}
 }
 
