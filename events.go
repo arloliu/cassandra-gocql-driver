@@ -40,7 +40,16 @@ type eventDebouncer struct {
 	events []frame
 
 	callback func([]frame)
-	quit     chan struct{}
+
+	// firstPending is when the oldest event still waiting to be flushed arrived.
+	// Zero when nothing is pending. Guarded by mu.
+	firstPending time.Time
+
+	// onResetTimer, when non-nil, observes every delay the debouncer arms
+	// (internal, for testing).
+	onResetTimer func(delay time.Duration)
+
+	quit chan struct{}
 	// done is closed when the flusher goroutine exits, allowing stop()
 	// to wait until callback dispatch has actually ceased. Without this,
 	// a Session.Close → stop() could return before a pending timer tick
@@ -95,10 +104,44 @@ func (e *eventDebouncer) flusher() {
 const (
 	eventBufferSize   = 1000
 	eventDebounceTime = 1 * time.Second
+
+	// eventMaxDebounce bounds how long the first event of a burst can be held.
+	//
+	// The quiet period alone has no bound: it restarts on every event, so a cluster
+	// producing them faster than eventDebounceTime - a rolling restart, a flapping
+	// node - postpones the flush for as long as the churn lasts, and the topology
+	// changes those events describe are never acted on.
+	eventMaxDebounce = eventDebounceTime * 4
 )
+
+// nextDebounceDeadline returns how long to wait before flushing, given when the
+// oldest pending event arrived.
+//
+// Two deadlines apply and the earlier one wins: the quiet period, which restarts on
+// every event, and a hard deadline measured from the first pending event, which does
+// not. Taking the earlier one on every event is what makes the hard deadline real -
+// simply declining to extend the quiet period once the bound is passed leaves an
+// expiry that an earlier event already pushed beyond it.
+//
+// Parameters:
+//   - now: the current time
+//   - firstPending: when the oldest pending event arrived
+//
+// Returns:
+//   - time.Duration: the delay to arm; zero or negative means flush now
+func nextDebounceDeadline(now, firstPending time.Time) time.Duration {
+	next := now.Add(eventDebounceTime)
+	if hard := firstPending.Add(eventMaxDebounce); hard.Before(next) {
+		next = hard
+	}
+	return next.Sub(now)
+}
 
 // flush must be called with mu locked
 func (e *eventDebouncer) flush() {
+	// Cleared whether or not there is anything to send, so the hard deadline of the
+	// next burst is measured from that burst's own first event.
+	e.firstPending = time.Time{}
 	if len(e.events) == 0 {
 		return
 	}
@@ -117,7 +160,11 @@ func (e *eventDebouncer) flush() {
 
 func (e *eventDebouncer) debounce(frame frame) {
 	e.mu.Lock()
-	e.timer.Reset(eventDebounceTime)
+	now := time.Now()
+	if e.firstPending.IsZero() {
+		e.firstPending = now
+	}
+	e.resetTimerLocked(nextDebounceDeadline(now, e.firstPending))
 
 	// TODO: probably need a warning to track if this threshold is too low
 	if len(e.events) < eventBufferSize {
@@ -128,6 +175,17 @@ func (e *eventDebouncer) debounce(frame frame) {
 	}
 
 	e.mu.Unlock()
+}
+
+// resetTimerLocked arms the flush timer. Call with mu held.
+//
+// Parameters:
+//   - delay: how long to wait; zero or negative arms an immediate expiry
+func (e *eventDebouncer) resetTimerLocked(delay time.Duration) {
+	if e.onResetTimer != nil {
+		e.onResetTimer(delay)
+	}
+	e.timer.Reset(delay)
 }
 
 func (s *Session) handleEvent(framer *framer) {
