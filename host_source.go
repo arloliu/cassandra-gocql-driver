@@ -729,6 +729,98 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 }
 
 // this will return nil, nil if there were no rows left in the Iter
+// peerRowError marks a failure to convert one row of a host-metadata table into a
+// HostInfo.
+//
+// It is the one error class that leaves the iterator open, so a caller may skip the
+// row and keep reading; every other error hostInfoFromIter returns comes from the
+// iterator itself and means the iterator is already closed.
+//
+// It carries whatever identity could still be read from the row, so a caller can
+// tell which host it failed to parse. hostID is preferred; nodeToNodeAddr is the
+// fallback and is only usable when it resolves to exactly one ring member.
+type peerRowError struct {
+	err error
+	// hostID is the row's host_id, or "" when the column was absent or unparseable.
+	hostID string
+	// nodeToNodeAddr is the address HostInfo.nodeToNodeAddress would have derived
+	// from this row - the address the ring indexes its hosts by - or "" when no
+	// address column was readable.
+	nodeToNodeAddr string
+}
+
+// Error describes the failure and names the row as precisely as the row allowed.
+//
+// Returns:
+//   - string: the message, carrying host_id, else the node-to-node address, else neither
+func (e *peerRowError) Error() string {
+	switch {
+	case e.hostID != "":
+		return fmt.Sprintf("could not convert the row for host %s: %v", e.hostID, e.err)
+	case e.nodeToNodeAddr != "":
+		return fmt.Sprintf("could not convert the row at %s: %v", e.nodeToNodeAddr, e.err)
+	default:
+		return fmt.Sprintf("could not convert an unidentifiable row: %v", e.err)
+	}
+}
+
+// Unwrap exposes the conversion error itself.
+func (e *peerRowError) Unwrap() error { return e.err }
+
+// rowIP reads one address column of a host-metadata row, best effort.
+//
+// Parameters:
+//   - row: the scanned row
+//   - column: the column to read
+//
+// Returns:
+//   - net.IP: the address, or nil when the column is absent or unreadable
+func rowIP(row map[string]interface{}, column string) net.IP {
+	switch v := row[column].(type) {
+	case net.IP:
+		return v
+	case string:
+		return net.ParseIP(v)
+	}
+	return nil
+}
+
+// rowHostID reads the host_id of a host-metadata row, best effort.
+//
+// Parameters:
+//   - row: the scanned row
+//
+// Returns:
+//   - string: the canonical host_id, or "" when it was absent or unparseable
+func rowHostID(row map[string]interface{}) string {
+	switch v := row["host_id"].(type) {
+	case UUID:
+		return v.String()
+	case string:
+		if hostID, err := ParseUUID(v); err == nil {
+			return hostID.String()
+		}
+	}
+	return ""
+}
+
+// rowNodeToNodeAddress reads the address a row's host would be indexed by,
+// best effort, using the same precedence as HostInfo.nodeToNodeAddress.
+//
+// Parameters:
+//   - row: the scanned row
+//
+// Returns:
+//   - string: the address, or "" when no address column was readable
+func rowNodeToNodeAddress(row map[string]interface{}) string {
+	for _, column := range []string{"broadcast_address", "peer"} {
+		if ip := rowIP(row, column); validIpAddr(ip) {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
 func (s *Session) hostInfoFromIter(iter *Iter, connectAddress net.IP, defaultPort int) (*HostInfo, error) {
 	// TODO: switch this to a new iterator method once CASSGO-36 is solved
 	m := map[string]interface{}{
@@ -746,7 +838,14 @@ func (s *Session) hostInfoFromIter(iter *Iter, connectAddress net.IP, defaultPor
 
 	host, err := s.newHostInfoFromMap(connectAddress, defaultPort, m)
 	if err != nil {
-		return nil, err
+		// The iterator is deliberately left open and positioned: only the conversion
+		// of this one row failed, so a caller that can skip the row keeps reading from
+		// it. Callers that cannot must close it themselves - see peerRowError.
+		return nil, &peerRowError{
+			err:            err,
+			hostID:         rowHostID(m),
+			nodeToNodeAddr: rowNodeToNodeAddress(m),
+		}
 	}
 	return host, nil
 }
@@ -813,14 +912,19 @@ func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([
 		// extract all available info about the peer
 		host, err := r.session.hostInfoFromIter(iter, nil, r.session.cfg.Port)
 		if err != nil {
-			// if the error came from the iterator then return it, otherwise ignore
-			// and warn
-			if iterErr := iter.Close(); iterErr != nil {
-				return nil, fmt.Errorf("unable to fetch peer host info: %s", iterErr)
+			var rowErr *peerRowError
+			if errors.As(err, &rowErr) {
+				// Deliberately not closed here. The iterator is still open and
+				// positioned on this row, so the loop skips it and reads the next one.
+				// Closing it and continuing is the bug itself: Close releases the framer
+				// and nils it, and the next MapScan then dereferences nil on the ring
+				// refresher's flusher.
+				r.session.logger.Warning("Failed to parse peer this host will be ignored.",
+					NewLogFieldError("err", rowErr))
+				continue
 			}
-			// skip over peers that we couldn't parse
-			r.session.logger.Warning("Failed to parse peer this host will be ignored.", NewLogFieldError("err", err))
-			continue
+			// Any other error came from the iterator, which hostInfoFromIter closed.
+			return nil, fmt.Errorf("unable to fetch peer host info: %w", err)
 		}
 		// if nil then none left
 		if host == nil {
