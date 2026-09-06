@@ -56,6 +56,13 @@ func (d *portRecordingDialer) DialHost(ctx context.Context, host *HostInfo) (*Di
 	return &DialedHost{Conn: conn}, nil
 }
 
+// reset forgets every endpoint recorded so far.
+func (d *portRecordingDialer) reset() {
+	d.mu.Lock()
+	d.asked = nil
+	d.mu.Unlock()
+}
+
 // askedFor reports whether the dialer was ever handed this endpoint.
 func (d *portRecordingDialer) askedFor(endpoint string) bool {
 	d.mu.Lock()

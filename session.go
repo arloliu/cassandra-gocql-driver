@@ -569,6 +569,13 @@ func (s *Session) reconnectDownedHostsOnce() {
 		if h.IsUp() {
 			continue
 		}
+		if s.cfg.filterHost(h) {
+			// A filtered host can sit DOWN in the ring - the control connection adds
+			// its host before filtering, and a DOWN sets the state before the filter is
+			// consulted - but the pool never admits it, so every dial here is wasted
+			// work against a node the application excluded on purpose.
+			continue
+		}
 		s.logger.Debug("Reconnecting to downed host.",
 			NewLogFieldIP("host_addr", h.ConnectAddress()),
 			NewLogFieldInt("host_port", h.Port()),
