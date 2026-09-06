@@ -379,6 +379,16 @@ func (c *controlConn) setupCandidate(host *HostInfo, cfg *ConnConfig, sessionIni
 func (c *controlConn) setupConn(conn *Conn, sessionInit bool) error {
 	// we need up-to-date host info for the filterHost call below
 	iter := conn.querySystemLocal(context.TODO())
+	if iter == nil {
+		return errNoControl
+	}
+	// Release on every path: like getLocalHostInfo this reader gives up after one
+	// row, so the iterator is never run dry, and everything below - the conversion,
+	// the HostFilter, the event registration - can panic with it still open.
+	defer iter.Close()
+	if c.session.cfg.testHostMetadataIter != nil {
+		c.session.cfg.testHostMetadataIter(iter)
+	}
 	// The address and the port both come from the HostInfo this connection was dialled
 	// with, so the pair published to the ring is the logical dial target: what the next
 	// dial to this host is made with, and what a custom HostDialer is handed.
@@ -390,8 +400,6 @@ func (c *controlConn) setupConn(conn *Conn, sessionInit bool) error {
 	// ringDescriber.getLocalHostInfo keeps the same pair on every later refresh.
 	host, err := c.session.hostInfoFromIter(iter, conn.host.ConnectAddress(), conn.host.Port())
 	if err != nil {
-		// just cleanup
-		iter.Close()
 		return fmt.Errorf("could not retrieve control host info: %w", err)
 	}
 	if host == nil {

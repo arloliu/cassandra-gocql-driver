@@ -68,6 +68,10 @@ type localHostServer struct {
 	// broadcastAddress is the value served for the broadcast_address column.
 	broadcastAddress atomic.Pointer[string]
 
+	// localHostIDOverride, when set, replaces hostID in the served system.local row,
+	// so a test can serve a host_id the conversion rejects.
+	localHostIDOverride atomic.Pointer[string]
+
 	// peers holds the rows served for the peers table; nil means no peers.
 	peers atomic.Pointer[[]peerRow]
 
@@ -699,6 +703,28 @@ func encodeTextSet(values []string) []byte {
 	return buf
 }
 
+// setLocalHostID overrides the host_id served by later system.local reads.
+//
+// A value ParseUUID rejects makes the local row unconvertible, which is the one
+// way to fail getLocalHostInfo inside the conversion rather than at the read.
+//
+// Parameters:
+//   - hostID: the value to serve
+func (s *localHostServer) setLocalHostID(hostID string) {
+	s.localHostIDOverride.Store(&hostID)
+}
+
+// localHostID returns the host_id later system.local reads serve.
+//
+// Returns:
+//   - string: the override if one was installed, else the fixture's own host id
+func (s *localHostServer) localHostID() string {
+	if override := s.localHostIDOverride.Load(); override != nil {
+		return *override
+	}
+	return s.hostID
+}
+
 // setBroadcastAddress changes the broadcast_address served by later system.local reads.
 //
 // Parameters:
@@ -804,7 +830,7 @@ func (s *localHostServer) handle(srv *TestServer, reqFrame, respFrame *framer) e
 func (s *localHostServer) writeLocalRow(f *framer, stream int) {
 	values := map[string]string{
 		"key":               "local",
-		"host_id":           s.hostID,
+		"host_id":           s.localHostID(),
 		"data_center":       s.dataCenter,
 		"rack":              s.rack,
 		"release_version":   s.releaseVersion,

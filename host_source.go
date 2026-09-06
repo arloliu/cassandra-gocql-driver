@@ -863,6 +863,14 @@ func (r *ringDescriber) getLocalHostInfo(ch *connHost) (*HostInfo, error) {
 	if iter == nil {
 		return nil, errNoControl
 	}
+	// Release on every path. This reader gives up on the iterator after one row, so
+	// it never runs it dry, and a per-row conversion error deliberately leaves it
+	// open (see peerRowError) - without this the framer is leaked on the success
+	// path outright, and on any path a panic unwinds through.
+	defer iter.Close()
+	if r.session.cfg.testHostMetadataIter != nil {
+		r.session.cfg.testHostMetadataIter(iter)
+	}
 
 	// Keep the address and the port the control connection was dialled with,
 	// ignoring the address from system.local.
@@ -882,8 +890,6 @@ func (r *ringDescriber) getLocalHostInfo(ch *connHost) (*HostInfo, error) {
 	// every later dial then goes to the wrong port.
 	host, err := r.session.hostInfoFromIter(iter, iter.host.actualConnectAddress(), iter.host.Port())
 	if err != nil {
-		// just cleanup
-		iter.Close()
 		return nil, fmt.Errorf("could not retrieve local host info: %w", err)
 	}
 	if host == nil {
@@ -905,6 +911,18 @@ func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([
 	iter := ch.conn.querySystemPeers(context.TODO(), localHost.version)
 	if iter == nil {
 		return nil, errNoControl
+	}
+	// Release on every path. The loop below deliberately keeps the iterator open
+	// across a row it could not convert, so a panic from the Warning it logs there,
+	// or from user code inside the conversion itself, unwinds straight to the ring
+	// refresher with the iterator never run dry. Close is idempotent under a CAS, so
+	// this does not double-release the framer on the ordinary path.
+	//
+	// The defer fires when this function returns, not between rows, so it does not
+	// conflict with the row-error branch keeping the iterator open.
+	defer iter.Close()
+	if r.session.cfg.testHostMetadataIter != nil {
+		r.session.cfg.testHostMetadataIter(iter)
 	}
 
 	var peers []*HostInfo

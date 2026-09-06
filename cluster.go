@@ -416,6 +416,16 @@ type ClusterConfig struct {
 	// system.local and its peers read (internal, for testing); nil in production.
 	testRingSnapshotHook func()
 
+	// testHostMetadataIter is called by each of the three readers of a host-metadata
+	// table - ringDescriber.getLocalHostInfo, ringDescriber.getClusterPeerInfo and
+	// controlConn.setupConn - with the iterator it just opened (internal, for
+	// testing); nil in production.
+	//
+	// It runs after that reader has installed its release defer, so a test can both
+	// hold the iterator to assert it was released and panic from the hook to prove
+	// the release survives a panic.
+	testHostMetadataIter func(iter *Iter)
+
 	// testSchemaRefreshHook is called when a schema refresh starts
 	// and testSchemaRefreshDone when it ends, with its result (internal, for testing);
 	// both nil in production.
