@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the six-strike threshold (upstream issue #1919); the floor that used to prevent this is
   gone because the heartbeat no longer inherits a timeout nobody chose for it.
 
+  The bound covers the wait for the response and for the connection's writer to accept the
+  frame. It does not interrupt a socket write already in progress, which is bounded by
+  `WriteTimeout` — itself defaulting to `Timeout` — so on a connection whose writes block, a
+  long query timeout can still delay a heartbeat. `HeartbeatTimeout` is independent of
+  `Timeout` for the case failure detection is about: a node that accepts writes and answers
+  nothing.
+
   This supersedes the heartbeat statements in the released entries below, which described the
   behaviour accurately when they were written and are kept as history: the 2.3.1-otter formula
   `phase + 6*heartbeatTimeout + 5*max(0, interval - heartbeatTimeout)` and its "the heartbeat

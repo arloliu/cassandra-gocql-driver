@@ -137,6 +137,14 @@ type ClusterConfig struct {
 	// independent of Timeout: a longer query timeout no longer slows failure
 	// detection.
 	//
+	// It bounds the wait for the response and, before that, the wait for the
+	// connection's writer to accept the frame. It does not interrupt a socket write
+	// already in progress: that is bounded by WriteTimeout, which itself defaults to
+	// Timeout. Nor does it interrupt the wait for a frame the coalescer has accepted
+	// but not yet flushed, which is WriteCoalesceWaitTime. On a connection whose
+	// writes block, or with coalescing configured into the seconds, raising those
+	// still delays a heartbeat however short this timeout is.
+	//
 	// A connection closes after six consecutive heartbeat failures, so with T the
 	// effective timeout resolved above, the time to notice a node that stops
 	// answering is roughly

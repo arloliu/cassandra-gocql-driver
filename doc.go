@@ -221,6 +221,15 @@
 // heartbeat timeout does not derive from ClusterConfig.Timeout: raising the
 // query timeout to tolerate slow queries no longer slows failure detection.
 //
+// The formula describes a node that accepts writes and stops answering, which
+// is the case it is meant to cover. A socket whose writes themselves block is
+// bounded by ClusterConfig.WriteTimeout instead: a write already in progress is
+// never interrupted by a request context, so the whole frame is either written
+// or not written at all. WriteTimeout defaults to ClusterConfig.Timeout, so a
+// long query timeout can still delay a heartbeat on such a connection. The wait
+// for an accepted frame to be flushed is likewise ClusterConfig.WriteCoalesceWaitTime,
+// which the formula assumes is the default 200 microseconds rather than seconds.
+//
 // A context passed to a query bounds that query. It does not bound every piece
 // of work the driver does on its behalf, and these are the exceptions:
 //
@@ -244,6 +253,11 @@
 //     to: a caller waiting on another caller's in-flight metadata load waits for
 //     that load, not for its own context. A token-aware query can reach this
 //     before it reaches the prepared-statement cache at all.
+//   - A socket write already in progress is never interrupted, so the time to
+//     write a request is bounded by ClusterConfig.WriteTimeout rather than by the
+//     caller's context. The same holds for a frame the write coalescer has
+//     accepted but not yet flushed: it waits out ClusterConfig.WriteCoalesceWaitTime
+//     (200 microseconds by default) whatever the caller's context says.
 //
 // # Compression
 //
