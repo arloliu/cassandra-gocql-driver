@@ -47,7 +47,8 @@ type writeFailure struct {
 
 // faultingDialer redirects every dial to one address, like redirectHostDialer,
 // and wraps each connection so a test can fail exactly the writes it names:
-// QUERY frames whose statement mentions system.peers, on the connections it armed.
+// QUERY and PREPARE frames whose statement contains a substring (system.peers
+// unless setFailingStatement changed it), on the connections it armed.
 //
 // OPTIONS, STARTUP, REGISTER and system.local writes always pass, so heartbeats,
 // connection setup and the control connection's own setup keep working; only a
@@ -57,6 +58,7 @@ type faultingDialer struct {
 	target string
 
 	mu        sync.Mutex
+	statement []byte
 	refuse    bool
 	armNew    bool
 	armed     map[*faultConn]bool
@@ -73,7 +75,18 @@ type faultingDialer struct {
 var _ HostDialer = (*faultingDialer)(nil)
 
 func newFaultingDialer(target string) *faultingDialer {
-	return &faultingDialer{target: target, armed: map[*faultConn]bool{}}
+	return &faultingDialer{target: target, statement: []byte("system.peers"), armed: map[*faultConn]bool{}}
+}
+
+// setFailingStatement changes which QUERY and PREPARE writes are failed on armed
+// connections: those whose statement contains the substring.
+//
+// A statement the session has already prepared goes out as an EXECUTE carrying
+// only its id, so a test that names one clears session.stmtsLRU first.
+func (d *faultingDialer) setFailingStatement(substring string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.statement = []byte(substring)
 }
 
 // DialHost dials the fixed target and wraps the connection.
@@ -156,12 +169,12 @@ func (d *faultingDialer) recordedFailures() []writeFailure {
 func (d *faultingDialer) shouldFail(fc *faultConn, p []byte) bool {
 	// Protocol v4, uncompressed: a 9-byte header whose fifth byte is the opcode,
 	// then for QUERY a 4-byte length and the statement.
-	if len(p) < 9 || frameOp(p[4]) != opQuery || !bytes.Contains(p, []byte("system.peers")) {
+	if len(p) < 9 || (frameOp(p[4]) != opQuery && frameOp(p[4]) != opPrepare) {
 		return false
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if !d.armed[fc] {
+	if !d.armed[fc] || !bytes.Contains(p, d.statement) {
 		return false
 	}
 	d.failures = append(d.failures, writeFailure{conn: fc, statement: append([]byte(nil), p[9:]...)})

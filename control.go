@@ -369,13 +369,15 @@ func (c *controlConn) setupConn(conn *Conn, sessionInit bool) error {
 		NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldString("host_id", host.HostID()))
 
 	if c.session.initialized() {
-		refreshErr := c.session.schemaDescriber.refreshSchemaMetadata()
-		if refreshErr != nil {
-			c.session.logger.Warning("Failed to refresh schema metadata after reconnecting. "+
-				"Schema might be stale or missing, causing token-aware routing to fall back to the configured fallback policy. "+
-				"Keyspace metadata queries might fail with ErrKeyspaceDoesNotExist until schema refresh succeeds.",
-				NewLogFieldError("err", refreshErr))
-		}
+		// Request the schema refresh; never wait for it.
+		// This setup can be running on the schema flusher's own goroutine:
+		// a schema refresh's control query that fails on write reaches HandleError,
+		// and so reconnect, synchronously.
+		// Waiting on the flusher from there is a deadlock that also leaves the
+		// reconnecting claim held forever, and Session.Close then hangs in
+		// schemaRefresher.stop.
+		// A failed refresh is logged by Session.runSchemaRefresh.
+		c.session.schemaDescriber.debounceRefreshSchemaMetadata()
 		// We connected to control conn, so add the connect the host in pool as well.
 		// Notify session we can start trying to connect to the node.
 		// We can't start the fill before the session is initialized, otherwise the fill would interfere
@@ -433,7 +435,12 @@ func (c *controlConn) reconnect() {
 	if !atomic.CompareAndSwapInt32(&c.reconnecting, 0, 1) {
 		return
 	}
-	defer atomic.StoreInt32(&c.reconnecting, 0)
+	defer func() {
+		atomic.StoreInt32(&c.reconnecting, 0)
+		if c.session.cfg.testControlReconnectDone != nil {
+			c.session.cfg.testControlReconnectDone()
+		}
+	}()
 
 	_, err := c.attemptReconnect()
 	if err != nil {
@@ -442,12 +449,12 @@ func (c *controlConn) reconnect() {
 		return
 	}
 
-	// Request the refresh; never wait for it.
+	// Request the ring refresh; never wait for it.
 	// This reconnect can be running on the ring flusher's own goroutine:
-	// a refresh's control query that fails on write reaches HandleError synchronously,
-	// and a refresh that finds no control connection calls reconnect from acquireConn.
+	// a refresh's control query that fails on write reaches HandleError synchronously.
 	// Waiting on the flusher from there is a deadlock,
 	// and Session.Close then hangs in ringRefresher.stop.
+	// The schema refresh that setupConn requests is debounced for the same reason.
 	// The debounce, rather than an immediate trigger,
 	// also paces a refresh whose own query keeps failing and reconnecting.
 	// A failed refresh is logged by Session.runRingRefresh.

@@ -924,6 +924,31 @@ func refreshSchemas(session *Session) error {
 	return nil
 }
 
+// runSchemaRefresh is the schema refresher's refresh function.
+//
+// It wraps refreshSchemas so that a failure is logged even when nobody waits for the result:
+// a debounced refresh, such as the one a control reconnect requests, has no listener,
+// so its error would otherwise vanish.
+//
+// Returns:
+//   - error: refreshSchemas's error, after logging it
+func (s *Session) runSchemaRefresh() error {
+	if s.cfg.testSchemaRefreshHook != nil {
+		s.cfg.testSchemaRefreshHook()
+	}
+	err := refreshSchemas(s)
+	if err != nil {
+		s.logger.Warning("Schema refresh failed. "+
+			"Schema might be stale or missing, causing token-aware routing to fall back to the configured fallback policy. "+
+			"Keyspace metadata queries might fail with ErrKeyspaceDoesNotExist until schema refresh succeeds.",
+			NewLogFieldError("err", err))
+	}
+	if s.cfg.testSchemaRefreshDone != nil {
+		s.cfg.testSchemaRefreshDone(err)
+	}
+	return err
+}
+
 func (s *schemaDescriber) debounceRefreshSchemaMetadata() {
 	s.schemaRefresher.debounce()
 }

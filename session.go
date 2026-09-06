@@ -188,9 +188,11 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		s.types = cfg.RegisteredTypes.Copy()
 	}
 
-	s.schemaDescriber = newSchemaDescriber(s, newRefreshDebouncer(schemaRefreshDebounceTime, func() error {
-		return refreshSchemas(s)
-	}, s.logger))
+	schemaDebounce := schemaRefreshDebounceTime
+	if cfg.schemaRefreshDebounce > 0 {
+		schemaDebounce = cfg.schemaRefreshDebounce
+	}
+	s.schemaDescriber = newSchemaDescriber(s, newRefreshDebouncer(schemaDebounce, s.runSchemaRefresh, s.logger))
 
 	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent, s.logger)
 

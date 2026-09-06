@@ -382,6 +382,20 @@ type ClusterConfig struct {
 	// system.local and its peers read (internal, for testing); nil in production.
 	testRingSnapshotHook func()
 
+	// testSchemaRefreshHook is called when a schema refresh starts
+	// and testSchemaRefreshDone when it ends, with its result (internal, for testing);
+	// both nil in production.
+	testSchemaRefreshHook func()
+	testSchemaRefreshDone func(err error)
+
+	// testControlReconnectDone is called when controlConn.reconnect returns,
+	// after it has released its reconnecting claim (internal, for testing); nil in production.
+	testControlReconnectDone func()
+
+	// schemaRefreshDebounce overrides the schema refresh debounce interval (internal, for testing);
+	// zero selects the schemaRefreshDebounceTime constant.
+	schemaRefreshDebounce time.Duration
+
 	// Metadata configures driver's internal metadata caching and event listening.
 	Metadata MetadataConfig
 }

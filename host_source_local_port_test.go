@@ -70,6 +70,15 @@ type localHostServer struct {
 
 	// peers holds the rows served for the peers table; nil means no peers.
 	peers atomic.Pointer[[]peerRow]
+
+	// schemaVersion is the value served for a schema_version read of system.local,
+	// so that a schema agreement wait converges on this single node.
+	schemaVersion atomic.Pointer[string]
+
+	// failExecutes makes every EXECUTE fail with a server error, which fails a
+	// schema metadata fetch (its statements are prepared) without touching the
+	// raw reads a ring refresh and a schema agreement wait issue.
+	failExecutes atomic.Bool
 }
 
 // peerRow is one scripted row of system.peers.
@@ -163,7 +172,35 @@ func newLocalHostServer(rpcAddress string) *localHostServer {
 		rpcAddress:     rpcAddress,
 	}
 	srv.setBroadcastAddress(rpcAddress)
+	srv.setSchemaVersion("5f0e2a2e-0000-4000-8000-00000000cafe")
 	return srv
+}
+
+// setSchemaVersion changes the schema_version served by later reads.
+//
+// Parameters:
+//   - version: the value to serve
+func (s *localHostServer) setSchemaVersion(version string) {
+	s.schemaVersion.Store(&version)
+}
+
+// writeSchemaVersionRow writes a one-column, one-row result holding the scripted
+// schema_version, the shape awaitSchemaAgreement scans its local read into.
+//
+// Parameters:
+//   - f: the response frame
+//   - stream: the request's stream id
+func (s *localHostServer) writeSchemaVersionRow(f *framer, stream int) {
+	f.writeHeader(0, opResult, stream)
+	f.writeInt(resultKindRows)
+	f.writeInt(int32(flagGlobalTableSpec))
+	f.writeInt(1) // columns count
+	f.writeString("system")
+	f.writeString("local")
+	f.writeString("schema_version")
+	f.writeShort(uint16(TypeVarchar))
+	f.writeInt(1) // rows count
+	f.writeBytes([]byte(*s.schemaVersion.Load()))
 }
 
 // TestRefreshRingKeepsLocalHostPortAfterAddressChange pins the port of the control
@@ -595,8 +632,9 @@ func (s *localHostServer) setBroadcastAddress(addr string) {
 
 // handle answers the handful of requests a session issues against this fixture.
 //
-// Anything that is not system.local gets an empty rows result, which is enough for
-// the peers query and for the schema metadata refresh (whose failure is only logged).
+// A schema_version read of system.local gets the scripted version, so a schema
+// agreement wait converges. Anything else gets an empty rows result, which is enough
+// for the peers query and for the schema metadata refresh (whose failure is only logged).
 //
 // Parameters:
 //   - reqFrame: the request frame, already positioned at the body
@@ -622,10 +660,22 @@ func (s *localHostServer) handle(_ *TestServer, reqFrame, respFrame *framer) err
 		respFrame.writeInt(0) // <metadata> pk count (proto >= 4)
 		respFrame.writeInt(int32(flagNoMetaData))
 		respFrame.writeInt(0)
+	case opExecute:
+		if s.failExecutes.Load() {
+			respFrame.writeHeader(0, opError, stream)
+			respFrame.writeInt(ErrCodeServer)
+			respFrame.writeString("scripted execute failure")
+			return nil
+		}
+		writeEmptyRows(respFrame, stream)
 	case opQuery:
 		query, err := reqFrame.readLongString()
 		if err != nil {
 			return err
+		}
+		if strings.Contains(query, "schema_version") && strings.Contains(query, "system.local") {
+			s.writeSchemaVersionRow(respFrame, stream)
+			return nil
 		}
 		if strings.Contains(query, "system.local") {
 			s.writeLocalRow(respFrame, stream)
