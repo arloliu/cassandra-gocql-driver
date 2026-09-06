@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.5.0-otter] - 2026-09-06
+
+This release makes `Session.Close` terminal, unblocks a control-connection reconnect that could
+deadlock against the schema flusher and hang `Close`, and removes three reachable panics.
+It then takes on two limits a downstream fault suite found: the heartbeat timeout no longer
+derives from `ClusterConfig.Timeout`, which roughly halves default failure detection and adds
+the exported `ClusterConfig.HeartbeatTimeout`, and a query's context now bounds how long it
+waits for a prepared statement instead of waiting out the session timeout.
+`HeartbeatTimeout` is the only exported addition; nothing exported changes meaning.
 
 ### Added
 
@@ -46,6 +54,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Detecting a node that stops answering, and the limits of a caller context", not here.
 
 ### Fixed
+
+- **`Session.Close` is terminal, and a reconnect can no longer outlive it.** `Close` latched
+  its state only from `Started` and closed only the connection published at that instant, so a
+  reconnect already past the closing check would dial, publish and start a pool fill
+  afterwards — leaking that connection and re-publishing its host to the selection policy as
+  the session tore down. The control connection now tracks every dialled candidate from the
+  dial to its publication or close, `Close` snapshots and closes the published connection plus
+  every candidate still in flight, and a reconnect that sees the closing state stops rather
+  than convicting a host, trying the next one or falling back to the contact points. `Close`
+  also cancels the session context before joining the refreshers, so a reconnect parked in a
+  per-host dial — unbounded while a node is paused — no longer holds the join. A fill unwound
+  by shutdown does not mark its host down or fire `HostDown`.
+
+- **A schema refresh on the flusher's own goroutine no longer deadlocks the control
+  connection.** `controlConn.setupConn` waited for the schema flusher to run a refresh, but a
+  refresh whose control query failed on write reached `HandleError` and reconnect
+  synchronously on that same goroutine: the reconnect never returned, its claim was never
+  released so every later reconnect short-circuited, and `Session.Close` hung. The
+  post-reconnect refresh is now debounced like the ring side. Until it runs, keyspace metadata
+  may be missing and token-aware routing falls back.
+
+- **Three reachable panics.** A CQL `NULL` scanned into a nil `interface{}` panicked on the
+  caller's goroutine, through `Unmarshal`, `Iter.Scan`, `Scanner.Scan` and `MapScan`.
+  `TokenAwareHostPolicy` panicked in its DC- and rack-aware fallbacks when the token ring held
+  no tokens, because the nil primary replica reached the classification loop. And a panic in an
+  application `HostUp`, `OnHostUp` or logger callback killed the process when it came from a
+  pool refill, which every dropped connection on a live host takes under the default
+  `NumConns` of 2; that notification is now recovered like the initial fill's.
 
 - **A query's context now bounds how long it waits for a prepared statement.** A caller
   waiting on the PREPARE of a cold statement used to ignore its own context entirely and wait
