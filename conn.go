@@ -1268,29 +1268,60 @@ type connReader struct {
 	timeout atomic.Int64
 }
 
+// Read fills p, spending at most one timeout doing it.
+//
+// The deadline covers the whole call and is computed here every time, never
+// cached on the connReader: recvSegment flips the timeout from 0 to the read
+// timeout part-way through a read sequence, and a deadline held across calls
+// would arm an idle read and reconnect the connection (CASSGO-125).
+//
+// This is per Read, not per frame. A v4 header and the first segment header are
+// read with no deadline at all, while a body, a segment payload, its CRC and
+// each continuation segment are separate calls that each get the full timeout.
 func (c *connReader) Read(p []byte) (n int, err error) {
 	const maxAttempts = 5
 
 	timeout := time.Duration(c.timeout.Load())
+	if timeout > 0 {
+		if err := c.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			// Without a deadline there is no bound to honour, so fail rather than
+			// read on and silently promise nothing.
+			return 0, err
+		}
+	} else if timeout == 0 {
+		// A zero timeout means "no read deadline". Clear any deadline a prior
+		// read armed; otherwise it persists and fires on an idle read, which
+		// is exactly the reconnect regression the callers avoid by toggling
+		// the timeout to 0 around idle frame/segment reads (CASSGO-125).
+		// A negative timeout is left alone, as it always has been.
+		if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+			return 0, err
+		}
+	}
+
 	for i := 0; i < maxAttempts; i++ {
 		var nn int
-		if timeout > 0 {
-			c.conn.SetReadDeadline(time.Now().Add(timeout))
-		} else if timeout == 0 {
-			// A zero timeout means "no read deadline". Clear any deadline a prior
-			// read armed; otherwise it persists and fires on an idle read, which
-			// is exactly the reconnect regression the callers avoid by toggling
-			// the timeout to 0 around idle frame/segment reads (CASSGO-125).
-			c.conn.SetReadDeadline(time.Time{})
-		}
-
 		nn, err = io.ReadFull(c.r, p[n:])
 		n += nn
 		if err == nil {
 			break
 		}
 
-		if verr, ok := err.(net.Error); !ok || !verr.Temporary() {
+		verr, ok := err.(net.Error)
+		if !ok || verr.Timeout() {
+			// The deadline has passed; another pass would only expire against it
+			// again. Re-arming per attempt is what used to turn one timeout into
+			// five, so a stuck read burned 5x the configured timeout before the
+			// connection was closed.
+			break
+		}
+
+		// Anything else temporary may still make progress on a retry. Standard
+		// TCP on a modern runtime does not reach here — EINTR and EAGAIN are
+		// handled below us — but the connection may come from a caller's own
+		// Dialer or HostDialer.
+		//nolint:staticcheck // Temporary is deprecated; this is the pre-existing contract.
+		if !verr.Temporary() {
 			break
 		}
 	}
