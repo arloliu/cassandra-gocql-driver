@@ -1090,8 +1090,7 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 		//
 		// This call has already left the call map, so closeWithError's snapshot
 		// will not find it and nobody else would report it to the observer.
-		var desync *frameReadError
-		if errors.As(err, &desync) {
+		if isFrameBoundaryLost(err) {
 			framer.release()
 			c.notifyStreamEnd(call, streamAbandoned)
 			return err
@@ -1102,23 +1101,16 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 	// connection has closed. Either way we should never block indefinatly here
 	if hooks := c.hooks(); hooks != nil && hooks.forceDeliverArm {
 		// Delivery is a legal outcome of the select below whenever the buffer is
-		// free; taking it unconditionally lets a test pin that schedule.
+		// free; taking it unconditionally lets a test pin that schedule. It joins
+		// the ordinary arm at afterDelivery rather than cleaning up for itself.
 		call.resp <- callResp{framer: framer, err: err}
-		c.drainAbandoned(call)
-		if hooks.afterDeliver != nil {
-			hooks.afterDeliver(head.op)
-		}
+		c.afterDelivery(call, head.op)
 		return nil
 	}
 
 	select {
 	case call.resp <- callResp{framer: framer, err: err}:
-		// The caller may have given up between the check above and this send, in
-		// which case nobody is left to read what was just delivered.
-		c.drainAbandoned(call)
-		if hooks := c.hooks(); hooks != nil && hooks.afterDeliver != nil {
-			hooks.afterDeliver(head.op)
-		}
+		c.afterDelivery(call, head.op)
 	case <-call.timeout:
 		framer.release()
 		c.releaseStream(call)
@@ -1148,6 +1140,19 @@ const (
 //
 // Only the first caller for a given call does anything: reclaiming an id twice
 // would free whichever request holds it by then.
+// isFrameBoundaryLost reports whether a readFrame failure left this connection
+// unable to find the next frame, which is the only reason to close it.
+//
+// The judgement is about how much of the frame was consumed, and readFrame is
+// the only thing that knows: it marks the exits that leave the wire mid-frame.
+// The error's dynamic type says nothing useful here — a compressor may return a
+// net.Error for a body that arrived complete — so nothing else may be consulted.
+func isFrameBoundaryLost(err error) bool {
+	var desync *frameReadError
+
+	return errors.As(err, &desync)
+}
+
 func (c *Conn) releaseStream(call *callReq) {
 	if !call.released.CompareAndSwap(false, true) {
 		return
@@ -1171,6 +1176,33 @@ func (c *Conn) endCallOnResponse(call *callReq, resp callResp) {
 	}
 
 	c.releaseStream(call)
+}
+
+// abandonCall is what a caller runs when it stops waiting for a response.
+//
+// Every exit that gives up goes through here, including the ones a test forces,
+// so there is one place where abandonment cleanup lives and one place a mutation
+// can remove it from.
+func (c *Conn) abandonCall(call *callReq) {
+	close(call.timeout)
+	// A response may already be sitting in the buffer: this caller's select and
+	// the receive side's can both have been ready at once.
+	c.drainAbandoned(call)
+}
+
+// afterDelivery is what the receive side runs once a response has been handed to
+// the caller's channel.
+//
+// As with abandonCall, both the ordinary select arm and the forced one converge
+// here so that removing the drain removes it from both.
+func (c *Conn) afterDelivery(call *callReq, op frameOp) {
+	// The caller may have given up between the check above and the send, in which
+	// case nobody is left to read what was just delivered.
+	c.drainAbandoned(call)
+
+	if hooks := c.hooks(); hooks != nil && hooks.afterDeliver != nil {
+		hooks.afterDeliver(op)
+	}
 }
 
 // drainAbandoned discards whatever is left for a call whose caller has gone
@@ -1890,15 +1922,14 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 
 	if hooks != nil && hooks.forceAbandonArm != nil && hooks.forceAbandonArm(req) {
 		// Take an abandonment arm without consulting call.resp, so the caller's
-		// own drain is the only thing that can reclaim the call.
+		// own drain is the only thing that can reclaim the call. Cleanup is the
+		// same abandonCall the ordinary arms use.
 		select {
 		case <-timeoutCh:
-			close(call.timeout)
-			c.drainAbandoned(call)
+			c.abandonCall(call)
 			return nil, ErrTimeoutNoResponse
 		case <-ctxDone:
-			close(call.timeout)
-			c.drainAbandoned(call)
+			c.abandonCall(call)
 			return nil, ctx.Err()
 		}
 	}
@@ -1942,10 +1973,7 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 
 		return resp.framer, nil
 	case <-timeoutCh:
-		close(call.timeout)
-		// A response may already be sitting in the buffer: this select and the
-		// receive side's can both have been ready at once.
-		c.drainAbandoned(call)
+		c.abandonCall(call)
 		c.logger.Debug("Request timed out on connection.",
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()))
 		return nil, ErrTimeoutNoResponse
@@ -1953,16 +1981,14 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 		c.logger.Debug("Request failed because context elapsed out on connection.",
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()),
 			NewLogFieldError("ctx_err", ctx.Err()))
-		close(call.timeout)
-		c.drainAbandoned(call)
+		c.abandonCall(call)
 		// Returned unwrapped: query_executor classifies context errors by equality,
 		// so wrapping one turns a caller giving up into a host failure.
 		return nil, ctx.Err()
 	case <-c.ctx.Done():
 		c.logger.Debug("Request failed because connection closed.",
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()))
-		close(call.timeout)
-		c.drainAbandoned(call)
+		c.abandonCall(call)
 		return nil, ErrConnectionClosed
 	}
 }

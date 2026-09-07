@@ -6,6 +6,7 @@ package gocql
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 
@@ -171,4 +172,31 @@ func TestFramer_ReadFrameKeepsTheUnderlyingError(t *testing.T) {
 	var netErr interface{ Timeout() bool }
 	require.True(t, errors.As(err, &netErr), "the cause must stay reachable through the marker")
 	require.True(t, netErr.Timeout())
+}
+
+// TestIsFrameBoundaryLostConsultsOnlyTheMarker gates the decision processFrame
+// makes about a readFrame failure.
+//
+// Classification has to rest on how much of the frame was consumed, which only
+// readFrame knows and reports by marking. Consulting the error's dynamic type as
+// well would close the connection on a body that arrived complete and merely
+// would not decode — a compressor may return anything, including a net.Error.
+func TestIsFrameBoundaryLostConsultsOnlyTheMarker(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "marked failure", err: &frameReadError{io.ErrUnexpectedEOF}, want: true},
+		{name: "marked failure, wrapped further", err: fmt.Errorf("context: %w", &frameReadError{io.ErrUnexpectedEOF}), want: true},
+		{name: "unmarked net.Error", err: timeoutError{}, want: false},
+		{name: "unmarked net.Error, wrapped", err: fmt.Errorf("decompress: %w", timeoutError{}), want: false},
+		{name: "unmarked plain error", err: errors.New("no compressor available"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, isFrameBoundaryLost(tt.err))
+		})
+	}
 }

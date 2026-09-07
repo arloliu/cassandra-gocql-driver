@@ -64,10 +64,13 @@ and no exported symbol changes meaning, so this is a patch release.
   always been documented to mean for the underlying connection. Raise `Timeout` on slow links
   -- noting that it is also the request timeout, and the default for `WriteTimeout`.
 
-  The bound is per read, not per response. A protocol v5 response is read in several pieces --
-  a segment header, its payload, its CRC, and any continuation segments -- and each gets the
-  full `Timeout`, so a fragmented response can legitimately take longer than one overall. What
-  is gone is spending five of them on a single read that never progresses.
+  The bound is per read, not per response, and only applies to reads that have a timeout at
+  all. Waiting for a response to begin arriving is deliberately unbounded, so neither a v4
+  frame header nor the first header of a v5 segment carries a deadline. Once a response is
+  arriving, each further read gets the full `Timeout` of its own: a segment payload, its CRC,
+  and each continuation segment and its header. A fragmented v5 response can therefore take
+  longer than one `Timeout` overall. What is gone is spending five of them on a single read
+  that never progresses.
 
 - **A connection that cannot carry a read deadline now fails the read.** The error from
   `SetReadDeadline` was previously ignored and the read went ahead without the bound it had

@@ -167,6 +167,14 @@ func testAbandonedRequestKeepsItsStream(t *testing.T, proto protoVersion) {
 // receive side's select are legitimately ready once the caller has gone, and
 // which one wins is not something a test can arrange from outside.
 func TestConn_ReceiverReclaimsWhenItTakesTheDeliveryArm(t *testing.T) {
+	for _, pc := range protoCases {
+		t.Run(pc.name, func(t *testing.T) {
+			testReceiverReclaims(t, pc.proto)
+		})
+	}
+}
+
+func testReceiverReclaims(t *testing.T, proto protoVersion) {
 	var framerReleases atomic.Int64
 	hooks := &connTestHooks{
 		forceDeliverArm: true,
@@ -174,7 +182,7 @@ func TestConn_ReceiverReclaimsWhenItTakesTheDeliveryArm(t *testing.T) {
 	}
 
 	gate := newAbandonGate()
-	h, conn := singleConnHarness(t, gate, defaultProto, hooks)
+	h, conn := singleConnHarness(t, gate, proto, hooks)
 
 	before := conn.streams.Available()
 
@@ -204,6 +212,14 @@ func TestConn_ReceiverReclaimsWhenItTakesTheDeliveryArm(t *testing.T) {
 // and its cancellation are both ready — and only its own drain is left to return
 // the stream.
 func TestConn_CallerReclaimsWhenItTakesItsAbandonmentArm(t *testing.T) {
+	for _, pc := range protoCases {
+		t.Run(pc.name, func(t *testing.T) {
+			testCallerReclaims(t, pc.proto)
+		})
+	}
+}
+
+func testCallerReclaims(t *testing.T, proto protoVersion) {
 	var (
 		framerReleases atomic.Int64
 		delivered      = make(chan struct{}, 1)
@@ -238,7 +254,7 @@ func TestConn_CallerReclaimsWhenItTakesItsAbandonmentArm(t *testing.T) {
 	}
 
 	gate := newAbandonGate()
-	h, conn := singleConnHarness(t, gate, defaultProto, hooks)
+	h, conn := singleConnHarness(t, gate, proto, hooks)
 
 	before := conn.streams.Available()
 
@@ -267,6 +283,14 @@ func TestConn_CallerReclaimsWhenItTakesItsAbandonmentArm(t *testing.T) {
 // had abandoned the call, it would take that response and the caller would be
 // left with a cancellation it never asked for.
 func TestConn_LiveCallerKeepsItsOwnResponse(t *testing.T) {
+	for _, pc := range protoCases {
+		t.Run(pc.name, func(t *testing.T) {
+			testLiveCallerKeepsItsResponse(t, pc.proto)
+		})
+	}
+}
+
+func testLiveCallerKeepsItsResponse(t *testing.T, proto protoVersion) {
 	var (
 		delivered = make(chan struct{}, 1)
 		release   = make(chan struct{})
@@ -299,7 +323,7 @@ func TestConn_LiveCallerKeepsItsOwnResponse(t *testing.T) {
 	}
 
 	gate := newAbandonGate()
-	h, conn := singleConnHarness(t, gate, defaultProto, hooks)
+	h, conn := singleConnHarness(t, gate, proto, hooks)
 
 	before := conn.streams.Available()
 
@@ -356,8 +380,17 @@ func TestConn_DrainDistinguishesACloseNotificationFromAResponse(t *testing.T) {
 		call := newAbandonedCall(c, rec)
 		before := c.streams.Available()
 
-		call.resp <- callResp{framer: getFramer(nil, protoVersion4, GlobalTypes)}
+		// Give the framer a non-empty buffer: release resets it on the way back to
+		// the pool, so an emptied buffer is evidence that release actually ran,
+		// rather than that the drain merely reached the line that calls it.
+		f := getFramer(nil, protoVersion4, GlobalTypes)
+		f.buf = append(f.buf, 1, 2, 3, 4)
+
+		call.resp <- callResp{framer: f}
 		c.drainAbandoned(call)
+
+		require.Empty(t, f.buf,
+			"the response framer must actually be released, not merely reached")
 
 		require.Equal(t, before+1, c.streams.Available(),
 			"the response arrived, so its stream is free to reuse")
@@ -450,7 +483,8 @@ func TestConn_CloseNotificationIsNotMistakenForAResponse(t *testing.T) {
 		callerDone  = make(chan struct{})
 		holdCancel  = make(chan struct{})
 		holdNotify  = make(chan struct{})
-		closerReady = make(chan struct{})
+		closerReady = make(chan struct{}, 1)
+		barrierFail = make(chan string, 4)
 	)
 
 	hooks := &connTestHooks{
@@ -468,6 +502,9 @@ func TestConn_CloseNotificationIsNotMistakenForAResponse(t *testing.T) {
 			select {
 			case <-holdNotify:
 			case <-time.After(10 * time.Second):
+				// Releasing on a timeout would drop the ordering this test is
+				// built on and report a pass it did not earn.
+				barrierFail <- "the closer's notification barrier timed out"
 			}
 		},
 		closerBeforeCancel: func() {
@@ -476,6 +513,7 @@ func TestConn_CloseNotificationIsNotMistakenForAResponse(t *testing.T) {
 			select {
 			case <-holdCancel:
 			case <-time.After(10 * time.Second):
+				barrierFail <- "the connection-cancellation barrier timed out"
 			}
 		},
 	}
@@ -526,6 +564,12 @@ func TestConn_CloseNotificationIsNotMistakenForAResponse(t *testing.T) {
 	}
 	close(holdNotify)
 	close(holdCancel)
+
+	select {
+	case why := <-barrierFail:
+		t.Fatalf("the forced schedule did not hold: %s", why)
+	default:
+	}
 
 	recorder.awaitEnd(t)
 	require.Equal(t, int64(0), recorder.finished.Load()-finishedBefore,
