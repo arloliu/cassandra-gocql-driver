@@ -545,23 +545,267 @@ func (s *Session) AwaitSchemaAgreement(ctx context.Context) error {
 	}).err
 }
 
-func (s *Session) reconnectDownedHosts(intv time.Duration) {
-	defer recoverGoroutine(s.logger, "Session.reconnectDownedHosts", nil)
+// ringFullRefreshInterval is how often the scheduler asks for a full ring
+// refresh while nothing else prompts one.
+//
+// It is deliberately independent of ReconnectInterval: the periodic refresh is
+// a safety net against lost topology events, not a reconnection setting, so a
+// long reconnect interval must not stretch it.
+const ringFullRefreshInterval = 5 * time.Minute
 
-	reconnectTicker := time.NewTicker(intv)
-	defer reconnectTicker.Stop()
+// ringRefreshRetryDelay is how long the ring-refresh phase waits before
+// retrying after it failed to deliver its request. It is the delay behind
+// hostScheduler.refreshRetryFloor.
+//
+// The floor is phase scoped: it suppresses only the refresh phase's own
+// eligibility to wake the scheduler, so a reconnect that comes due inside the
+// floor is still served on time.
+const ringRefreshRetryDelay = time.Second
 
-	for {
-		select {
-		case <-reconnectTicker.C:
-			s.reconnectDownedHostsOnce()
-		case <-s.ctx.Done():
-			return
-		}
+// schedulerClock supplies the host scheduler with its notion of time.
+//
+// Tests replace it to drive deadlines without waiting on a wall clock, and to
+// observe the delay the scheduler picks for each round - which is the
+// scheduling decision under test, not the moment a dial is observed.
+type schedulerClock interface {
+	// now returns the current time.
+	now() time.Time
+	// newTimer returns a channel that receives once after d elapses, and a
+	// function that releases the timer's resources.
+	newTimer(d time.Duration) (<-chan time.Time, func())
+}
+
+// realSchedulerClock is the wall clock the session uses in production.
+type realSchedulerClock struct{}
+
+var _ schedulerClock = realSchedulerClock{}
+
+// now returns the current wall-clock time.
+//
+// Returns:
+//   - time.Time: time.Now()
+func (realSchedulerClock) now() time.Time { return time.Now() }
+
+// newTimer arms a one-shot timer.
+//
+// Parameters:
+//   - d: the delay before the channel receives
+//
+// Returns:
+//   - <-chan time.Time: fires once after d
+//   - func(): stops the timer
+func (realSchedulerClock) newTimer(d time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(d)
+	return timer.C, func() { timer.Stop() }
+}
+
+// hostScheduler services the session's periodic host work from a single
+// deadline-driven loop.
+//
+// A ticker cannot express what this loop needs: both the reconnect sweep and
+// the periodic ring refresh have to decide for themselves when the next wake-up
+// is due, and a ticker's next firing is fixed the moment it is created. The
+// loop instead sleeps until the earliest armed deadline and serves whichever
+// phases that wake-up made due.
+//
+// Every field is worker local. Nothing else reads or writes them, so the loop
+// needs no lock of its own.
+//
+// The two phases are independent by construction (I3): each has its own
+// deadline, its own recovery boundary, and its own rule for advancing after a
+// failure. A panic out of one phase must never be able to stop or delay the
+// other, because the ring refresh is the session's safety net and the reconnect
+// sweep is the phase that calls application code.
+type hostScheduler struct {
+	// session owns the ring, the pool and the refresh debouncer this loop drives.
+	session *Session
+	// clock is the scheduler's source of time and timers.
+	clock schedulerClock
+
+	// reconnectInterval is ClusterConfig.ReconnectInterval, the rhythm of the
+	// reconnect phase.
+	reconnectInterval time.Duration
+
+	// reconnectDeadline is when the reconnect phase is next due. The zero value
+	// means the phase has no deadline and takes no part in choosing the next
+	// wake-up.
+	reconnectDeadline time.Time
+
+	// fullRefreshDeadline is when the periodic ring refresh is next due. The
+	// zero value means the phase has no deadline; the session leaves it unarmed
+	// until the periodic refresh is turned on.
+	fullRefreshDeadline time.Time
+
+	// refreshRetryFloor holds back the refresh phase after a delivery failure.
+	// It is the zero value whenever the last attempt was delivered.
+	refreshRetryFloor time.Time
+}
+
+// newHostScheduler builds the scheduler the reconnect goroutine runs.
+//
+// Parameters:
+//   - intv: the reconnect interval; must be positive
+//
+// Returns:
+//   - *hostScheduler: a scheduler whose reconnect phase is armed one interval
+//     out and whose periodic ring refresh is not armed
+func (s *Session) newHostScheduler(intv time.Duration) *hostScheduler {
+	return &hostScheduler{
+		session:           s,
+		clock:             realSchedulerClock{},
+		reconnectInterval: intv,
 	}
 }
 
-// reconnectDownedHostsOnce is one tick of reconnectDownedHosts.
+// reconnectDownedHosts runs the session's host scheduler until the session's
+// context is cancelled.
+//
+// Parameters:
+//   - intv: the reconnect interval
+func (s *Session) reconnectDownedHosts(intv time.Duration) {
+	defer recoverGoroutine(s.logger, "Session.reconnectDownedHosts", nil)
+
+	s.newHostScheduler(intv).run()
+}
+
+// run arms the reconnect phase and serves rounds until the session's context is
+// cancelled.
+func (w *hostScheduler) run() {
+	w.reconnectDeadline = w.clock.now().Add(w.reconnectInterval)
+
+	for {
+		wait, armed := w.nextWait(w.clock.now())
+
+		// A nil channel blocks forever, which is what an unarmed scheduler
+		// should do: wait for cancellation and nothing else.
+		var fired <-chan time.Time
+		stop := func() {}
+		if armed {
+			fired, stop = w.clock.newTimer(wait)
+		}
+
+		select {
+		case <-w.session.ctx.Done():
+			stop()
+			return
+		case <-fired:
+			stop()
+		}
+
+		w.serve()
+	}
+}
+
+// nextWait reports how long to sleep before the next round.
+//
+// A phase whose deadline is the zero value takes no part in the choice. An
+// already-passed deadline yields zero, not a negative delay.
+//
+// Parameters:
+//   - now: the round's reference time
+//
+// Returns:
+//   - time.Duration: the delay until the earliest armed deadline
+//   - bool: false when no phase is armed, in which case the delay is meaningless
+func (w *hostScheduler) nextWait(now time.Time) (time.Duration, bool) {
+	var earliest time.Time
+	for _, deadline := range []time.Time{w.reconnectDeadline, w.refreshWakeAt()} {
+		if deadline.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || deadline.Before(earliest) {
+			earliest = deadline
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	return max(earliest.Sub(now), 0), true
+}
+
+// refreshWakeAt returns the time the ring-refresh phase may next wake the
+// scheduler, or the zero value when the phase is not armed.
+//
+// A pending retry floor holds the phase back past its own deadline; the floor
+// is deliberately not applied to the reconnect phase.
+//
+// Returns:
+//   - time.Time: the phase's effective wake-up time
+func (w *hostScheduler) refreshWakeAt() time.Time {
+	if w.fullRefreshDeadline.IsZero() {
+		return time.Time{}
+	}
+	if w.refreshRetryFloor.After(w.fullRefreshDeadline) {
+		return w.refreshRetryFloor
+	}
+	return w.fullRefreshDeadline
+}
+
+// serve runs one round: every phase this wake-up made due, each inside its own
+// recovery boundary.
+//
+// The ring refresh goes first because delivering its request neither dials nor
+// calls application code, while the reconnect sweep does both. Ordering it
+// after the sweep would make the safety net's liveness depend on the phase most
+// likely to fail.
+func (w *hostScheduler) serve() {
+	now := w.clock.now()
+	w.serveRingRefresh(now)
+	w.serveReconnect(now)
+}
+
+// serveRingRefresh requests a full ring refresh when the periodic deadline is
+// due.
+//
+// A request that is not delivered leaves the deadline where it is - the phase
+// has not been served - and takes a retry floor instead, so repeated failures
+// retry on a rhythm rather than spinning the loop.
+//
+// Parameters:
+//   - now: the round's reference time
+func (w *hostScheduler) serveRingRefresh(now time.Time) {
+	wakeAt := w.refreshWakeAt()
+	if wakeAt.IsZero() || now.Before(wakeAt) {
+		return
+	}
+
+	delivered := false
+	defer func() {
+		if delivered {
+			w.fullRefreshDeadline = w.clock.now().Add(ringFullRefreshInterval)
+			w.refreshRetryFloor = time.Time{}
+			return
+		}
+		w.refreshRetryFloor = w.clock.now().Add(ringRefreshRetryDelay)
+	}()
+	defer recoverGoroutine(w.session.logger, "Session.hostScheduler.ringRefresh", nil)
+
+	w.session.ringRefresher.trigger()
+	delivered = true
+}
+
+// serveReconnect runs one reconnect sweep when its deadline is due.
+//
+// The round consumes an interval whether the sweep returned or panicked, so a
+// callback that panics on every sweep is retried on the configured rhythm
+// instead of immediately.
+//
+// Parameters:
+//   - now: the round's reference time
+func (w *hostScheduler) serveReconnect(now time.Time) {
+	if w.reconnectDeadline.IsZero() || now.Before(w.reconnectDeadline) {
+		return
+	}
+
+	defer func() {
+		w.reconnectDeadline = w.clock.now().Add(w.reconnectInterval)
+	}()
+	defer recoverGoroutine(w.session.logger, "Session.hostScheduler.reconnect", nil)
+
+	w.session.reconnectDownedHostsOnce()
+}
+
+// reconnectDownedHostsOnce is one sweep of the host scheduler's reconnect phase.
 //
 // While at least one unfiltered ring host is DOWN it first requests a ring
 // refresh, then starts a pool fill for every host that is not UP.
