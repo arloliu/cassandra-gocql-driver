@@ -1028,10 +1028,6 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 }
 
 func (c *Conn) releaseStream(call *callReq) {
-	if call.timer != nil {
-		call.timer.Stop()
-	}
-
 	c.streams.Clear(call.streamID)
 
 	if call.streamObserverContext != nil {
@@ -1260,7 +1256,12 @@ type callReq struct {
 	timeout  chan struct{} // indicates to recv() that a call has timed out
 	streamID int           // current stream in use
 
-	timer *time.Timer
+	// The request timer is deliberately NOT held here. It is created by the
+	// caller after its frame has been written, so any goroutine that reached
+	// this call through the call map could observe it mid-initialisation: a
+	// Stop landing between time.NewTimer and the drain of its channel parks the
+	// caller for good. The timer is a local in execInternal instead, owned and
+	// stopped by the one goroutine that builds it.
 
 	// streamObserverContext is notified about events regarding this stream
 	streamObserverContext StreamObserverContext
@@ -1629,20 +1630,9 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 	// cannot effectively extend a short Session.Timeout.
 	_, ctxHasDeadline := ctx.Deadline()
 	if requestTimeout := time.Duration(c.requestTimeout.Load()); requestTimeout > 0 && !ctxHasDeadline {
-		if call.timer == nil {
-			call.timer = time.NewTimer(0)
-			<-call.timer.C
-		} else {
-			if !call.timer.Stop() {
-				select {
-				case <-call.timer.C:
-				default:
-				}
-			}
-		}
-
-		call.timer.Reset(requestTimeout)
-		timeoutCh = call.timer.C
+		timer := time.NewTimer(requestTimeout)
+		defer timer.Stop()
+		timeoutCh = timer.C
 	}
 
 	var ctxDone <-chan struct{}
