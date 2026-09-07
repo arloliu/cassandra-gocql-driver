@@ -335,11 +335,82 @@ func (s *Session) startPoolFill(host *HostInfo) {
 	s.pool.addHost(host)
 	s.withOwnedHost(host, func() bool {
 		s.policy.AddHost(host)
+		s.publishedHosts[host.HostID()] = host
 		return true
 	})
 	if s.cfg.testStartPoolFillDone != nil {
 		s.cfg.testStartPoolFillDone(host)
 	}
+}
+
+// completeAdmission finishes an admission that was never completed for the ring's
+// current object: it registers a pool if the object has none, and announces the
+// object to the selection policy if it has never been announced.
+//
+// The two are separate obligations. A pool can exist without a first policy
+// publication - the scheduled reconnect path admits a pool and leaves the
+// publication to the fill's HostUp, which tokenAwareHostPolicy forwards to its
+// fallback without rebuilding the token ring - so keying the repair on pool
+// existence alone would leave such a host out of token-aware routing for good.
+//
+// Everything that decides is inside one hostPublishMu section, so it cannot
+// interleave with markHostDown, whose state change, policy notification and pool
+// removal are one transition under the same mutex. The fill is deliberately
+// outside: it dials synchronously, and it is armed by a defer set up before any
+// application callback runs, so a panicking policy cannot leave a registered pool
+// that nothing will ever fill.
+//
+// A host that is DOWN is left alone. Its pool was removed by markHostDown on
+// purpose, and rebuilding it here would readmit the host ahead of whatever delay
+// the reconnect schedule owes it.
+//
+// Parameters:
+//   - host: the ring's current object for its host ID
+//
+// Returns:
+//   - bool: true when this call performed the first policy publication, so the
+//     caller owes an OnNewHost notification
+func (s *Session) completeAdmission(host *HostInfo) bool {
+	if s.cfg.testCompleteAdmissionStart != nil {
+		s.cfg.testCompleteAdmissionStart(host)
+	}
+
+	var pool *hostConnPool
+	needFill := false
+	published := false
+	// Armed before the section, so it still runs when a policy callback panics
+	// after the pool was registered. withOwnedHost releases hostPublishMu while
+	// unwinding, so this defer never dials under it.
+	defer func() {
+		if needFill && pool.claimFill() {
+			pool.runFill()
+		}
+	}()
+
+	s.withOwnedHost(host, func() bool {
+		if !host.IsUp() {
+			return false
+		}
+		// The filter is consulted on the canonical object, and before anything is
+		// registered or announced. The snapshot object the refresh loop filtered
+		// can give a different answer: HostInfo.update keeps a non-empty data
+		// centre, so the canonical object can carry metadata the snapshot lacked.
+		// Filtering after registration would dial a host the application excluded.
+		if s.cfg.filterHost(host) {
+			return false
+		}
+		if _, ok := s.pool.getPoolFor(host); !ok {
+			pool, needFill = s.pool.registerPool(host)
+		}
+		if s.publishedHosts[host.HostID()] != host {
+			s.policy.AddHost(host)
+			s.publishedHosts[host.HostID()] = host
+			published = true
+		}
+		return true
+	})
+
+	return published
 }
 
 func (s *Session) handleNodeConnected(host *HostInfo) {

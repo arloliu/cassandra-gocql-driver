@@ -130,6 +130,26 @@ type Session struct {
 	// in Close can still wait on a callback or its mutex dependencies.
 	hostPublishClosed atomic.Bool
 
+	// publishedHosts records the ring objects this session has already announced
+	// to the selection policy with AddHost, keyed by host ID. It is read and
+	// written under hostPublishMu.
+	//
+	// It answers a question a registered pool cannot: "has this exact object had
+	// its first policy publication?". The two are not the same. The scheduled
+	// reconnect path admits a pool without publishing, and the fill's success
+	// reports HostUp, which tokenAwareHostPolicy forwards to its fallback without
+	// touching the token ring - only AddHost rebuilds that. A host recovered that
+	// way therefore has a pool, is UP, and is still missing from token-aware
+	// routing, and an admission repair keyed on pool existence would never notice.
+	//
+	// The value is the object, not a flag, so the record is pointer-sensitive the
+	// same way ring.owns is: a replacement that takes the same host ID does not
+	// inherit its predecessor's publication.
+	//
+	// It is allocated in NewSession, before the control connection can produce a
+	// host event, and never replaced afterwards.
+	publishedHosts map[string]*HostInfo
+
 	// Per-instance test hooks, invoked immediately after ring.owns returned true
 	// in handleHostDown / handleNodeConnected so tests can replace the ring entry
 	// inside the check-to-mutation window.
@@ -192,6 +212,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		cancel:          cancel,
 		logger:          cfg.newLogger(),
 		trace:           cfg.Tracer,
+		publishedHosts:  make(map[string]*HostInfo),
 	}
 	if cfg.RegisteredTypes == nil {
 		s.types = GlobalTypes.Copy()
@@ -459,6 +480,11 @@ func (s *Session) init() error {
 			for _, host := range owned {
 				s.policy.AddHost(host)
 			}
+		}
+		// Record the publication so a later admission repair does not announce
+		// these hosts a second time. Both branches above are an AddHost.
+		for _, host := range owned {
+			s.publishedHosts[host.HostID()] = host
 		}
 	}()
 
@@ -806,6 +832,12 @@ func (s *Session) removeHost(h *HostInfo) {
 func (s *Session) unpublishHost(h *HostInfo) {
 	s.hostPublishMu.Lock()
 	defer s.hostPublishMu.Unlock()
+	// Retire the publication record, but only while it still names h. A
+	// replacement that took this host ID has its own record under the same key,
+	// and dropping that would make a later repair publish it a second time.
+	if s.publishedHosts[h.HostID()] == h {
+		delete(s.publishedHosts, h.HostID())
+	}
 	s.policy.RemoveHost(h)
 }
 

@@ -37,19 +37,24 @@ const resiliencePeerHostID = "33333333-0000-4000-8000-00000000beef"
 // with "refreshDebouncer is stopped", and the ring is frozen at whatever it last
 // held for the rest of the session's life.
 //
-// runRingRefresh now turns that panic into a failed round. The guarantee is
-// deliberately narrow: the flusher stays alive and the next round still runs. It is
-// NOT that the ring was repaired. The panic below lands after addHostIfMissing has
-// already inserted the host, and the next round sees an unchanged endpoint and only
-// calls HostInfo.update, so the pool and policy publication the panic skipped is not
-// made up. Closing that gap is separate work.
+// runRingRefresh turns that panic into a failed round: the flusher stays alive and
+// the next round still runs.
+//
+// The panic below lands after addHostIfMissing has already inserted the host, so the
+// ring changed and the admission that follows it did not.
+// The next round now repairs that.
+// It sees an unchanged endpoint, so it only calls HostInfo.update - but every branch
+// of the apply loop ends at completeAdmission, which registers the missing pool and
+// makes the missing policy publication.
+// Before that repair existed, such a host stayed in the ring with no pool and no
+// publication for the rest of the session.
 func TestRingRefreshSurvivesAPanicAfterItChangedTheRing(t *testing.T) {
 	var panicOnFill atomic.Bool
 	var done atomic.Pointer[[]error]
 	done.Store(&[]error{})
 
 	script, _, _, session := startLocalHostFixture(t, "", func(cluster *ClusterConfig, _ string) {
-		cluster.testStartPoolFillStart = func(host *HostInfo) {
+		cluster.testCompleteAdmissionStart = func(host *HostInfo) {
 			if host.HostID() == resiliencePeerHostID && panicOnFill.CompareAndSwap(true, false) {
 				panic("scripted panic after the ring was changed")
 			}
@@ -76,8 +81,16 @@ func TestRingRefreshSurvivesAPanicAfterItChangedTheRing(t *testing.T) {
 
 	// The whole point: the refresher is still running.
 	require.NoError(t, session.refreshRing(), "the next round must still run")
-	_, ok := session.ring.getHost(resiliencePeerHostID)
+	peer, ok := session.ring.getHost(resiliencePeerHostID)
 	require.True(t, ok, "the host admitted before the panic is still in the ring")
+
+	// And the round that survived the panic repaired what the panic skipped.
+	_, pooled := session.pool.getPoolFor(peer)
+	require.True(t, pooled, "the unchanged refresh must register the pool the panic skipped")
+	session.hostPublishMu.Lock()
+	published := session.publishedHosts[resiliencePeerHostID]
+	session.hostPublishMu.Unlock()
+	require.Same(t, peer, published, "the unchanged refresh must make the policy publication the panic skipped")
 }
 
 // TestRingRefreshSurvivesAPanicFromItsOwnReporting pins the two isolated boundaries
@@ -101,7 +114,7 @@ func TestRingRefreshSurvivesAPanicFromItsOwnReporting(t *testing.T) {
 			}
 			logger = &panicOnWarningLogger{StructuredLogger: base}
 			cluster.Logger = logger
-			cluster.testStartPoolFillStart = func(host *HostInfo) {
+			cluster.testCompleteAdmissionStart = func(host *HostInfo) {
 				if host.HostID() == resiliencePeerHostID && panicOnFill.CompareAndSwap(true, false) {
 					panic("scripted panic after the ring was changed")
 				}

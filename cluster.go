@@ -465,6 +465,17 @@ type ClusterConfig struct {
 	// nil in production.
 	testStartPoolFillStart func(host *HostInfo)
 
+	// testAfterPrevHostsSnapshot is called by refreshRing immediately after it
+	// captured the prevHosts snapshot, so a test can insert a ring entry into the
+	// window the snapshot can no longer see (internal, for testing).
+	testAfterPrevHostsSnapshot func()
+
+	// testCompleteAdmissionStart is called at the start of
+	// Session.completeAdmission, after the ring has already been reconciled for
+	// this host and before any pool registration or policy publication
+	// (internal, for testing).
+	testCompleteAdmissionStart func(host *HostInfo)
+
 	// testStartPoolFillDone is called at the end of Session.startPoolFill, after the
 	// withOwnedHost publication attempt, so a test can join that goroutine
 	// (internal, for testing); nil in production.

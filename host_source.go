@@ -43,6 +43,11 @@ import (
 const connectAddressSourceCaller = "connect_address"
 
 var (
+	// ErrCannotFindHost and ErrHostAlreadyExists are no longer returned by a ring
+	// refresh. Both named a collision with controlConn.setupConn, which inserts a
+	// host under the same ID while a refresh is running; the refresh now adopts
+	// the ring's object and carries on instead of abandoning the round. They are
+	// kept because they are part of the package's exported surface.
 	ErrCannotFindHost    = errors.New("cannot find host")
 	ErrHostAlreadyExists = errors.New("host already exists")
 
@@ -1449,6 +1454,9 @@ func refreshRing(r *ringDescriber) error {
 	hosts, partitioner := snapshot.hosts, snapshot.partitioner
 
 	prevHosts := r.session.ring.currentHosts()
+	if r.session.cfg.testAfterPrevHostsSnapshot != nil {
+		r.session.cfg.testAfterPrevHostsSnapshot()
+	}
 	hostStateListener := r.session.hostListeners
 
 	// With DisableInitialHostLookup, hosts were assigned random UUIDs at session
@@ -1481,53 +1489,92 @@ func refreshRing(r *ringDescriber) error {
 			continue
 		}
 
+		// canonical is the object the ring owns for this host ID - the winner of any
+		// race with controlConn.setupConn, which inserts under the same ID while a
+		// refresh is running. Every branch below settles on it, and the tail
+		// completes its admission and drops it from the sweep candidates.
+		//
+		// branchOwesNewHost records whether this round is the one that brought the
+		// host into the ring, so a healthy unchanged refresh does not re-announce
+		// every host on every round. The listener fires at the tail, after the
+		// admission, because it is dispatched synchronously: a listener that waits
+		// for the host it was just told about would otherwise block the flusher
+		// before the admission it is waiting for has started.
+		var canonical *HostInfo
+		branchOwesNewHost := false
+
 		if host, ok := r.session.ring.addHostIfMissing(h); !ok {
 			r.session.logger.Info("Adding host.", NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", h.HostID()))
-			r.session.startPoolFill(h)
-			hostStateListener.OnNewHost(NewHostEvent{Host: h})
+			canonical = host
+			branchOwesNewHost = true
 		} else {
 			// host (by hostID) already exists; determine if IP has changed
 			newHostID := h.HostID()
+			canonical = host
 			existing, ok := prevHosts[newHostID]
 			if !ok {
-				return fmt.Errorf("get existing host=%s from prevHosts: %w", h, ErrCannotFindHost)
-			}
-			// The port is half of an endpoint, so a node that moved only its
-			// native_transport_port has to be reconciled the same way one that moved an
-			// address is. Comparing addresses alone sent it down the update branch, and
-			// HostInfo.update adopts a port only when the entry has none, so the new
-			// port was dropped and every later dial went to a port nothing was
-			// listening on - permanently, for as long as its addresses stayed put.
-			//
-			// This comparison is safe only because the endpoint a HostInfo carries now
-			// has a defined provenance: the control host keeps the pair its connection
-			// was dialled with, so a native_port from system.local that contradicts it
-			// cannot present itself here as a port change.
-			// A port only counts as changed when the new description actually named
-			// one. A rebuilt host whose port is just ClusterConfig.Port - a peers table
-			// with no native_port column, or a NULL in it - says nothing about the
-			// port, and treating that silence as a change would replace a working pool
-			// on a node reached on a non-default port. HostInfo.update keeps the port
-			// the entry already has, so the update branch is the right home for it.
-			samePort := !h.portIsNamed() || h.Port() == existing.Port()
-			if h.actualConnectAddress().Equal(existing.actualConnectAddress()) &&
-				h.nodeToNodeAddress().Equal(existing.nodeToNodeAddress()) &&
-				samePort {
-				// no endpoint change
+				// The ring holds this ID but the snapshot of prevHosts taken at the top
+				// of this round does not: controlConn.setupConn inserted it in between.
+				// Abandoning the round here left every later host in this snapshot
+				// unreconciled, and left this one with a ring entry that may have no
+				// pool and no policy publication - setupConn inserts before it registers
+				// events, and that registration can fail. Carry on with the winner
+				// object and let the tail complete its admission.
+				//
+				// There is no endpoint comparison to make: without a previous entry
+				// there is nothing to compare against.
+				r.session.logger.Warning("Host appeared in the ring during this refresh.",
+					NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", newHostID))
 				host.update(h)
+				branchOwesNewHost = true
 			} else {
-				// the endpoint has changed
-				// remove old HostInfo (w/old endpoint)
-				r.session.removeHost(existing)
-				hostStateListener.OnRemovedHost(RemovedHostEvent{Host: existing})
-				if _, alreadyExists := r.session.ring.addHostIfMissing(h); alreadyExists {
-					return fmt.Errorf("add new host=%s after removal: %w", h, ErrHostAlreadyExists)
+				// The port is half of an endpoint, so a node that moved only its
+				// native_transport_port has to be reconciled the same way one that moved an
+				// address is. Comparing addresses alone sent it down the update branch, and
+				// HostInfo.update adopts a port only when the entry has none, so the new
+				// port was dropped and every later dial went to a port nothing was
+				// listening on - permanently, for as long as its addresses stayed put.
+				//
+				// This comparison is safe only because the endpoint a HostInfo carries now
+				// has a defined provenance: the control host keeps the pair its connection
+				// was dialled with, so a native_port from system.local that contradicts it
+				// cannot present itself here as a port change.
+				// A port only counts as changed when the new description actually named
+				// one. A rebuilt host whose port is just ClusterConfig.Port - a peers table
+				// with no native_port column, or a NULL in it - says nothing about the
+				// port, and treating that silence as a change would replace a working pool
+				// on a node reached on a non-default port. HostInfo.update keeps the port
+				// the entry already has, so the update branch is the right home for it.
+				samePort := !h.portIsNamed() || h.Port() == existing.Port()
+				if h.actualConnectAddress().Equal(existing.actualConnectAddress()) &&
+					h.nodeToNodeAddress().Equal(existing.nodeToNodeAddress()) &&
+					samePort {
+					// no endpoint change
+					host.update(h)
+				} else {
+					// the endpoint has changed
+					// remove old HostInfo (w/old endpoint)
+					r.session.removeHost(existing)
+					hostStateListener.OnRemovedHost(RemovedHostEvent{Host: existing})
+					// Take whatever the ring holds now. Losing this race means setupConn
+					// re-added the ID between the removal and here; the winner is the
+					// object every later step must use, because an object the ring does
+					// not own fails the ownership checks in registerPool and withOwnedHost.
+					readded, alreadyExists := r.session.ring.addHostIfMissing(h)
+					if alreadyExists {
+						r.session.logger.Warning("Host was re-added during this refresh; adopting the ring's object.",
+							NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", newHostID))
+					} else {
+						r.session.logger.Info("Adding host with new endpoint after removing old host.", NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", h.HostID()))
+					}
+					canonical = readded
+					branchOwesNewHost = true
 				}
-				r.session.logger.Info("Adding host with new endpoint after removing old host.", NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", h.HostID()))
-				// add new HostInfo (same hostID, new IP)
-				r.session.startPoolFill(h)
-				hostStateListener.OnNewHost(NewHostEvent{Host: h})
 			}
+		}
+
+		if r.session.completeAdmission(canonical) && branchOwesNewHost {
+			hostStateListener.OnNewHost(NewHostEvent{Host: canonical})
 		}
 		delete(prevHosts, h.HostID())
 	}
