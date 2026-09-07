@@ -486,7 +486,7 @@ func (p *policyConnPool) Close() {
 	}
 }
 
-// addHost registers a pool for host, if the ring still owns host, and fills it.
+// registerPool registers a pool for host under p.mu, without filling it.
 //
 // Pools are keyed by host ID, and refreshRing replaces a host that changed
 // address with a new *HostInfo under the same ID, so the object a caller
@@ -494,7 +494,7 @@ func (p *policyConnPool) Close() {
 // Under p.mu, an object the ring no longer owns is ignored; for an owned one:
 //
 //   - no pool for the ID: one is registered;
-//   - a pool built for this exact object: it is filled if it needs it;
+//   - a pool built for this exact object: it is returned as it is;
 //   - a pool built for another object under this ID: that pool belongs to
 //     a superseded object and is replaced and closed.
 //
@@ -502,14 +502,28 @@ func (p *policyConnPool) Close() {
 // pool, every interleaving of a stale caller with a replacement ends with one
 // pool for the ID, owned by the ring's current object.
 //
+// The fill is left to the caller because it must run with p.mu released:
+// connect notifies the parent generation, which takes p.mu, so filling under
+// it would self-deadlock. Splitting the two lets a caller that must decide
+// something about host under another mutex - whether the ring still owns it,
+// what its state is - hold that mutex across the registration without holding
+// it across a dial.
+//
 // Parameters:
 //   - host: the object to admit
-func (p *policyConnPool) addHost(host *HostInfo) {
+//
+// Returns:
+//   - *hostConnPool: the registered pool, or nil when host was not admitted
+//   - bool: whether the caller must fill the returned pool. It is true for
+//     every non-nil pool, newly built or already registered: a pool that lost
+//     its connections needs the refill just as much as a new one does, and
+//     hostConnPool.fill rejects a concurrent fill on its own.
+func (p *policyConnPool) registerPool(host *HostInfo) (*hostConnPool, bool) {
 	hostID := host.HostID()
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.closed || !p.session.ring.owns(host) {
-		p.mu.Unlock()
-		return
+		return nil, false
 	}
 	pool, ok := p.hostConnPools[hostID]
 	if ok && pool.host != host {
@@ -530,10 +544,21 @@ func (p *policyConnPool) addHost(host *HostInfo) {
 
 		p.hostConnPools[hostID] = pool
 	}
-	p.mu.Unlock()
+	return pool, true
+}
 
-	// The fill runs after p.mu was released: connect notifies the parent
-	// generation, which takes p.mu, so filling under it would self-deadlock.
+// addHost registers a pool for host, if the ring still owns host, and fills it.
+//
+// See registerPool for the admission rules; this is that registration followed
+// by the fill, with p.mu released in between.
+//
+// Parameters:
+//   - host: the object to admit
+func (p *policyConnPool) addHost(host *HostInfo) {
+	pool, needFill := p.registerPool(host)
+	if !needFill {
+		return
+	}
 	if pool.claimFill() {
 		pool.runFill()
 	}
