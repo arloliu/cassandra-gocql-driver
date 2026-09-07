@@ -160,6 +160,12 @@ func (d *gatedDialer) close() {
 	d.closed.Store(true)
 }
 
+// open lets dials through again, so a test can drive a real recovery rather
+// than simulate one by writing host state directly.
+func (d *gatedDialer) open() {
+	d.closed.Store(false)
+}
+
 // recordingConvictionPolicy records every AddFailure call and lets a test decide the verdict,
 // optionally mutating driver state inside the call to exercise the check-then-convict window.
 type recordingConvictionPolicy struct {

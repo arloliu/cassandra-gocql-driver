@@ -667,11 +667,13 @@ type hostScheduler struct {
 // newHostScheduler builds the scheduler the reconnect goroutine runs.
 //
 // Parameters:
-//   - intv: the reconnect interval; must be positive
+//   - intv: the reconnect interval; zero is valid and means the reconnect phase
+//     does not exist
 //
 // Returns:
 //   - *hostScheduler: a scheduler with the periodic ring refresh armed one
-//     period out, and the reconnect phase armed only when intv is positive
+//     period out and no reconnect deadline, which only a round that reconciles
+//     an outage against the ledger produces
 func (s *Session) newHostScheduler(intv time.Duration) *hostScheduler {
 	w := &hostScheduler{
 		session:           s,
@@ -1005,8 +1007,18 @@ func (w *hostScheduler) reconcile(now time.Time, gen uint64, startedAt time.Time
 // positive from any state, including the zero left behind by a round that found
 // nothing to reconnect and a panic that happened before the backoff was ever
 // initialised.
+//
+// The cap is applied by comparison rather than after the doubling. A
+// ReconnectInterval past half of time.Duration's range would otherwise overflow
+// into a negative delay, and a negative delay is a deadline that is already due
+// - exactly the immediate retry the floor exists to prevent.
 func (w *hostScheduler) advanceReconnect() {
-	w.backoff = min(max(w.backoff, w.baseRetryInterval())*2, w.reconnectInterval)
+	step := max(w.backoff, w.baseRetryInterval())
+	if step >= w.reconnectInterval/2 {
+		w.backoff = w.reconnectInterval
+	} else {
+		w.backoff = step * 2
+	}
 	w.reconnectDeadline = w.clock.now().Add(w.backoff)
 }
 

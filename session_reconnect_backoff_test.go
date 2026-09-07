@@ -71,6 +71,9 @@ type admitGate struct {
 	mu sync.Mutex
 	// seen is every host the gate was consulted for, in order.
 	seen []string
+	// trapAction runs instead of reopening the outage, for tests that need a
+	// different producer transition in the same window.
+	trapAction func()
 }
 
 // hook is installed as ClusterConfig.testScheduledAdmitStart.
@@ -87,7 +90,26 @@ func (g *admitGate) hook(host *HostInfo) {
 		return
 	}
 	g.trap.Store(nil)
+
+	g.mu.Lock()
+	custom := g.trapAction
+	g.mu.Unlock()
+	if custom != nil {
+		custom()
+		return
+	}
 	reopenOutage(session, host.HostID())
+}
+
+// onTrap replaces the trap's default action, which is to reopen the outage.
+//
+// Parameters:
+//   - fn: what to run in the window between the scheduler choosing a host and
+//     the gate registering its pool
+func (g *admitGate) onTrap(fn func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.trapAction = fn
 }
 
 // armTrap makes the admission of the host with this ID find a newer outage.
@@ -106,33 +128,72 @@ func (g *admitGate) consulted() []string {
 	return append([]string(nil), g.seen...)
 }
 
-// scanFlipper accepts every host and moves the outage ledger on from inside the
-// eligibility scan, which is the window between the scheduler's two reads of it.
+// scanFlipper is the HostFilter the sampling tests drive the scheduler with. It
+// moves the outage ledger on from inside the eligibility scan, which is the
+// window between the scheduler's two reads of that ledger, and can change its
+// own verdict at the same moment so the two scans of one round see different
+// candidate sets.
 type scanFlipper struct {
 	session atomic.Pointer[Session]
 	id      atomic.Pointer[string]
-	// armed makes every scan move the ledger on, so a scheduler that resampled
-	// until the two reads agreed would never finish the round.
+	// reject names a host the filter excludes. It survives disarming, so a later
+	// round still sees the membership the flip established.
+	reject atomic.Pointer[string]
+	// rejectOnFlip is applied to reject the next time the ledger is moved on.
+	rejectOnFlip atomic.Pointer[string]
+	// armed makes the scan move the ledger on, so a scheduler that resampled
+	// until its two reads agreed would never finish the round.
 	armed atomic.Bool
-	scans atomic.Int64
+	// flipEvery is how many Accept calls make up one scan. The flip happens on
+	// the last call of a scan so a scan never observes a verdict change halfway
+	// through its own pass. Zero means every call.
+	flipEvery int64
+	// flipLimit caps how many flips happen while armed. Zero means unlimited,
+	// which is what a test that pins the resampling bound needs; a limit lets a
+	// test leave the ledger settled after the round it is examining.
+	flipLimit int64
+	flips     atomic.Int64
+	scans     atomic.Int64
 }
 
 var _ HostFilter = (*scanFlipper)(nil)
 
-// Accept counts the scan, moves the ledger on when armed, and accepts.
+// Accept counts the scan, accepts unless the host is the rejected one, and moves
+// the ledger on at the end of each scan while armed.
 //
 // Returns:
-//   - bool: always true
-func (f *scanFlipper) Accept(*HostInfo) bool {
-	f.scans.Add(1)
+//   - bool: false for the rejected host, true otherwise
+func (f *scanFlipper) Accept(host *HostInfo) bool {
+	seen := f.scans.Add(1)
+	accepted := true
+	if rejected := f.reject.Load(); rejected != nil && *rejected == host.HostID() {
+		accepted = false
+	}
 	if !f.armed.Load() {
-		return true
+		return accepted
+	}
+
+	every := f.flipEvery
+	if every <= 0 {
+		every = 1
+	}
+	if seen%every != 0 {
+		return accepted
+	}
+	if f.flipLimit > 0 && f.flips.Load() >= f.flipLimit {
+		return accepted
+	}
+	f.flips.Add(1)
+
+	if next := f.rejectOnFlip.Load(); next != nil {
+		f.reject.Store(next)
+		f.rejectOnFlip.Store(nil)
 	}
 	session, id := f.session.Load(), f.id.Load()
 	if session != nil && id != nil {
 		reopenOutage(session, *id)
 	}
-	return true
+	return accepted
 }
 
 // TestScheduledAdmit_StaleGenerationIsRejected pins I1 at the gate itself.
@@ -427,12 +488,19 @@ func TestHostScheduler_JoiningAnOutageDoesNotResetTheRhythm(t *testing.T) {
 // other end of the rhythm: the backoff returns to the first step only once there
 // is nothing left to reconnect, and the outage after that is armed from its own
 // start.
+//
+// The recovery is driven through the real path - the gate is opened, the
+// scheduler's own retry fills the pool, and the fill's handleNodeConnected is
+// what empties the ledger. Writing NodeUp directly would leave the host ID in
+// the ledger, so the next conviction would find a non-empty set, would not open
+// a generation, and the assertions below would be satisfied by the drift branch
+// instead of by the reset they are meant to pin.
 func TestHostScheduler_RecoveryClearsThePhaseAndTheNextOutageStartsOver(t *testing.T) {
 	const intv = time.Minute
 
 	f := newTickFixture(t, nil)
 	f.driveDown(t)
-	_, startedAt := f.session.outageSnapshot()
+	firstGen, startedAt := f.session.outageSnapshot()
 
 	clock := newFakeSchedulerClock()
 	clock.rebase(startedAt)
@@ -445,15 +513,29 @@ func TestHostScheduler_RecoveryClearsThePhaseAndTheNextOutageStartsOver(t *testi
 	}
 	require.Equal(t, 8*time.Second, w.backoff)
 
-	// The host is back, so the scan finds nothing to reconnect.
-	f.host.setState(NodeUp)
+	// The host is reachable again, so the next retry's fill succeeds and the
+	// producer behind it takes the host out of the ledger.
+	f.gate.open()
+	clock.advance(w.reconnectDeadline.Sub(clock.now()))
+	w.serveReconnect(clock.now())
+	awaitHost(t, f.collector.up, f.host, "the host to come back up through its own fill")
+	require.Zero(t, readLedger(f.session, f.host.HostID()).members,
+		"a real recovery must empty the ledger, which is what lets the next failure open a generation")
+
+	// The round after that finds nothing to reconnect.
+	clock.advance(w.reconnectDeadline.Sub(clock.now()))
 	w.serveReconnect(clock.now())
 	require.Zero(t, w.backoff, "a recovered ring must clear the backoff")
 	require.True(t, w.reconnectDeadline.IsZero(), "a recovered ring must leave no reconnect deadline")
 
-	// The next outage is a new generation, armed from its own start.
+	// The next failure is a new outage, armed from its own start.
+	f.gate.close()
 	f.session.markHostDown(f.host)
 	nextGen, nextStartedAt := f.session.outageSnapshot()
+	require.Equal(t, firstGen+1, nextGen,
+		"a failure after a real recovery must open a new outage, not join the old one")
+	require.True(t, nextStartedAt.After(startedAt), "the new outage must carry its own start")
+
 	clock.rebase(nextStartedAt)
 	w.serveReconnect(clock.now())
 
@@ -474,11 +556,27 @@ func TestHostScheduler_RecoveryClearsThePhaseAndTheNextOutageStartsOver(t *testi
 func TestHostScheduler_DriftRemedyArmsFromNow(t *testing.T) {
 	const intv = time.Minute
 
-	f := newTickFixture(t, nil)
-	// DOWN in the ring but never through a producer, which is the shape a filter
-	// that started accepting a host leaves behind.
+	filter := &flippableHostFilter{}
+	f := newTickFixture(t, func(cluster *ClusterConfig) {
+		cluster.HostFilter = filter
+	})
+
+	// The host is excluded when it fails, so its own producer records it as
+	// irrelevant and no outage opens; the filter then starts accepting it again,
+	// with no event to announce the change. That is the shape the remedy exists
+	// for, and it is reached through markHostDown rather than by writing state.
+	excluded := f.host.HostID()
+	filter.reject.Store(&excluded)
+	// markHostDown is the producer; for an excluded host it records the host as
+	// irrelevant and returns before the pool teardown, so the pool is removed
+	// here to reach the state the remedy acts on.
+	f.gate.close()
 	f.session.pool.removeHost(f.host)
-	f.host.setState(NodeDown)
+	f.session.markHostDown(f.host)
+	require.Equal(t, NodeDown, f.host.State(), "the producer must have convicted the host")
+	require.False(t, readLedger(f.session, f.host.HostID()).holds,
+		"an excluded host must not be recorded as relevant")
+	filter.reject.Store(nil)
 
 	gen, _ := f.session.outageSnapshot()
 	require.Zero(t, gen, "the ledger must hold no outage for this host")
@@ -692,4 +790,208 @@ func TestHostScheduler_DriftIntoAnOutageInheritsItsBackoff(t *testing.T) {
 	f.hooks.drain()
 	w.serveReconnect(clock.now())
 	f.hooks.await(t, poolFillDone, second, "the drifted host's retry once the outage's own deadline came due")
+}
+
+// dialedHosts drains the pool hooks and returns the host IDs a connect attempt
+// was made for, which is the observable proof that a host was admitted.
+//
+// Parameters:
+//   - hooks: the fixture's pool hooks
+//
+// Returns:
+//   - []string: the host IDs dialled since the last drain, in order
+func dialedHosts(hooks *poolHooks) []string {
+	var out []string
+	for _, rec := range hooks.drain() {
+		if rec.ev == poolConnectAttempt {
+			out = append(out, rec.host.HostID())
+		}
+	}
+	return out
+}
+
+// TestHostScheduler_ResampledAuthorizationCarriesItsOwnTargets pins the half of
+// I1 that the generation alone does not cover: an authorization is a generation,
+// an outage start and the candidate set that was sampled with them.
+//
+// The scan and the ledger read are separate, so the round can find both the
+// generation and the membership changed. Carrying the first scan's list under
+// the second sample's generation would spend the new outage's first retry on
+// hosts that were never part of it - and the gate would not catch it, because
+// the generation it checks would be the current one.
+func TestHostScheduler_ResampledAuthorizationCarriesItsOwnTargets(t *testing.T) {
+	const intv = time.Minute
+
+	// One flip, at the end of the first scan: the resample then sees a settled
+	// ledger, so the round after it is not reconciling yet another generation.
+	flipper := &scanFlipper{flipEvery: 2, flipLimit: 1}
+	f := newTickFixture(t, func(cluster *ClusterConfig) {
+		cluster.HostFilter = flipper
+	})
+	f.driveDown(t)
+
+	second := addRingHost(t, f.session, "10.0.0.80")
+	f.session.markHostDown(second)
+	require.Len(t, f.session.ring.allHosts(), 2, "the round must scan exactly two hosts")
+
+	flipper.session.Store(f.session)
+	id := second.HostID()
+	flipper.id.Store(&id)
+	// The flip at the end of the first scan opens a new outage and drops the
+	// original host from the candidate set, so the two scans of this round see
+	// different targets.
+	dropped := f.host.HostID()
+	flipper.rejectOnFlip.Store(&dropped)
+
+	firstGen, _ := f.session.outageSnapshot()
+	clock := newFakeSchedulerClock()
+	// Ahead of any instant a producer can stamp during this round, so the outage
+	// the flip opens is already overdue and this very round serves it. The
+	// assertion has to land on the round that resampled: a later round would take
+	// a fresh scan of its own and pass whichever list this one carried.
+	clock.rebase(time.Now().Add(time.Hour))
+	w := newSessionScheduler(f.session, clock, intv)
+
+	f.hooks.drain()
+	flipper.armed.Store(true)
+	w.serveReconnect(clock.now())
+	flipper.armed.Store(false)
+
+	require.Equal(t, firstGen+1, w.observedGen, "the round must reconcile against the sample it resampled")
+	require.Equal(t, []string{second.HostID()}, dialedHosts(f.hooks),
+		"the round must dial the set its resample produced, not the list the first scan produced")
+}
+
+// TestHostScheduler_ChurnStarvesADriftedHostUntilItStops pins the third case of
+// I4 - the one with no service bound at all - so it is not mistaken for a bug
+// and "fixed" with a mechanism the plan deliberately left out.
+//
+// A host that is eligible but absent from the ledger depends on the phase coming
+// due. Another host opening a new generation faster than one base interval
+// re-arms the deadline into the future every round, and I5 forbids the worker
+// from adding the drifted host to the ledger itself, so it can wait
+// indefinitely. What must hold is that it is served once the churn stops - the
+// starvation is a delay, not a permanent exclusion.
+func TestHostScheduler_ChurnStarvesADriftedHostUntilItStops(t *testing.T) {
+	const intv = time.Minute
+
+	filter := &flippableHostFilter{}
+	f := newTickFixture(t, func(cluster *ClusterConfig) {
+		cluster.HostFilter = filter
+	})
+
+	// The drifted host: excluded when it went down, so no producer recorded it,
+	// and accepted again afterwards with no event to announce the change.
+	drifted := addRingHost(t, f.session, "10.0.0.81")
+	excluded := drifted.HostID()
+	filter.reject.Store(&excluded)
+	f.session.markHostDown(drifted)
+	require.False(t, readLedger(f.session, drifted.HostID()).holds,
+		"an excluded host must not be recorded as relevant")
+	filter.reject.Store(nil)
+
+	// The churning host.
+	f.driveDown(t)
+	_, startedAt := f.session.outageSnapshot()
+
+	clock := newFakeSchedulerClock()
+	clock.rebase(startedAt)
+	w := newSessionScheduler(f.session, clock, intv)
+
+	f.hooks.drain()
+	for round := range 5 {
+		// A generation that opens now always arms its first retry ahead of the
+		// clock this round is served at.
+		reopenOutage(f.session, f.host.HostID())
+		w.serveReconnect(clock.now())
+		require.Empty(t, dialedHosts(f.hooks),
+			"round %d: a generation that keeps being replaced never comes due", round)
+	}
+
+	// The churn stops. The retry the last generation armed is still owed, and
+	// serving it serves the drifted host too.
+	gen, _ := f.session.outageSnapshot()
+	require.Equal(t, gen, w.observedGen, "the last round must have reconciled the final generation")
+	clock.advance(w.reconnectDeadline.Sub(clock.now()))
+	w.serveReconnect(clock.now())
+
+	require.Contains(t, dialedHosts(f.hooks), drifted.HostID(),
+		"once the churn stops the drifted host must be served under the authorization in force")
+}
+
+// TestHostScheduler_LedgerIsDecidedByProducersAcrossARound pins I5 at the moment
+// it is easiest to get wrong: between the eligibility scan and the admissions it
+// authorizes.
+//
+// The scheduler samples without holding anything, so producers run freely inside
+// that window. A worker that corrected the ledger to match what it had just
+// scanned would erase whatever they recorded - and the erased state is exactly
+// the "an outage has begun" signal the ledger exists to carry.
+func TestHostScheduler_LedgerIsDecidedByProducersAcrossARound(t *testing.T) {
+	const intv = time.Minute
+
+	gate := &admitGate{}
+	f := newTickFixture(t, func(cluster *ClusterConfig) {
+		cluster.testScheduledAdmitStart = gate.hook
+	})
+	gate.session.Store(f.session)
+	f.driveDown(t)
+	gen, startedAt := f.session.outageSnapshot()
+
+	// A host that becomes relevant after the scan, through its own producer.
+	late := addRingHost(t, f.session, "10.0.0.82")
+
+	clock := newFakeSchedulerClock()
+	clock.rebase(startedAt)
+	w := newSessionScheduler(f.session, clock, intv)
+	w.observedGen = gen
+	w.backoff = time.Second
+	w.reconnectDeadline = clock.now()
+
+	gate.armTrap(f.host.HostID())
+	gate.onTrap(func() { f.session.markHostDown(late) })
+	w.serveReconnect(clock.now())
+
+	// The producer's record stands: the late host is a member, and it joined the
+	// outage under way rather than opening one, because the set was not empty.
+	lateState := readLedger(f.session, late.HostID())
+	require.True(t, lateState.holds, "the producer's record must survive the round that was sampling")
+	require.Equal(t, gen, lateState.gen, "joining a non-empty ledger must not open a generation")
+	require.Equal(t, 2, lateState.members, "the ledger must hold exactly what the producers put there")
+	require.True(t, readLedger(f.session, f.host.HostID()).holds,
+		"the host the round was already working on must still be recorded")
+}
+
+// TestHostScheduler_HugeIntervalDoesNotOverflowIntoAnImmediateRetry pins the
+// arithmetic boundary of I6.
+//
+// ReconnectInterval is a time.Duration, so a caller may set one past half of
+// that type's range. Doubling towards such a cap and only then clamping wraps to
+// a negative delay, and a negative delay is a deadline that is already due -
+// precisely the immediate retry the base-interval floor exists to prevent. The
+// cap therefore has to be applied by comparison, before the multiplication.
+func TestHostScheduler_HugeIntervalDoesNotOverflowIntoAnImmediateRetry(t *testing.T) {
+	// Comfortably past time.Duration's midpoint, so the naive form wraps.
+	const intv = time.Duration(1) << 62
+
+	f := newTickFixture(t, nil)
+	f.driveDown(t)
+	_, startedAt := f.session.outageSnapshot()
+
+	clock := newFakeSchedulerClock()
+	clock.rebase(startedAt)
+	w := newSessionScheduler(f.session, clock, intv)
+	require.Equal(t, time.Second, w.baseRetryInterval(), "the base is still capped at one second")
+
+	w.serveReconnect(clock.now())
+	for round := range 40 {
+		clock.advance(w.reconnectDeadline.Sub(clock.now()))
+		w.serveReconnect(clock.now())
+
+		require.Positive(t, w.backoff, "round %d must leave a strictly positive delay", round)
+		require.LessOrEqual(t, w.backoff, intv, "round %d must not exceed the cap", round)
+		require.True(t, w.reconnectDeadline.After(clock.now()),
+			"round %d must arm a deadline in the future, not one that is already due", round)
+	}
+	require.Equal(t, intv, w.backoff, "the ramp must settle on the cap")
 }

@@ -776,7 +776,8 @@ func TestHostScheduler_ConstructionArmsOnlyWhatIsEnabled(t *testing.T) {
 		after := time.Now()
 
 		require.Equal(t, intv > 0, w.reconnectEnabled(), "reconnect interval %s", intv)
-		require.True(t, w.reconnectDeadline.IsZero(), "run arms the reconnect phase, not the constructor")
+		require.True(t, w.reconnectDeadline.IsZero(),
+			"only a round that reconciles an outage arms the reconnect phase")
 		require.WithinRange(t, w.fullRefreshDeadline,
 			before.Add(ringFullRefreshInterval), after.Add(ringFullRefreshInterval),
 			"the safety net must be armed one of its own periods out, with a reconnect interval of %s", intv)
@@ -931,6 +932,9 @@ func TestRefreshRing_LogsChangesNotTheWholeRing(t *testing.T) {
 }
 
 // countRefreshedRingAtInfo counts the closing refresh lines written at Info.
+//
+// Parameters:
+//   - logger: the recording logger to read
 //
 // Returns:
 //   - int: how many "Refreshed ring." records are Info level

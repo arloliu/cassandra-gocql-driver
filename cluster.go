@@ -262,9 +262,10 @@ type ClusterConfig struct {
 	// ReconnectInterval caps the delay between scheduled retry rounds for known DOWN
 	// nodes. Retries start one second after a node goes down, also limited by
 	// ReconnectInterval, and the delay doubles after every round until it reaches that
-	// cap. The delay returns to the start only once every known node is UP again, so a
-	// node failing while another is already down joins the retry rhythm under way
-	// rather than restarting it.
+	// cap. The delay returns to the start only once no known node is waiting to be
+	// reconnected - because they came back up, left the ring, or the HostFilter now
+	// excludes them - so a node failing while another is already down joins the retry
+	// rhythm under way rather than restarting it.
 	//
 	// While a node is DOWN, every retry round also re-reads the peers table over the
 	// control connection, so a node that rejoined at a different address is found
