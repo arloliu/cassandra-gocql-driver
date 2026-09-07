@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1-otter] - 2026-09-07
+
+Request termination. A cancelled or timed-out request now always gives its stream back once
+the answer arrives, a connection that loses its place in the frame stream is closed instead
+of carrying on, and a stalled read spends one timeout rather than five. No new exported API
+and no exported symbol changes meaning, so this is a patch release.
+
+### Fixed
+
+- **A request whose caller gave up had only about an even chance of ever returning its
+  stream.** When the response finally arrived, the receive side chose between delivering it
+  into a buffered channel nobody was reading and noticing the caller had gone -- and only the
+  second of those returned the stream. Both were ready, so the runtime picked one at random.
+  The caller's own wait had the same shape, and could return through cancellation while
+  holding a response it had already been handed.
+
+  Measured on a connection that stayed healthy throughout: 40 cancelled requests whose
+  responses arrived afterwards left 21 streams behind, out of the 2048 a connection has. The
+  loss is one-way. Nothing reclaims those streams later, and a connection narrows invisibly
+  while the pool keeps preferring whichever connection has the most left. It ends when the
+  connection is exhausted, at which point its own heartbeat starts failing and it is replaced
+  about thirty seconds later.
+
+  The regime that triggers it is a cluster healthy enough to answer, just later than the
+  caller's deadline. A node that never answers costs nothing: there is no response to lose.
+
+  Both sides now drain. When a stream becomes reusable is unchanged -- a response that has
+  not arrived may still arrive, and returning its id early would hand a later request the
+  answer to this one.
+
+- **A connection that lost its frame boundary kept serving queries.** `readFrame` wraps its
+  errors, and the check for whether to close asked whether the error *was* a `net.Error`
+  through a bare type assertion, which a wrapped error never satisfies. A body that stopped
+  arriving was reported to the caller as an ordinary failure while the rest of it was still
+  on the wire, and the next read took those leftover bytes for a frame header.
+
+  What decides this is whether the frame was consumed in full, not what type the error has.
+  A truncated body may surface as `io.EOF`, which is not a `net.Error` at all.
+
+- **`Conn.Close()` left outstanding streams with no terminal `StreamObserver` event.** The
+  teardown gated its whole snapshot on having an error to deliver, and a plain close has
+  none, so neither `StreamFinished` nor `StreamAbandoned` was reported -- contrary to
+  `StreamObserverContext`'s documented contract. A genuine error response that raced a close
+  was dropped the same way.
+
+### Changed
+
+- **A stalled read now spends one `Timeout`, not five.** The read deadline was armed inside
+  a five-attempt retry loop, and an expired deadline is itself a temporary error, so it was
+  also the loop's retry condition. At the default 11-second `Timeout` a stuck connection took
+  up to 55 seconds to be closed, and the pool kept handing it to new queries throughout.
+
+  **Upgrading:** a response body arriving in pieces that together take longer than `Timeout`
+  now fails, where it previously had up to five times as long. This is what `Timeout` has
+  always been documented to mean for the underlying connection. Raise `Timeout` on slow links
+  -- noting that it is also the request timeout, and the default for `WriteTimeout`.
+
+- **A connection that cannot carry a read deadline now fails the read.** The error from
+  `SetReadDeadline` was previously ignored and the read went ahead without the bound it had
+  just promised. This can only affect a connection supplied by a custom `Dialer` or
+  `HostDialer`.
+
+- **A decompression failure on a fully received body no longer closes the connection.** The
+  body arrived intact, so the frame boundary is sound and the error belongs to the caller. It
+  was previously closed whenever the compressor happened to return something implementing
+  `net.Error`.
+
+### Documented
+
+- `ClusterConfig.Timeout` and `WriteTimeout` now record that setting both to zero arms no
+  write deadline at all, leaving a blocked write with no bound -- a caller's context is not
+  consulted once a write has started. Under the default coalescer that point comes earlier
+  than it sounds: a frame accepted but not yet flushed is already past it, so a caller can
+  wait beyond its own deadline before any of its frame has reached the socket. Behaviour is
+  unchanged.
+
 ## [2.6.0-otter] - 2026-09-07
 
 Auto-healing. A ring that has gone quiet now repairs itself, and a node that comes back is
