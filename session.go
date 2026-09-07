@@ -649,6 +649,19 @@ type hostScheduler struct {
 	// refreshRetryFloor holds back the refresh phase after a delivery failure.
 	// It is the zero value whenever the last attempt was delivered.
 	refreshRetryFloor time.Time
+
+	// backoff is the delay the reconnect phase last chose, the state that makes
+	// its retries exponential. It is reset to one base interval when a new
+	// outage is observed, doubled towards reconnectInterval at the end of every
+	// round that served or abandoned a batch, and cleared when there is nothing
+	// left to reconnect.
+	backoff time.Duration
+
+	// observedGen is the outage generation this loop has already reconciled
+	// against, including rounds that served nothing. It is what distinguishes a
+	// new outage - which resets the backoff and arms an absolute deadline from
+	// the outage's own start - from another host joining the one under way.
+	observedGen uint64
 }
 
 // newHostScheduler builds the scheduler the reconnect goroutine runs.
@@ -696,14 +709,28 @@ func (s *Session) reconnectDownedHosts(intv time.Duration) {
 	s.newHostScheduler(intv).run()
 }
 
-// run arms the reconnect phase and serves rounds until the session's context is
-// cancelled.
+// run serves rounds until the session's context is cancelled.
+//
+// Nothing arms the reconnect phase here. Its deadline is produced by the
+// reconciliation in serveReconnect, from an outage the ledger actually recorded,
+// so an idle session keeps no reconnect wake-up at all: the only thing owed to a
+// ring with nothing DOWN is the periodic refresh.
+//
+// A nudge is a wake-up and nothing else. The round it starts re-reads the ledger
+// like any other, because the channel keeps no history and a receive is no
+// evidence of an unseen generation. A scheduler with no reconnect phase never
+// receives one, so it cannot swallow an announcement it would not act on.
 func (w *hostScheduler) run() {
 	if w.session.cfg.testSchedulerStarted != nil {
 		w.session.cfg.testSchedulerStarted(w.reconnectInterval)
 	}
+
+	// A nudge announces an outage, and only the reconnect phase acts on one. A
+	// scheduler without that phase has nothing to do with the announcement, so it
+	// does not consume it: a nil channel blocks for ever.
+	var nudged <-chan struct{}
 	if w.reconnectEnabled() {
-		w.reconnectDeadline = w.clock.now().Add(w.reconnectInterval)
+		nudged = w.session.outage.nudge
 	}
 
 	for {
@@ -721,6 +748,8 @@ func (w *hostScheduler) run() {
 		case <-w.session.ctx.Done():
 			stop()
 			return
+		case <-nudged:
+			stop()
 		case <-fired:
 			stop()
 		}
@@ -817,31 +846,172 @@ func (w *hostScheduler) serveRingRefresh(now time.Time) {
 	delivered = true
 }
 
-// serveReconnect runs one reconnect sweep when its deadline is due.
+// baseRetryInterval is the first delay a new outage waits before its hosts are
+// retried, and the step the exponential backoff starts from.
 //
-// The round consumes an interval whether the sweep returned or panicked, so a
-// callback that panics on every sweep is retried on the configured rhythm
-// instead of immediately.
+// It is capped by ReconnectInterval so a configuration that retries faster than
+// once a second is honoured rather than overridden. That collapses the sequence
+// for such a configuration: with an interval under a second the first step is
+// already the cap, and the backoff degenerates into the fixed rhythm the setting
+// asks for.
+//
+// The result is strictly positive for every scheduler whose reconnect phase
+// exists, which is what stops a failed round from arming a deadline that is
+// already due.
+//
+// Returns:
+//   - time.Duration: the base retry delay
+func (w *hostScheduler) baseRetryInterval() time.Duration {
+	return min(time.Second, w.reconnectInterval)
+}
+
+// serveReconnect runs one reconnect round: it reconciles the phase against the
+// outage ledger, and serves a sweep when the reconciled deadline is due.
+//
+// A round that served or abandoned a batch leaves with a longer delay than it
+// arrived with, and so does a round that panicked - including one that failed
+// before the reconciliation ran, when the backoff may still be zero. Doubling a
+// zero backoff yields zero, so the advance takes the base interval as its floor;
+// without that floor a callback that panics during the eligibility scan would
+// arm an already-due deadline and spin the loop.
+//
+// A round that found nothing due changes no deadline. The suppression is scoped
+// to this phase: the ring refresh has already been served by the time this runs.
 //
 // Parameters:
 //   - now: the round's reference time
 func (w *hostScheduler) serveReconnect(now time.Time) {
-	if !w.reconnectEnabled() || w.reconnectDeadline.IsZero() || now.Before(w.reconnectDeadline) {
+	if !w.reconnectEnabled() {
+		// The phase does not exist: no deadline is produced, none is advanced,
+		// and the application's HostFilter is never consulted from here.
 		return
 	}
 
+	// Armed before anything that can panic, and cleared only on the path that
+	// deliberately serves nothing, so every other way out of this function
+	// leaves with a strictly positive delay.
+	advance := true
 	defer func() {
-		w.reconnectDeadline = w.clock.now().Add(w.reconnectInterval)
+		if advance {
+			w.advanceReconnect()
+		}
 	}()
 	defer recoverGoroutine(w.session.logger, "Session.hostScheduler.reconnect", nil)
 
-	w.session.reconnectDownedHostsOnce()
+	gen, startedAt, eligible := w.sampleOutage()
+	w.reconcile(now, gen, startedAt, eligible)
+
+	if len(eligible) == 0 || w.reconnectDeadline.IsZero() || now.Before(w.reconnectDeadline) {
+		advance = false
+		return
+	}
+
+	w.session.reconnectDownedHostsOnce(eligible, gen)
 }
 
-// reconnectDownedHostsOnce is one sweep of the host scheduler's reconnect phase.
+// sampleOutage reads the outage ledger and the hosts to retry as one
+// authorization.
 //
-// While at least one unfiltered ring host is DOWN it first requests a ring
-// refresh, then starts a pool fill for every host that is not UP.
+// The generation and the eligibility scan are separate reads, so a producer can
+// change the ledger in between and leave the pair describing two different
+// outages. The scan is therefore repeated once when that is detected, which is
+// enough: what actually keeps a stale round from admitting a host is the
+// generation gate at registration, not this resampling, so retrying until the
+// two agree would only trade a correctness question for a livelock behind one
+// flapping host.
+//
+// A second disagreement is left alone. The caller carries the authorization it
+// holds into the gate, which rejects it, and the newer outage is reconciled
+// untouched on the next round - relabelling the old list with the new generation
+// would spend that outage's first retry on work that was never part of it.
+//
+// Returns:
+//   - uint64: the outage generation that authorizes this round
+//   - time.Time: when that outage began
+//   - []*HostInfo: the hosts to retry under that authorization
+func (w *hostScheduler) sampleOutage() (uint64, time.Time, []*HostInfo) {
+	gen, startedAt := w.session.outageSnapshot()
+	eligible := w.scanEligible()
+
+	afterGen, afterStartedAt := w.session.outageSnapshot()
+	if afterGen == gen && afterStartedAt.Equal(startedAt) {
+		return gen, startedAt, eligible
+	}
+
+	// One resample, taken as a pair with its own scan.
+	gen, startedAt = afterGen, afterStartedAt
+	return gen, startedAt, w.scanEligible()
+}
+
+// scanEligible takes a ring snapshot and returns the hosts the reconnect phase
+// may retry.
+//
+// Returns:
+//   - []*HostInfo: the hosts that are not UP and that the HostFilter accepts
+func (w *hostScheduler) scanEligible() []*HostInfo {
+	hosts := w.session.ring.allHosts()
+	w.session.logger.Debug("Logging current ring state.", NewLogFieldString("ring", ringString(hosts)))
+	return w.session.eligibleDownHosts(hosts)
+}
+
+// reconcile brings the reconnect phase's deadline and backoff up to date with
+// the ledger, before anything asks whether the phase is due.
+//
+// The order matters: a new outage must be able to make this very round due, so
+// the deadline it arms has to exist before the due check reads it. Deciding
+// first and reconciling afterwards would delay every outage by one round.
+//
+// A new outage arms an absolute deadline from the outage's own start, not from
+// now. The retry is then owed at a fixed instant however late this loop happens
+// to wake, and a round held up by a slow dial serves it immediately on arrival
+// instead of waiting out another full step.
+//
+// An outage that another host joins is deliberately left alone: it neither
+// resets the backoff nor moves a retry that is already pending, because a
+// cluster with nodes constantly entering and leaving would otherwise reset to
+// the first step for ever and never retry anything.
+//
+// Parameters:
+//   - now: the round's reference time
+//   - gen: the sampled outage generation
+//   - startedAt: when that outage began
+//   - eligible: the hosts to retry under that authorization
+func (w *hostScheduler) reconcile(now time.Time, gen uint64, startedAt time.Time, eligible []*HostInfo) {
+	switch {
+	case gen != w.observedGen:
+		w.observedGen = gen
+		w.backoff = w.baseRetryInterval()
+		w.reconnectDeadline = startedAt.Add(w.backoff)
+	case len(eligible) == 0:
+		// Nothing to reconnect, so the phase keeps no deadline and takes no part
+		// in choosing the next wake-up. The backoff is reset here rather than at
+		// the next outage because the two are indistinguishable from outside.
+		w.reconnectDeadline = time.Time{}
+		w.backoff = 0
+	case w.reconnectDeadline.IsZero():
+		// Hosts to retry but no outage recorded for them: a HostFilter that
+		// started accepting a host without any event to announce it. The ledger
+		// belongs to its producers and is never corrected from here, so the
+		// remedy is a deadline of this phase's own.
+		w.backoff = w.baseRetryInterval()
+		w.reconnectDeadline = now.Add(w.backoff)
+	}
+}
+
+// advanceReconnect moves the phase on to its next step.
+//
+// The backoff doubles towards ReconnectInterval, which is the cap rather than
+// the rhythm. The floor under the doubling is what makes the step strictly
+// positive from any state, including the zero left behind by a round that found
+// nothing to reconnect and a panic that happened before the backoff was ever
+// initialised.
+func (w *hostScheduler) advanceReconnect() {
+	w.backoff = min(max(w.backoff, w.baseRetryInterval())*2, w.reconnectInterval)
+	w.reconnectDeadline = w.clock.now().Add(w.backoff)
+}
+
+// reconnectDownedHostsOnce is one sweep of the host scheduler's reconnect phase:
+// it requests a ring refresh and then admits every host on the list.
 //
 // The refresh is what finds a host that came back at a different address
 // when the server events that would announce it are lost (#1884):
@@ -855,58 +1025,113 @@ func (w *hostScheduler) serveReconnect(now time.Time) {
 // connection synchronously, with the reconnection policy's retries and waits,
 // and must not delay the discovery behind every unreachable host.
 // It goes through the debouncer's immediate trigger,
-// so it is bounded to one request per tick, coalesces with a running refresh,
+// so it is bounded to one request per sweep, coalesces with a running refresh,
 // and never waits; on a healthy ring nothing is requested at all.
-func (s *Session) reconnectDownedHostsOnce() {
-	s.logger.Debug("Connecting to downed hosts if there is any.")
-	hosts := s.ring.allHosts()
-
-	// Print session.ring for debug.
-	s.logger.Debug("Logging current ring state.", NewLogFieldString("ring", ringString(hosts)))
-
-	if s.hasUnfilteredDownHost(hosts) {
-		s.ringRefresher.trigger()
+//
+// The sweep stops at the first host the generation gate rejects. The outage this
+// batch was authorized by is over, so the rest of the list describes a state the
+// ledger has already left; the next round reconciles against the current one.
+//
+// Parameters:
+//   - eligible: the hosts to admit, from one sample of the ring
+//   - authGen: the outage generation that authorizes these admissions
+//
+// Returns:
+//   - bool: false when the batch was abandoned because the generation changed
+func (s *Session) reconnectDownedHostsOnce(eligible []*HostInfo, authGen uint64) bool {
+	if len(eligible) == 0 {
+		return true
 	}
 
-	for _, h := range hosts {
-		if h.IsUp() {
-			continue
-		}
-		if s.cfg.filterHost(h) {
-			// A filtered host can sit DOWN in the ring - the control connection adds
-			// its host before filtering, and a DOWN sets the state before the filter is
-			// consulted - but the pool never admits it, so every dial here is wasted
-			// work against a node the application excluded on purpose.
-			continue
-		}
+	s.logger.Debug("Connecting to downed hosts if there is any.")
+
+	s.ringRefresher.trigger()
+
+	for _, h := range eligible {
 		s.logger.Debug("Reconnecting to downed host.",
 			NewLogFieldIP("host_addr", h.ConnectAddress()),
 			NewLogFieldInt("host_port", h.Port()),
 			NewLogFieldString("host_id", h.HostID()))
-		// we let the pool call handleNodeConnected to change the host state
-		s.pool.addHost(h)
+		if !s.scheduledAdmit(h, authGen) {
+			return false
+		}
 	}
+	return true
 }
 
-// hasUnfilteredDownHost reports whether any host the HostFilter accepts is not UP.
+// scheduledAdmit registers a pool for a host the scheduler decided to retry, if
+// the outage that decided it is still the current one.
+//
+// The check and the registration are one hostPublishMu section, so the
+// generation that authorizes the admission is the one in force at registration
+// and not the one that was read when this batch was chosen. Without that, a host
+// that went UP and DOWN again while the round was in flight would be readmitted
+// ahead of the new outage's first retry: the pool's own guards compare closed
+// state and object identity, and the host is the same ring object throughout, so
+// nothing else would stop it.
+//
+// The fill is deliberately outside the section - it dials - and is armed by a
+// defer set up before it, so a panic cannot leave a registered pool that nothing
+// fills.
+//
+// Unlike completeAdmission there is no IsUp or publication check: this path
+// exists to act on hosts that are DOWN, and the first policy publication is left
+// to the fill's own handleNodeConnected.
+//
+// Parameters:
+//   - host: the ring object to admit
+//   - authGen: the outage generation this admission was authorized by
+//
+// Returns:
+//   - bool: false when the generation moved on and the batch must be abandoned
+func (s *Session) scheduledAdmit(host *HostInfo, authGen uint64) (ok bool) {
+	if s.cfg.testScheduledAdmitStart != nil {
+		s.cfg.testScheduledAdmitStart(host)
+	}
+
+	var pool *hostConnPool
+	needFill := false
+	defer func() {
+		if needFill && pool.claimFill() {
+			pool.runFill()
+		}
+	}()
+
+	ok = true
+	s.withOwnedHost(host, func() bool {
+		if s.outageGen() != authGen {
+			ok = false
+			return false
+		}
+		pool, needFill = s.pool.registerPool(host)
+		return pool != nil
+	})
+	return ok
+}
+
+// eligibleDownHosts returns the hosts in a ring snapshot that the reconnect
+// phase may act on.
 //
 // A filtered host can sit DOWN in the ring - the control connection adds its
-// host before filtering, and a DOWN sets state before checking the filter -
-// but is never pooled, so it must not keep a ring refresh going on an
-// otherwise healthy ring.
+// host before filtering, and a DOWN sets the state before the filter is
+// consulted - but the pool never admits it, so every dial against one is wasted
+// work on a node the application excluded on purpose, and it must not keep a
+// ring refresh going on an otherwise healthy ring either.
 //
 // Parameters:
 //   - hosts: a ring snapshot
 //
 // Returns:
-//   - bool: true when an accepted host is DOWN
-func (s *Session) hasUnfilteredDownHost(hosts []*HostInfo) bool {
+//   - []*HostInfo: the hosts that are not UP and pass the HostFilter
+func (s *Session) eligibleDownHosts(hosts []*HostInfo) []*HostInfo {
+	var eligible []*HostInfo
 	for _, h := range hosts {
-		if !h.IsUp() && !s.cfg.filterHost(h) {
-			return true
+		if h.IsUp() || s.cfg.filterHost(h) {
+			continue
 		}
+		eligible = append(eligible, h)
 	}
-	return false
+	return eligible
 }
 
 // Query generates a new query object for interacting with the database.
@@ -1165,6 +1390,42 @@ func (s *Session) outageAdd(id string) {
 	case s.outage.nudge <- struct{}{}:
 	default:
 	}
+}
+
+// outageSnapshot reads the current outage's generation and start time as one
+// pair.
+//
+// They are read together on purpose. The scheduler arms a new outage's first
+// retry at startedAt plus one base interval, so a generation paired with another
+// outage's start would authorize a deadline that outage never had - either one
+// already in the past, or one belonging to an outage that has not begun.
+//
+// The start time is meaningless while no outage is under way; the generation is
+// what tells a caller whether it is.
+//
+// Returns:
+//   - uint64: the current outage generation
+//   - time.Time: when that outage began
+func (s *Session) outageSnapshot() (uint64, time.Time) {
+	s.outage.mu.Lock()
+	defer s.outage.mu.Unlock()
+
+	return s.outage.gen, s.outage.startedAt
+}
+
+// outageGen reads the current outage generation.
+//
+// It is the gate a scheduled admission is checked against, so it is read inside
+// that admission's hostPublishMu section: lock order is hostPublishMu then
+// outage.mu, never the reverse.
+//
+// Returns:
+//   - uint64: the current outage generation
+func (s *Session) outageGen() uint64 {
+	s.outage.mu.Lock()
+	defer s.outage.mu.Unlock()
+
+	return s.outage.gen
 }
 
 // outageRemove drops the host with the given ID from the ledger.

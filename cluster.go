@@ -259,9 +259,14 @@ type ClusterConfig struct {
 	// configuration of host selection and connection selection policies.
 	PoolConfig PoolConfig
 
-	// If not zero, gocql attempt to reconnect known DOWN nodes in every ReconnectInterval.
+	// ReconnectInterval caps the delay between scheduled retry rounds for known DOWN
+	// nodes. Retries start one second after a node goes down, also limited by
+	// ReconnectInterval, and the delay doubles after every round until it reaches that
+	// cap. The delay returns to the start only once every known node is UP again, so a
+	// node failing while another is already down joins the retry rhythm under way
+	// rather than restarting it.
 	//
-	// While a node is DOWN, every interval also re-reads the peers table over the
+	// While a node is DOWN, every retry round also re-reads the peers table over the
 	// control connection, so a node that rejoined at a different address is found
 	// without relying on server events.
 	// With DisableInitialHostLookup that re-read can be the first ring refresh of the
@@ -490,6 +495,12 @@ type ClusterConfig struct {
 	// this host and before any pool registration or policy publication
 	// (internal, for testing).
 	testCompleteAdmissionStart func(host *HostInfo)
+
+	// testScheduledAdmitStart is called at the start of Session.scheduledAdmit,
+	// after the scheduler chose this host and before the generation gate and the
+	// pool registration, so a test can change the outage ledger inside the window
+	// the gate exists to close (internal, for testing).
+	testScheduledAdmitStart func(host *HostInfo)
 
 	// testStartPoolFillDone is called at the end of Session.startPoolFill, after the
 	// withOwnedHost publication attempt, so a test can join that goroutine

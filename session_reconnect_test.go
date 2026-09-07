@@ -138,6 +138,20 @@ func TestRingRefreshFailure_IsLogged(t *testing.T) {
 	require.Equal(t, errNoControl.Error(), warnings[0].fieldString("err"))
 }
 
+// sweepDownedHostsOnce runs one reconnect sweep the way the scheduler does:
+// one ring sample, filtered to the hosts the phase may act on, admitted under
+// the outage generation in force when the sample was taken.
+//
+// Parameters:
+//   - s: the session to sweep
+//
+// Returns:
+//   - bool: false when the batch was abandoned because the generation changed
+func sweepDownedHostsOnce(s *Session) bool {
+	gen, _ := s.outageSnapshot()
+	return s.reconnectDownedHostsOnce(s.eligibleDownHosts(s.ring.allHosts()), gen)
+}
+
 // tickFixture is a pause-recovery session with the reconnect ticker disabled,
 // so the test owns every tick, and with the ring refresh's start observable.
 type tickFixture struct {
@@ -230,7 +244,7 @@ func (f *tickFixture) requireNoRefresh(t *testing.T, window time.Duration, what 
 func TestReconnectTick_AllUpNoRequest(t *testing.T) {
 	f := newTickFixture(t, nil)
 
-	f.session.reconnectDownedHostsOnce()
+	sweepDownedHostsOnce(f.session)
 
 	f.requireNoRefresh(t, 2*ringRefreshDebounceTime, "a tick with every host UP")
 }
@@ -245,7 +259,7 @@ func TestReconnectTick_HostDownRequestsBeforeDialCompletes(t *testing.T) {
 	f.hooks.blockDial(f.host)
 	ticked := make(chan struct{})
 	go func() {
-		f.session.reconnectDownedHostsOnce()
+		sweepDownedHostsOnce(f.session)
 		close(ticked)
 	}()
 	f.hooks.awaitDialBlocked(t)
@@ -266,12 +280,12 @@ func TestReconnectTick_HostDownRequestsEveryTick(t *testing.T) {
 	f := newTickFixture(t, nil)
 	f.driveDown(t)
 
-	f.session.reconnectDownedHostsOnce()
+	sweepDownedHostsOnce(f.session)
 	f.awaitEntered(t, "the first tick's refresh")
 	require.Error(t, awaitRefreshDone(t, f.done, "the first refresh to finish"))
 	f.hooks.await(t, poolFillDone, f.host, "the first tick's failed fill")
 
-	f.session.reconnectDownedHostsOnce()
+	sweepDownedHostsOnce(f.session)
 	f.awaitEntered(t, "the second tick's refresh")
 	require.Error(t, awaitRefreshDone(t, f.done, "the second refresh to finish"))
 }
@@ -283,7 +297,7 @@ func TestReconnectTick_DisabledControlWarnsPerTick(t *testing.T) {
 	f.driveDown(t)
 
 	for i := range 2 {
-		f.session.reconnectDownedHostsOnce()
+		sweepDownedHostsOnce(f.session)
 		require.ErrorIs(t, awaitRefreshDone(t, f.done, "the refresh to finish"), errNoControl)
 		f.hooks.await(t, poolFillDone, f.host, "the tick's failed fill")
 		warnings := f.logger.withMessage("Ring refresh failed.")
@@ -312,8 +326,8 @@ func TestReconnectTick_TickerRequestsRefreshWhileDown(t *testing.T) {
 	f.awaitEntered(t, "a refresh requested by the reconnect sweep")
 }
 
-// TestHasUnfilteredDownHost covers the trigger predicate on hand-built hosts.
-func TestHasUnfilteredDownHost(t *testing.T) {
+// TestEligibleDownHosts covers the eligibility scan on hand-built hosts.
+func TestEligibleDownHosts(t *testing.T) {
 	mk := func(addr string, state nodeState) *HostInfo {
 		h, err := NewHostInfoFromAddrPort(net.ParseIP(addr), 9042)
 		require.NoError(t, err)
@@ -329,8 +343,9 @@ func TestHasUnfilteredDownHost(t *testing.T) {
 		return host != down
 	})}}
 
-	require.False(t, accept.hasUnfilteredDownHost(nil), "an empty ring has no DOWN host")
-	require.False(t, accept.hasUnfilteredDownHost([]*HostInfo{up}), "an UP host does not trigger")
-	require.True(t, accept.hasUnfilteredDownHost([]*HostInfo{up, down}), "an accepted DOWN host triggers")
-	require.False(t, reject.hasUnfilteredDownHost([]*HostInfo{up, down}), "a filtered DOWN host does not trigger")
+	require.Empty(t, accept.eligibleDownHosts(nil), "an empty ring has no DOWN host")
+	require.Empty(t, accept.eligibleDownHosts([]*HostInfo{up}), "an UP host is not eligible")
+	require.Equal(t, []*HostInfo{down}, accept.eligibleDownHosts([]*HostInfo{up, down}),
+		"an accepted DOWN host is eligible")
+	require.Empty(t, reject.eligibleDownHosts([]*HostInfo{up, down}), "a filtered DOWN host is not eligible")
 }

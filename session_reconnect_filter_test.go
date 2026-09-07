@@ -71,10 +71,10 @@ func TestReconnectSkipsFilteredHosts(t *testing.T) {
 	rejected := peerHostID
 	filter.reject.Store(&rejected)
 
-	// reconnectDownedHostsOnce registers the pool synchronously before filling it,
+	// The sweep registers the pool synchronously before filling it,
 	// so the answer is settled by the time the call returns.
 	dialer.reset()
-	session.reconnectDownedHostsOnce()
+	sweepDownedHostsOnce(session)
 	_, ok = session.pool.getPoolByHostID(peerHostID)
 	require.False(t, ok, "a filtered host must not be admitted to the pool by the reconnect tick")
 	require.False(t, dialer.askedFor(peer.ConnectAddressAndPort()),
@@ -83,7 +83,7 @@ func TestReconnectSkipsFilteredHosts(t *testing.T) {
 	// A host the filter accepts is still acted on, so the skip is the filter's doing
 	// and not a reconnect that stopped working.
 	filter.reject.Store(nil)
-	session.reconnectDownedHostsOnce()
+	sweepDownedHostsOnce(session)
 	_, ok = session.pool.getPoolByHostID(peerHostID)
 	require.True(t, ok, "an accepted host must still be admitted by the reconnect tick")
 }

@@ -598,7 +598,7 @@ func TestRefreshRing_DuplicateLimitationTwoPhase(t *testing.T) {
 			// C is DOWN, so the reconnect tick is what requests the next refresh.
 			f.drain()
 			f.script.setPeers([]peerRow{moved})
-			f.session.reconnectDownedHostsOnce()
+			sweepDownedHostsOnce(f.session)
 			require.NoError(t, f.awaitDone(t, "the refresh the tick requested after the duplicate cleared"))
 			after, ok := f.session.ring.getHost(peerIDOne)
 			require.True(t, ok)

@@ -92,6 +92,22 @@ func (c *fakeSchedulerClock) newTimer(d time.Duration) (<-chan time.Time, func()
 	return timer.fired, func() {}
 }
 
+// rebase moves the clock onto another timeline, so a scheduler driven by it
+// shares one with the wall-clock instants the outage ledger stamps.
+//
+// The ledger's producers read the wall clock, and the deadline a new outage arms
+// is absolute - the outage's own start plus one base interval - so a test that
+// left the fake clock on its own epoch would find that deadline months away and
+// never due.
+//
+// Parameters:
+//   - at: the instant the clock should now read
+func (c *fakeSchedulerClock) rebase(at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.current = at
+}
+
 // advance moves virtual time forward without firing any timer, for tests that
 // drive phases directly instead of running the loop.
 //
@@ -145,6 +161,10 @@ var _ HostFilter = (*panickingHostFilter)(nil)
 
 // arm makes every later call panic.
 func (f *panickingHostFilter) arm() { f.armed.Store(true) }
+
+// disarm makes the filter accept again, so a test can assert that what it was
+// holding back resumes.
+func (f *panickingHostFilter) disarm() { f.armed.Store(false) }
 
 // Accept accepts until armed, and panics after that.
 //
@@ -202,6 +222,23 @@ func newSessionScheduler(session *Session, clock *fakeSchedulerClock, intv time.
 	// because this line would otherwise hide it.
 	w.fullRefreshDeadline = clock.now().Add(ringFullRefreshInterval)
 	return w
+}
+
+// pinAtBackoffCap puts the reconnect phase where its rhythm is one fixed
+// interval again: the outage already observed, so no round reconciles a new one,
+// and the backoff already at the cap, where min(max(intv, base)*2, intv) is intv.
+//
+// Tests about the loop's structure use it so the exponential ramp does not have
+// to be replayed in every one of them; the ramp itself is pinned by
+// TestHostScheduler_BackoffDoublesToTheCap.
+//
+// Parameters:
+//   - w: the scheduler to pin
+//   - session: the session whose ledger it is reconciling against
+func pinAtBackoffCap(w *hostScheduler, session *Session) {
+	w.observedGen = session.outageGen()
+	w.backoff = w.reconnectInterval
+	w.reconnectDeadline = w.clock.now().Add(w.reconnectInterval)
 }
 
 // TestHostScheduler_NextWaitPicksEarliestArmedDeadline pins the timer choice:
@@ -285,15 +322,111 @@ func TestHostScheduler_NextWaitPicksEarliestArmedDeadline(t *testing.T) {
 	}
 }
 
-// TestHostScheduler_ReconnectKeepsItsInterval proves the deadline loop replaced
-// the ticker without changing the rhythm: with only the reconnect phase armed
-// the scheduler waits exactly one interval before every round.
-func TestHostScheduler_ReconnectKeepsItsInterval(t *testing.T) {
-	const intv = 90 * time.Second
+// TestHostScheduler_BackoffDoublesToTheCap pins F3 on the shape the default
+// configuration has: a 60s ReconnectInterval against a five-minute refresh
+// period, so the whole ramp happens inside one safety-net period and nothing in
+// the assertion depends on the two phases sharing a rhythm.
+//
+// The delays asserted are the ones the scheduler chose, read back from the
+// clock. They are not the moments a dial was observed: a pool fill dials its
+// first connection synchronously, with the reconnection policy's own retries, so
+// an unreachable host would push every later observation out.
+//
+// The first delay is not part of the sequence read here - it is armed from the
+// outage's own start, which TestHostScheduler_NewOutageArmsFromItsStart pins -
+// so the ramp below begins at the first doubling.
+func TestHostScheduler_BackoffDoublesToTheCap(t *testing.T) {
+	const intv = time.Minute
 
 	f := newTickFixture(t, nil)
+	f.driveDown(t)
+	_, startedAt := f.session.outageSnapshot()
+
 	clock := newFakeSchedulerClock()
-	w := newTestScheduler(f.session, clock, intv)
+	clock.rebase(startedAt)
+	w := newSessionScheduler(f.session, clock, intv)
+
+	// The ramp is read from serveReconnect directly: the loop's own timer choice
+	// is the minimum of both phases, and the safety net would win the later
+	// rounds once the backoff reaches the cap.
+	require.Equal(t, time.Second, w.baseRetryInterval(), "the default interval must give a one second base")
+
+	// The first round only reconciles. The outage's first retry is owed at its own
+	// start plus one base interval, which has not arrived yet.
+	w.serveReconnect(clock.now())
+	require.Equal(t, time.Second, w.backoff, "a new outage starts at the base interval")
+	require.Equal(t, startedAt.Add(time.Second), w.reconnectDeadline,
+		"the first retry must be armed from the outage's own start")
+
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second,
+		32 * time.Second, intv, intv}
+	for round, expected := range want {
+		clock.advance(w.reconnectDeadline.Sub(clock.now()))
+		w.serveReconnect(clock.now())
+		require.Equal(t, expected, w.backoff, "round %d must double towards the cap and stop there", round)
+		require.Equal(t, clock.now().Add(expected), w.reconnectDeadline,
+			"round %d must arm the delay it chose", round)
+	}
+}
+
+// TestHostScheduler_NewOutageArmsFromItsStart pins the first step of the ramp
+// and where it is measured from.
+//
+// A new outage's first retry is owed at a fixed instant - the outage's own start
+// plus one base interval - and not one base interval after whenever the loop
+// happened to wake. Arming it from now would let a round held up elsewhere push
+// the retry it was late for further out, and would make the delay depend on the
+// loop's timing rather than the outage's.
+func TestHostScheduler_NewOutageArmsFromItsStart(t *testing.T) {
+	const intv = time.Minute
+
+	f := newTickFixture(t, nil)
+	f.driveDown(t)
+	_, startedAt := f.session.outageSnapshot()
+
+	clock := newFakeSchedulerClock()
+	clock.rebase(startedAt)
+	w := newSessionScheduler(f.session, clock, intv)
+	require.Zero(t, w.observedGen, "a fresh scheduler has observed no outage")
+	require.True(t, w.reconnectDeadline.IsZero(), "a fresh scheduler arms no reconnect deadline")
+
+	// The loop wakes well after the outage began, which is what a slow round or a
+	// late nudge looks like.
+	clock.advance(5 * time.Second)
+	w.serveReconnect(clock.now())
+
+	gen, _ := f.session.outageSnapshot()
+	require.Equal(t, gen, w.observedGen, "the round must record the outage it reconciled")
+	require.Equal(t, 2*time.Second, w.backoff,
+		"an overdue first retry must be served on arrival, and leave on the second step")
+	require.Equal(t, clock.now().Add(2*time.Second), w.reconnectDeadline)
+
+	// The deadline the round served was the outage's own, not one measured from
+	// the round: the retry actually ran rather than being deferred a full step.
+	// The pool itself cannot be asserted on - the fill fails against the closed
+	// gate and markHostDown unregisters it again before the round returns.
+	f.hooks.await(t, poolFillDone, f.host, "the overdue retry's fill")
+}
+
+// TestHostScheduler_QuietSessionArmsNoReconnect pins the other half of the
+// deadline's ownership: it is produced by the reconciliation from an outage the
+// ledger recorded, and by nothing else.
+//
+// A session with every host UP owes no reconnect at all, so it must keep no
+// reconnect deadline - the safety net is the only thing left to wake it. A
+// deadline armed on construction would be a retry for an outage that never
+// happened, and would consult the application's HostFilter on a rhythm the
+// cluster gave no reason for.
+func TestHostScheduler_QuietSessionArmsNoReconnect(t *testing.T) {
+	const intv = time.Minute
+
+	filter := &countingHostFilter{}
+	f := newTickFixture(t, func(cluster *ClusterConfig) {
+		cluster.HostFilter = filter
+	})
+
+	clock := newFakeSchedulerClock()
+	w := newSessionScheduler(f.session, clock, intv)
 
 	done := make(chan struct{})
 	go func() {
@@ -302,8 +435,18 @@ func TestHostScheduler_ReconnectKeepsItsInterval(t *testing.T) {
 	}()
 
 	for round := range 3 {
-		require.Equal(t, intv, clock.release(t, "the reconnect phase to arm its timer"),
-			"round %d must wait exactly one reconnect interval", round)
+		require.Equal(t, ringFullRefreshInterval, clock.release(t, "the next round's timer"),
+			"round %d must be scheduled by the safety net alone", round)
+		f.awaitEntered(t, "the periodic refresh")
+		require.Error(t, awaitRefreshDone(t, f.done, "the periodic refresh to finish"))
+	}
+
+	// The next timer is armed only once the round has finished both phases, so
+	// waiting for it makes the worker's own state readable.
+	select {
+	case <-clock.armed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the scheduler did not arm a timer after the last round")
 	}
 
 	f.session.cancel()
@@ -312,6 +455,10 @@ func TestHostScheduler_ReconnectKeepsItsInterval(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the scheduler did not exit after the session context was cancelled")
 	}
+
+	require.True(t, w.reconnectDeadline.IsZero(), "a session with nothing DOWN must keep no reconnect deadline")
+	require.Zero(t, w.backoff, "a session with nothing DOWN must keep no backoff")
+	require.Positive(t, filter.count(), "the eligibility scan is what establishes there is nothing to reconnect")
 }
 
 // TestHostScheduler_UnarmedRefreshRequestsNothing pins the phase's zero value as
@@ -329,22 +476,14 @@ func TestHostScheduler_UnarmedRefreshRequestsNothing(t *testing.T) {
 	w := newTestScheduler(f.session, clock, intv)
 	require.True(t, w.fullRefreshDeadline.IsZero(), "the fixture must start with the periodic refresh unarmed")
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		w.run()
-	}()
-
+	// Driven synchronously: with the refresh unarmed and nothing DOWN, no phase
+	// is armed at all, so the loop would park on cancellation and never wake.
 	for round := range 3 {
-		require.Equal(t, intv, clock.release(t, "the next round's timer"),
-			"round %d must be scheduled by the reconnect phase alone", round)
-	}
+		_, armed := w.nextWait(clock.now())
+		require.False(t, armed, "round %d: an unarmed refresh must not schedule a wake-up on its own", round)
 
-	f.session.cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the scheduler did not exit after the session context was cancelled")
+		clock.advance(intv)
+		w.serve()
 	}
 
 	f.requireNoRefresh(t, 2*ringRefreshDebounceTime, "an unarmed periodic refresh on a healthy ring")
@@ -364,13 +503,17 @@ func TestHostScheduler_ReconnectRoundsDoNotPostponeTheSafetyNet(t *testing.T) {
 	const intv = time.Minute
 
 	f := newTickFixture(t, nil)
+	f.driveDown(t)
+
 	clock := newFakeSchedulerClock()
 	w := newSessionScheduler(f.session, clock, intv)
 	armedAt := w.fullRefreshDeadline
 
 	// Driven synchronously: the test owns the clock and reads the worker's own
-	// state, so there is no second goroutine to race with.
-	w.reconnectDeadline = clock.now().Add(intv)
+	// state, so there is no second goroutine to race with. The phase is pinned at
+	// its cap so every round is one interval apart, which is the shape where a
+	// reconnect round could push the safety net out.
+	pinAtBackoffCap(w, f.session)
 
 	rounds := int(ringFullRefreshInterval / intv)
 	require.Greater(t, rounds, 1, "the fixture must give several reconnect rounds inside one refresh period")
@@ -386,13 +529,11 @@ func TestHostScheduler_ReconnectRoundsDoNotPostponeTheSafetyNet(t *testing.T) {
 		if round < rounds {
 			require.Equal(t, armedAt, w.fullRefreshDeadline,
 				"round %d served only the reconnect phase, so the refresh deadline must not move", round)
-			f.requireNoRefresh(t, 20*time.Millisecond, "a reconnect round before the refresh was due")
 		}
 	}
 
 	require.Equal(t, armedAt.Add(ringFullRefreshInterval), w.fullRefreshDeadline,
 		"the refresh must advance exactly one period, and only once it was served")
-	f.awaitEntered(t, "the periodic refresh on the round it finally came due")
 }
 
 // TestHostScheduler_RunExitsOnContextCancel proves a scheduler parked on its
@@ -400,7 +541,7 @@ func TestHostScheduler_ReconnectRoundsDoNotPostponeTheSafetyNet(t *testing.T) {
 func TestHostScheduler_RunExitsOnContextCancel(t *testing.T) {
 	f := newTickFixture(t, nil)
 	clock := newFakeSchedulerClock()
-	w := newTestScheduler(f.session, clock, time.Hour)
+	w := newSessionScheduler(f.session, clock, time.Hour)
 
 	done := make(chan struct{})
 	go func() {
@@ -419,6 +560,38 @@ func TestHostScheduler_RunExitsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the scheduler did not exit on cancellation")
+	}
+}
+
+// TestHostScheduler_RunExitsWithNothingArmed covers the state the reconnect
+// phase's ownership made reachable: with the refresh unarmed and no outage
+// recorded, no phase is armed and the loop parks on a nil channel.
+//
+// A loop that treated "nothing armed" as a zero delay would spin instead, so the
+// exit has to be proved from that state and not only from a parked timer.
+func TestHostScheduler_RunExitsWithNothingArmed(t *testing.T) {
+	f := newTickFixture(t, nil)
+	clock := newFakeSchedulerClock()
+	w := newTestScheduler(f.session, clock, time.Hour)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.run()
+	}()
+
+	// Nothing may be armed, so the absence of a timer is the state under test.
+	select {
+	case <-clock.armed:
+		t.Fatal("a scheduler with no armed phase must not arm a timer")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	f.session.cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a scheduler with no armed phase did not exit on cancellation")
 	}
 }
 
@@ -444,6 +617,16 @@ func TestHostScheduler_ReconnectPanicKeepsRefreshAndRhythm(t *testing.T) {
 	// Arm the periodic refresh on the same rhythm so every round makes both
 	// phases due, which is the case where one phase can starve the other.
 	w.fullRefreshDeadline = clock.now().Add(intv)
+	// The sweep panics inside the eligibility scan, before any reconciliation, so
+	// the backoff is whatever the previous round left. Pinning it at the cap makes
+	// the rhythm one interval per round and the assertion below readable; that a
+	// panic from the zero state still leaves a positive delay is pinned by
+	// TestHostScheduler_PanicBeforeReconcileStillAdvances.
+	pinAtBackoffCap(w, f.session)
+	// The conviction above left a nudge pending. Consuming it here keeps every
+	// round in this test timer-driven: a nudge-woken round leaves its timer
+	// unread, and the next release would then fire a timer nothing is waiting on.
+	takeNudge(f.session)
 
 	done := make(chan struct{})
 	go func() {
@@ -513,11 +696,9 @@ func TestHostScheduler_RefreshFailureFloorIsPhaseScoped(t *testing.T) {
 	w := newTestScheduler(f.session, clock, time.Minute)
 
 	// A nil refresher makes the delivery panic, which is the failure the phase
-	// boundary exists to absorb; the fixture host is UP, so the reconnect sweep
-	// never reaches the refresher itself.
+	// boundary exists to absorb.
 	refresher := f.session.ringRefresher
 	f.session.ringRefresher = nil
-	t.Cleanup(func() { f.session.ringRefresher = refresher })
 
 	now := clock.now()
 	w.fullRefreshDeadline = now
@@ -525,6 +706,14 @@ func TestHostScheduler_RefreshFailureFloorIsPhaseScoped(t *testing.T) {
 
 	require.Equal(t, now, w.fullRefreshDeadline, "a request that was not delivered must not consume the deadline")
 	require.Equal(t, now.Add(ringRefreshRetryDelay), w.refreshRetryFloor, "a failed delivery must take a retry floor")
+
+	// The refresher is restored before the round below: what must hold the phase
+	// back there is its floor, not a delivery that would fail anyway.
+	f.session.ringRefresher = refresher
+	// The reconnect phase needs something to serve, pinned at its cap so the
+	// round's own rhythm is the configured interval.
+	f.driveDown(t)
+	pinAtBackoffCap(w, f.session)
 
 	// The reconnect phase comes due well inside the refresh's floor.
 	w.reconnectDeadline = now.Add(ringRefreshRetryDelay / 4)
