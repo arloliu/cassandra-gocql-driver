@@ -292,6 +292,17 @@ func LookupIP(host string) ([]net.IP, error) {
 	return net.LookupIP(host)
 }
 
+// hostRef names one host for a log line: its connect address and host ID.
+//
+// Parameters:
+//   - h: the host to name
+//
+// Returns:
+//   - string: "<address>-<host id>"
+func hostRef(h *HostInfo) string {
+	return h.ConnectAddress().String() + "-" + h.HostID()
+}
+
 func ringString(hosts []*HostInfo) string {
 	buf := new(bytes.Buffer)
 	for _, h := range hosts {

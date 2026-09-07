@@ -263,15 +263,25 @@ type ClusterConfig struct {
 	//
 	// While a node is DOWN, every interval also re-reads the peers table over the
 	// control connection, so a node that rejoined at a different address is found
-	// without relying on server events; nothing is read while every node is UP.
+	// without relying on server events.
 	// With DisableInitialHostLookup that re-read can be the first ring refresh of the
 	// session, which is when placeholder host IDs are replaced by the real ones and
 	// the affected pools are rebuilt; that used to wait for the first event- or
 	// reconnect-driven refresh.
 	//
-	// Setting it to zero disables that sweep, and no other component takes the job over: a
-	// host the driver has convicted then stays down until the server sends an UP event for
-	// it. Leave it set unless something outside the driver owns recovery.
+	// Independently of this setting, the driver re-reads the cluster metadata every
+	// five minutes even while every node is UP. That period is fixed and is not
+	// derived from ReconnectInterval: it is a safety net for topology events the
+	// driver never received, so tying it to a reconnection setting would let a long
+	// ReconnectInterval stretch it - or, at zero, remove it.
+	//
+	// Setting it to zero disables the scheduled retries for DOWN hosts the driver
+	// already knows about and whose description has not changed. It does not stop
+	// the driver connecting: the periodic metadata refresh still discovers new
+	// hosts and still notices that a known host now answers at a different address,
+	// and both of those dial. UP events and control-connection recovery are also
+	// unaffected. Leave it set unless something outside the driver owns recovery of
+	// unchanged DOWN hosts.
 	//
 	// Default: 60s.
 	ReconnectInterval time.Duration
@@ -458,6 +468,11 @@ type ClusterConfig struct {
 	// set and before it is closed, so a test can latch a shutdown into that window
 	// (internal, for testing); nil in production.
 	testControlAfterSetupFailure func()
+
+	// testSchedulerStarted is called by the host scheduler's goroutine before its
+	// first round, with the reconnect interval it was given, so a test can assert
+	// that the scheduler runs even when scheduled reconnects are disabled.
+	testSchedulerStarted func(reconnectInterval time.Duration)
 
 	// testStartPoolFillStart is called at the start of Session.startPoolFill,
 	// before pool admission and the withOwnedHost publication, so a test can gate

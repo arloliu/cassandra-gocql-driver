@@ -508,12 +508,10 @@ func (s *Session) init() error {
 		}
 	}
 
-	// TODO(zariel): we probably dont need this any more as we verify that we
-	// can connect to one of the endpoints supplied by using the control conn.
-	// See if there are any connections in the pool
-	if s.cfg.ReconnectInterval > 0 {
-		go s.reconnectDownedHosts(s.cfg.ReconnectInterval)
-	}
+	// The scheduler always runs: the periodic ring refresh is its own safety net
+	// and is not something ReconnectInterval turns off. With ReconnectInterval at
+	// zero the worker serves that refresh and nothing else.
+	go s.reconnectDownedHosts(s.cfg.ReconnectInterval)
 
 	if s.pool.Size() == 0 {
 		return ErrNoConnectionsStarted
@@ -643,8 +641,9 @@ type hostScheduler struct {
 	reconnectDeadline time.Time
 
 	// fullRefreshDeadline is when the periodic ring refresh is next due. The
-	// zero value means the phase has no deadline; the session leaves it unarmed
-	// until the periodic refresh is turned on.
+	// zero value means the phase has no deadline, which the session never
+	// produces: the refresh is armed at construction and re-armed every time it
+	// is served.
 	fullRefreshDeadline time.Time
 
 	// refreshRetryFloor holds back the refresh phase after a delivery failure.
@@ -658,14 +657,32 @@ type hostScheduler struct {
 //   - intv: the reconnect interval; must be positive
 //
 // Returns:
-//   - *hostScheduler: a scheduler whose reconnect phase is armed one interval
-//     out and whose periodic ring refresh is not armed
+//   - *hostScheduler: a scheduler with the periodic ring refresh armed one
+//     period out, and the reconnect phase armed only when intv is positive
 func (s *Session) newHostScheduler(intv time.Duration) *hostScheduler {
-	return &hostScheduler{
+	w := &hostScheduler{
 		session:           s,
 		clock:             realSchedulerClock{},
 		reconnectInterval: intv,
 	}
+	w.fullRefreshDeadline = w.clock.now().Add(ringFullRefreshInterval)
+	return w
+}
+
+// reconnectEnabled reports whether this session schedules retries for DOWN hosts
+// it already knows about.
+//
+// A zero ReconnectInterval does not mean "retry immediately": it means the phase
+// does not exist. It arms no deadline, is never advanced, and takes no part in
+// choosing the next wake-up. Producing a deadline and then declining to act on
+// it would leave a deadline that is due and never served, which is a wake-up
+// with no delay - the scheduler would spin, calling the application's HostFilter
+// as fast as it could.
+//
+// Returns:
+//   - bool: true when the reconnect phase exists
+func (w *hostScheduler) reconnectEnabled() bool {
+	return w.reconnectInterval > 0
 }
 
 // reconnectDownedHosts runs the session's host scheduler until the session's
@@ -682,7 +699,12 @@ func (s *Session) reconnectDownedHosts(intv time.Duration) {
 // run arms the reconnect phase and serves rounds until the session's context is
 // cancelled.
 func (w *hostScheduler) run() {
-	w.reconnectDeadline = w.clock.now().Add(w.reconnectInterval)
+	if w.session.cfg.testSchedulerStarted != nil {
+		w.session.cfg.testSchedulerStarted(w.reconnectInterval)
+	}
+	if w.reconnectEnabled() {
+		w.reconnectDeadline = w.clock.now().Add(w.reconnectInterval)
+	}
 
 	for {
 		wait, armed := w.nextWait(w.clock.now())
@@ -804,7 +826,7 @@ func (w *hostScheduler) serveRingRefresh(now time.Time) {
 // Parameters:
 //   - now: the round's reference time
 func (w *hostScheduler) serveReconnect(now time.Time) {
-	if w.reconnectDeadline.IsZero() || now.Before(w.reconnectDeadline) {
+	if !w.reconnectEnabled() || w.reconnectDeadline.IsZero() || now.Before(w.reconnectDeadline) {
 		return
 	}
 

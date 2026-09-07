@@ -1453,6 +1453,14 @@ func refreshRing(r *ringDescriber) error {
 	}
 	hosts, partitioner := snapshot.hosts, snapshot.partitioner
 
+	// What this round changed about ring membership, for the closing log line.
+	// The periodic refresh runs on a quiet ring for ever, so a round that changed
+	// nothing must not write a line at all at Info, and a round that did change
+	// something must report the change rather than dump every host: on a hundred
+	// nodes that dump is several kilobytes, and at one line per period it is the
+	// bulk of what the driver writes.
+	var changes []string
+
 	prevHosts := r.session.ring.currentHosts()
 	if r.session.cfg.testAfterPrevHostsSnapshot != nil {
 		r.session.cfg.testAfterPrevHostsSnapshot()
@@ -1480,6 +1488,7 @@ func refreshRing(r *ringDescriber) error {
 				NewLogFieldString("old_host_id", prevHost.HostID()),
 				NewLogFieldString("new_host_id", newHostID))
 			r.session.removeHost(prevHost)
+			changes = append(changes, "rekeyed "+hostRef(prevHost))
 			delete(prevHosts, prevHost.HostID())
 		}
 	}
@@ -1507,6 +1516,7 @@ func refreshRing(r *ringDescriber) error {
 			r.session.logger.Info("Adding host.", NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", h.HostID()))
 			canonical = host
 			branchOwesNewHost = true
+			changes = append(changes, "added "+hostRef(host))
 		} else {
 			// host (by hostID) already exists; determine if IP has changed
 			newHostID := h.HostID()
@@ -1527,6 +1537,7 @@ func refreshRing(r *ringDescriber) error {
 					NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", newHostID))
 				host.update(h)
 				branchOwesNewHost = true
+				changes = append(changes, "appeared "+hostRef(host))
 			} else {
 				// The port is half of an endpoint, so a node that moved only its
 				// native_transport_port has to be reconciled the same way one that moved an
@@ -1569,6 +1580,7 @@ func refreshRing(r *ringDescriber) error {
 					}
 					canonical = readded
 					branchOwesNewHost = true
+					changes = append(changes, "replaced "+hostRef(existing)+" with "+hostRef(readded))
 				}
 			}
 		}
@@ -1596,6 +1608,7 @@ func refreshRing(r *ringDescriber) error {
 			}
 			r.session.removeHost(host)
 			hostStateListener.OnRemovedHost(RemovedHostEvent{Host: host})
+			changes = append(changes, "removed "+hostRef(host))
 		}
 	} else {
 		r.session.logger.Warning("Skipping the ring sweep: a row in this snapshot could not be attributed to a host.")
@@ -1603,7 +1616,11 @@ func refreshRing(r *ringDescriber) error {
 
 	r.session.metadata.setPartitioner(partitioner)
 	r.session.policy.SetPartitioner(partitioner)
-	r.session.logger.Info("Refreshed ring.", NewLogFieldString("ring", ringString(r.session.ring.allHosts())))
+	if len(changes) > 0 {
+		r.session.logger.Info("Refreshed ring.", NewLogFieldString("changes", strings.Join(changes, " ")))
+	} else {
+		r.session.logger.Debug("Refreshed ring.", NewLogFieldString("ring", ringString(r.session.ring.allHosts())))
+	}
 
 	return nil
 }
