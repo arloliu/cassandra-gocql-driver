@@ -220,6 +220,7 @@ func connConfig(cfg *ClusterConfig) (*ConnConfig, error) {
 		heartbeatInterval: interval,
 		heartbeatPhase:    phase,
 		heartbeatTimeout:  hbTimeout,
+		testHooks:         cfg.testHooks,
 	}, nil
 }
 

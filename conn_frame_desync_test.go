@@ -266,3 +266,72 @@ func TestConn_StreamIsNotClearedTwiceAcrossReallocation(t *testing.T) {
 	require.Equal(t, before, c.streams.Available(),
 		"reclaiming an already-reclaimed call freed stream %d out from under its new owner", idA)
 }
+
+// writeCompressedFlagFrame answers reqFrame with a response whose body is
+// complete but marked compressed. A client with no compressor reads the whole
+// body and then fails to make sense of it — an error that leaves the wire
+// exactly where it should be.
+func writeCompressedFlagFrame(conn net.Conn, reqFrame *framer) {
+	body := []byte("not really compressed")
+
+	head := make([]byte, 9)
+	head[0] = protoVersion4 | protoDirectionMask
+	head[1] = flagCompress
+	binary.BigEndian.PutUint16(head[2:4], uint16(reqFrame.header.stream))
+	head[4] = byte(opResult)
+	binary.BigEndian.PutUint32(head[5:9], uint32(len(body)))
+
+	_, _ = conn.Write(head)
+	_, _ = conn.Write(body)
+}
+
+// TestConn_NonTerminalFrameErrorKeepsTheConnection is the guard on the other side
+// of the classification.
+//
+// A body that arrived in full leaves the frame boundary intact, so however the
+// error is reported it belongs to the caller and the connection is still good.
+// Closing here would turn one unreadable response into a reconnect.
+//
+// Asserting that the error surfaces is not enough on its own: the connection has
+// to go on working, so the test runs a second query over the same one and
+// requires it to succeed.
+func TestConn_NonTerminalFrameErrorKeepsTheConnection(t *testing.T) {
+	var breakNext atomic.Bool
+
+	srv := newTestServerOpts{
+		addr:     "127.0.0.1:0",
+		protocol: defaultProto,
+		rawRespFn: func(conn net.Conn, reqFrame *framer) bool {
+			if reqFrame.header.op != opQuery || !breakNext.CompareAndSwap(true, false) {
+				return false
+			}
+			writeCompressedFlagFrame(conn, reqFrame)
+			return true
+		},
+	}.newServer(t, context.Background())
+	defer srv.Stop()
+
+	cluster := testCluster(defaultProto, srv.Address)
+	cluster.NumConns = 1
+	cluster.Timeout = 2 * time.Second
+
+	session, err := cluster.CreateSession()
+	require.NoError(t, err)
+	defer session.Close()
+
+	pool, ok := session.pool.getPool(session.ring.allHosts()[0])
+	require.True(t, ok)
+	pool.mu.RLock()
+	require.NotEmpty(t, pool.conns)
+	conn := pool.conns[0]
+	pool.mu.RUnlock()
+
+	breakNext.Store(true)
+	require.Error(t, session.Query("void").Exec(), "an undecodable body is still an error for the caller")
+
+	require.False(t, conn.Closed(),
+		"the body arrived in full, so the frame boundary is intact and the connection must survive")
+	require.NoError(t, session.Query("void").Exec(),
+		"the same connection must go on serving queries")
+	require.False(t, conn.Closed(), "the follow-up query must not have retired it either")
+}

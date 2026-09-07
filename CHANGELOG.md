@@ -29,7 +29,9 @@ and no exported symbol changes meaning, so this is a patch release.
   about thirty seconds later.
 
   The regime that triggers it is a cluster healthy enough to answer, just later than the
-  caller's deadline. A node that never answers costs nothing: there is no response to lose.
+  caller's deadline. A node that never answers does not trigger this leak, because the leak is
+  in what happens when the answer arrives -- though such a request does still hold its stream
+  until the connection goes, which is deliberate and unchanged.
 
   Both sides now drain. When a stream becomes reusable is unchanged -- a response that has
   not arrived may still arrive, and returning its id early would hand a later request the
@@ -62,15 +64,22 @@ and no exported symbol changes meaning, so this is a patch release.
   always been documented to mean for the underlying connection. Raise `Timeout` on slow links
   -- noting that it is also the request timeout, and the default for `WriteTimeout`.
 
+  The bound is per read, not per response. A protocol v5 response is read in several pieces --
+  a segment header, its payload, its CRC, and any continuation segments -- and each gets the
+  full `Timeout`, so a fragmented response can legitimately take longer than one overall. What
+  is gone is spending five of them on a single read that never progresses.
+
 - **A connection that cannot carry a read deadline now fails the read.** The error from
   `SetReadDeadline` was previously ignored and the read went ahead without the bound it had
-  just promised. This can only affect a connection supplied by a custom `Dialer` or
-  `HostDialer`.
+  just promised. Any connection whose setter fails is affected; one supplied by a custom
+  `Dialer` or `HostDialer` is the likely way to encounter it, not the condition.
 
-- **A decompression failure on a fully received body no longer closes the connection.** The
-  body arrived intact, so the frame boundary is sound and the error belongs to the caller. It
-  was previously closed whenever the compressor happened to return something implementing
-  `net.Error`.
+- **A decompression failure on a fully received legacy frame body no longer closes the
+  connection.** The body arrived intact, so the frame boundary is sound and the error belongs
+  to the caller. It was previously closed whenever the compressor happened to return something
+  implementing `net.Error`. This is about the pre-v5 frame body only: a protocol v5 segment
+  whose payload will not decompress still propagates out of `recvSegment` and closes the
+  connection, as before.
 
 ### Documented
 

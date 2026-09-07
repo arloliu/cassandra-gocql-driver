@@ -520,6 +520,10 @@ type ClusterConfig struct {
 	// the gate exists to close (internal, for testing).
 	testScheduledAdmitStart func(host *HostInfo)
 
+	// testHooks is copied into every ConnConfig this cluster builds; see
+	// connTestHooks. Nil outside tests.
+	testHooks *connTestHooks
+
 	// testStartPoolFillDone is called at the end of Session.startPoolFill, after the
 	// withOwnedHost publication attempt, so a test can join that goroutine
 	// (internal, for testing); nil in production.

@@ -5,6 +5,8 @@ package gocql
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,16 +51,37 @@ func (g *abandonGate) awaitParked(t *testing.T, round int) {
 
 // singleConnHarness starts a one-host harness pinned to a single connection, so
 // every query in a test lands on the same stream allocator.
-func singleConnHarness(t *testing.T, gate *abandonGate) (*fillHarness, *Conn) {
+func singleConnHarness(t *testing.T, gate *abandonGate, proto protoVersion, hooks *connTestHooks) (*fillHarness, *Conn) {
 	t.Helper()
 
 	h := newFillHarnessOpts(t, 1, fillHarnessOpts{
 		recvHook: gate.hook,
+		proto:    proto,
+		hooks:    hooks,
 		tune:     func(cfg *ClusterConfig) { cfg.NumConns = 1 },
 	})
 
 	pool := h.pool(t, h.hosts[0])
 	return h, h.pickAnyConn(t, pool)
+}
+
+// isQuery reports whether a request is the test's own QUERY rather than
+// background traffic. Every connection runs a heartbeat that goes through the
+// same code as a query, so a hook that does not filter would fire for it too.
+func isQuery(req frameBuilder) bool {
+	_, ok := req.(*writeQueryFrame)
+	return ok
+}
+
+// protoCases are the protocol versions the stream-lifecycle tests run under.
+// v4 frames each response on its own; v5 wraps them in segments, which is a
+// different receive path entirely (recvSegment rather than processFrame).
+var protoCases = []struct {
+	name  string
+	proto protoVersion
+}{
+	{name: "v4", proto: protoVersion4},
+	{name: "v5", proto: protoVersion5},
 }
 
 // TestConn_CancelledRequestReleasesItsStream is the end-to-end regression for a
@@ -74,8 +97,16 @@ func singleConnHarness(t *testing.T, gate *abandonGate) (*fillHarness, *Conn) {
 // Before the fix this leaked 21 of 40 streams on a connection that stayed
 // healthy throughout.
 func TestConn_CancelledRequestReleasesItsStream(t *testing.T) {
+	for _, pc := range protoCases {
+		t.Run(pc.name, func(t *testing.T) {
+			testCancelledRequestReleasesItsStream(t, pc.proto)
+		})
+	}
+}
+
+func testCancelledRequestReleasesItsStream(t *testing.T, proto protoVersion) {
 	gate := newAbandonGate()
-	h, conn := singleConnHarness(t, gate)
+	h, conn := singleConnHarness(t, gate, proto, nil)
 
 	before := conn.streams.Available()
 
@@ -101,8 +132,16 @@ func TestConn_CancelledRequestReleasesItsStream(t *testing.T) {
 // the other side: a stream must NOT be reclaimed while a response can still turn
 // up for it, or a later request would reuse the id and receive the old answer.
 func TestConn_AbandonedRequestKeepsItsStreamUntilTheResponseArrives(t *testing.T) {
+	for _, pc := range protoCases {
+		t.Run(pc.name, func(t *testing.T) {
+			testAbandonedRequestKeepsItsStream(t, pc.proto)
+		})
+	}
+}
+
+func testAbandonedRequestKeepsItsStream(t *testing.T, proto protoVersion) {
 	gate := newAbandonGate()
-	h, conn := singleConnHarness(t, gate)
+	h, conn := singleConnHarness(t, gate, proto, nil)
 	t.Cleanup(func() { close(gate.release) })
 
 	before := conn.streams.Available()
@@ -119,47 +158,160 @@ func TestConn_AbandonedRequestKeepsItsStreamUntilTheResponseArrives(t *testing.T
 		"the stream was reclaimed while a response could still arrive for it")
 }
 
-// TestConn_ResponseDeliveredBeforeCancellationReleasesItsStream covers the caller
-// side of the same race.
+// TestConn_ReceiverReclaimsWhenItTakesTheDeliveryArm makes the receive side the
+// only party that can reclaim the call, deterministically.
 //
-// TestConn_CancelledRequestReleasesItsStream can only exercise the receive side:
-// there the caller has fully given up before the response is sent, so the receive
-// side is always the one that finds it. Here the order is reversed — the response
-// is already in the buffer when the caller notices its context is done — and the
-// caller's select then picks between them at random. Whenever it picks
-// cancellation, only the caller's own drain can return the stream.
-//
-// Statistical for the same reason as the other direction, with the same 40
-// rounds and the same ~2^-40 chance of a broken driver passing.
-func TestConn_ResponseDeliveredBeforeCancellationReleasesItsStream(t *testing.T) {
+// The caller finishes abandoning against an empty buffer, so its own drain finds
+// nothing; the response is then delivered, and only the drain that follows that
+// delivery can return the stream. Delivery is forced because both arms of the
+// receive side's select are legitimately ready once the caller has gone, and
+// which one wins is not something a test can arrange from outside.
+func TestConn_ReceiverReclaimsWhenItTakesTheDeliveryArm(t *testing.T) {
+	var framerReleases atomic.Int64
+	hooks := &connTestHooks{
+		forceDeliverArm: true,
+		onFramerRelease: func() { framerReleases.Add(1) },
+	}
+
 	gate := newAbandonGate()
-	h, conn := singleConnHarness(t, gate)
+	h, conn := singleConnHarness(t, gate, defaultProto, hooks)
 
 	before := conn.streams.Available()
 
-	const rounds = 40
-	for i := 0; i < rounds; i++ {
-		ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	result := h.query(ctx, nil)
+	gate.awaitParked(t, 0)
 
-		// Just before the caller waits, let the response through and cancel: the
-		// caller reaches its select with both outcomes already available.
-		testBeforeCallerRecv = func() {
-			testBeforeCallerRecv = nil
-			gate.release <- struct{}{}
-			time.Sleep(20 * time.Millisecond)
-			cancel()
-		}
+	// The caller gives up and completes its own drain before the answer exists.
+	cancel()
+	require.Error(t, awaitQuery(t, result))
 
-		result := h.query(ctx, nil)
-		gate.awaitParked(t, i)
-		_ = awaitQuery(t, result) // either outcome is legitimate; neither may leak
-		cancel()
-	}
-	testBeforeCallerRecv = nil
+	gate.release <- struct{}{}
 
 	require.Eventually(t, func() bool { return conn.streams.Available() == before },
 		10*time.Second, 20*time.Millisecond,
-		"%d of %d requests never returned their stream", before-conn.streams.Available(), rounds)
+		"the receive side's drain is the only reclaimer in this schedule and did not run")
+	require.Equal(t, int64(1), framerReleases.Load(),
+		"the response framer must be returned to the pool exactly once")
+}
+
+// TestConn_CallerReclaimsWhenItTakesItsAbandonmentArm is the mirror: the caller
+// is the only party that can reclaim.
+//
+// The response is delivered and the receive side's drain has already run and
+// found the caller still present, so nothing on that side will look again. The
+// caller then takes its abandonment arm — forced, because by then its response
+// and its cancellation are both ready — and only its own drain is left to return
+// the stream.
+func TestConn_CallerReclaimsWhenItTakesItsAbandonmentArm(t *testing.T) {
+	var (
+		framerReleases atomic.Int64
+		delivered      = make(chan struct{}, 1)
+		cancelQuery    context.CancelFunc
+	)
+
+	hooks := &connTestHooks{
+		forceAbandonArm: isQuery,
+		onFramerRelease: func() { framerReleases.Add(1) },
+		afterDeliver: func(op frameOp) {
+			if op != opResult {
+				return // connection setup uses this path too
+			}
+			select {
+			case delivered <- struct{}{}:
+			default:
+			}
+		},
+	}
+	hooks.beforeCallerRecv = func(req frameBuilder) {
+		if !isQuery(req) {
+			return
+		}
+		// Wait for the response to be buffered and the receive side's drain to
+		// have run, then cancel. No sleeping: the acknowledgement is the event.
+		select {
+		case <-delivered:
+		case <-time.After(10 * time.Second):
+			panic("the response was never delivered")
+		}
+		cancelQuery()
+	}
+
+	gate := newAbandonGate()
+	h, conn := singleConnHarness(t, gate, defaultProto, hooks)
+
+	before := conn.streams.Available()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelQuery = cancel
+
+	result := h.query(ctx, nil)
+	gate.awaitParked(t, 0)
+	gate.release <- struct{}{}
+
+	require.Error(t, awaitQuery(t, result), "the forced arm returns the context error")
+
+	require.Eventually(t, func() bool { return conn.streams.Available() == before },
+		10*time.Second, 20*time.Millisecond,
+		"the caller's own drain is the only reclaimer in this schedule and did not run")
+	require.Equal(t, int64(1), framerReleases.Load(),
+		"the response framer must be returned to the pool exactly once")
+}
+
+// TestConn_LiveCallerKeepsItsOwnResponse guards the check that keeps a drain off
+// a call whose caller is still waiting.
+//
+// The response is delivered while the caller has been held short of receiving
+// it. If the drain consulted the buffer without first checking that the caller
+// had abandoned the call, it would take that response and the caller would be
+// left with a cancellation it never asked for.
+func TestConn_LiveCallerKeepsItsOwnResponse(t *testing.T) {
+	var (
+		delivered = make(chan struct{}, 1)
+		release   = make(chan struct{})
+	)
+
+	hooks := &connTestHooks{
+		forceDeliverArm: true,
+		afterDeliver: func(op frameOp) {
+			if op != opResult {
+				return // connection setup uses this path too
+			}
+			select {
+			case delivered <- struct{}{}:
+			default:
+			}
+		},
+	}
+	hooks.beforeCallerRecv = func(req frameBuilder) {
+		if !isQuery(req) {
+			return
+		}
+		// Hold the caller short of its receive until the response, and the drain
+		// that follows delivery, have both happened.
+		select {
+		case <-delivered:
+		case <-time.After(10 * time.Second):
+			panic("the response was never delivered")
+		}
+		<-release
+	}
+
+	gate := newAbandonGate()
+	h, conn := singleConnHarness(t, gate, defaultProto, hooks)
+
+	before := conn.streams.Available()
+
+	result := h.query(context.Background(), nil)
+	gate.awaitParked(t, 0)
+	gate.release <- struct{}{}
+	close(release)
+
+	require.NoError(t, awaitQuery(t, result),
+		"a caller that never gave up must still receive its own response")
+	require.Eventually(t, func() bool { return conn.streams.Available() == before },
+		10*time.Second, 20*time.Millisecond, "the stream must be returned as usual")
 }
 
 // TestConn_DrainDistinguishesACloseNotificationFromAResponse pins what the
@@ -278,4 +430,155 @@ func TestConn_CloseWithoutErrorEndsEveryStartedStream(t *testing.T) {
 		"every stream still outstanding at close must get exactly one terminal event")
 	require.Equal(t, int64(1), recorder.abandoned.Load()-abandonedBefore,
 		"a call closed before its response is abandoned, not finished")
+}
+
+// TestConn_CloseNotificationIsNotMistakenForAResponse forces the schedule in
+// which a caller receives a teardown notification through its ordinary response
+// branch.
+//
+// closeWithError publishes into the same channel a real response uses, so the
+// value has to say which it is. If it did not, the caller would treat a
+// connection teardown as its answer: it would reclaim the stream and report
+// StreamFinished, and because a call gets exactly one terminal event, the
+// StreamAbandoned the closer owes would be swallowed.
+//
+// The connection context is held closed until the caller has returned, so the
+// caller cannot escape through it and must take the response branch.
+func TestConn_CloseNotificationIsNotMistakenForAResponse(t *testing.T) {
+	var (
+		recorder    = newStreamEventRecorder()
+		callerDone  = make(chan struct{})
+		holdCancel  = make(chan struct{})
+		holdNotify  = make(chan struct{})
+		closerReady = make(chan struct{})
+	)
+
+	hooks := &connTestHooks{
+		closerAfterSnapshot: func() {
+			select {
+			case closerReady <- struct{}{}:
+			default:
+			}
+		},
+		closerAfterSend: func() {
+			// Let the caller act on the value before the closer reports the call.
+			// A call gets one terminal event, so whoever reports first decides
+			// what is recorded; without this the closer would always win and the
+			// caller's decision would be invisible.
+			select {
+			case <-holdNotify:
+			case <-time.After(10 * time.Second):
+			}
+		},
+		closerBeforeCancel: func() {
+			// Keep the connection context alive until the caller has taken the
+			// notification through its response branch.
+			select {
+			case <-holdCancel:
+			case <-time.After(10 * time.Second):
+			}
+		},
+	}
+
+	gate := newAbandonGate()
+	h := newFillHarnessOpts(t, 1, fillHarnessOpts{
+		recvHook: gate.hook,
+		hooks:    hooks,
+		tune: func(cfg *ClusterConfig) {
+			cfg.NumConns = 1
+			cfg.StreamObserver = recorder
+		},
+	})
+	t.Cleanup(func() { close(gate.release) })
+
+	conn := h.pickAnyConn(t, h.pool(t, h.hosts[0]))
+
+	recorder.drain()
+	finishedBefore := recorder.finished.Load()
+	abandonedBefore := recorder.abandoned.Load()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := h.query(ctx, nil)
+	gate.awaitParked(t, 0)
+
+	go func() {
+		conn.closeWithError(errors.New("injected teardown"))
+	}()
+
+	select {
+	case <-closerReady:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the closer never reached its snapshot")
+	}
+
+	go func() {
+		_ = awaitQuery(t, result)
+		close(callerDone)
+	}()
+
+	select {
+	case <-callerDone:
+	case <-time.After(10 * time.Second):
+		close(holdNotify)
+		close(holdCancel)
+		t.Fatal("the caller never returned")
+	}
+	close(holdNotify)
+	close(holdCancel)
+
+	recorder.awaitEnd(t)
+	require.Equal(t, int64(0), recorder.finished.Load()-finishedBefore,
+		"a teardown notification is not a response and must not be reported as a finished stream")
+	require.Equal(t, int64(1), recorder.abandoned.Load()-abandonedBefore,
+		"the closer owes exactly one StreamAbandoned for the outstanding call")
+}
+
+// TestConn_EndCallOnResponseJudgesTheValueNotTheConnection gates the predicate
+// that decides whether a delivered value ends its call.
+//
+// The distinction matters exactly when a teardown is already under way. By then
+// the receive side may have taken the call out of the call map, so the closer's
+// snapshot cannot see it and will never report it. Asking the connection whether
+// it is closed would decline to end the call, and it would get no terminal event
+// at all. The value itself says which kind it is.
+func TestConn_EndCallOnResponseJudgesTheValueNotTheConnection(t *testing.T) {
+	newCall := func(c *Conn, rec *streamEventRecorder) *callReq {
+		id, ok := c.streams.GetStream()
+		require.True(t, ok)
+		return &callReq{
+			resp:                  make(chan callResp, 1),
+			timeout:               make(chan struct{}),
+			streamID:              id,
+			streamObserverContext: rec,
+		}
+	}
+
+	t.Run("a wire response ends the call even while closing", func(t *testing.T) {
+		c := &Conn{streams: streams.New(int(protoVersion4), 64)}
+		c.closed = true // a teardown is already under way
+		rec := newStreamEventRecorder()
+		call := newCall(c, rec)
+		before := c.streams.Available()
+
+		c.endCallOnResponse(call, callResp{err: errors.New("server error frame")})
+
+		require.Equal(t, before+1, c.streams.Available(),
+			"the answer arrived, so the call is over regardless of the connection")
+		require.Equal(t, int64(1), rec.finished.Load())
+	})
+
+	t.Run("a teardown notification is left to the closer", func(t *testing.T) {
+		c := &Conn{streams: streams.New(int(protoVersion4), 64)}
+		c.closed = true
+		rec := newStreamEventRecorder()
+		call := newCall(c, rec)
+		before := c.streams.Available()
+
+		c.endCallOnResponse(call, callResp{err: ErrConnectionClosed, closing: true})
+
+		require.Equal(t, before, c.streams.Available(),
+			"the closer owns this call and takes the allocator with it")
+		require.Equal(t, int64(0), rec.finished.Load())
+	})
 }

@@ -165,6 +165,72 @@ type ConnConfig struct {
 	// resolves a zero or negative ClusterConfig value to
 	// heartbeatDefaultTimeout.
 	heartbeatTimeout time.Duration
+
+	// testHooks pins interleavings that a test cannot otherwise force, because
+	// both arms of a select are legitimately ready. It is nil outside tests, is
+	// fixed when the session builds its ConnConfig, and is never written
+	// afterwards, so every connection reads the same immutable value.
+	testHooks *connTestHooks
+}
+
+// hooks returns the connection's test hooks, or nil. Conn.cfg is a pointer and
+// is not always set: closeWithError in particular runs on hand-built connections
+// in tests, so every lookup goes through here.
+func (c *Conn) hooks() *connTestHooks {
+	if c.cfg == nil {
+		return nil
+	}
+
+	return c.cfg.testHooks
+}
+
+// connTestHooks lets a test force one particular schedule through a request.
+//
+// Whether a caller sees its response or its cancellation first, and whether the
+// receive side delivers a response or notices the caller has gone, are races the
+// runtime settles. A test that needs one specific outcome has to be able to ask
+// for it; production leaves this nil and behaves exactly as before.
+type connTestHooks struct {
+	// beforeCallerRecv runs just before a caller waits for its response. req
+	// identifies the request, so a test can ignore traffic it did not ask for --
+	// heartbeats run through the same path.
+	beforeCallerRecv func(req frameBuilder)
+
+	// afterDeliver runs after the receive side has delivered a response and
+	// finished its own drain, so a test can wait for that rather than sleeping.
+	// op is the response's opcode, which is how a test tells its own answer from
+	// the connection-setup traffic that runs through the same path.
+	afterDeliver func(op frameOp)
+
+	// forceDeliverArm makes the receive side skip its select and take the
+	// delivery arm. The delivery arm is a legal outcome whenever the buffer is
+	// free; forcing it makes the receive side's drain the only possible
+	// reclaimer.
+	forceDeliverArm bool
+
+	// forceAbandonArm, when it returns true for a request, makes that caller skip
+	// its select and take its abandonment arm, which likewise makes the caller's
+	// own drain the only possible reclaimer. It must select the test's own
+	// request: forcing it on connection setup would strand it, since neither
+	// abandonment arm is ready there.
+	forceAbandonArm func(req frameBuilder) bool
+
+	// closerAfterSnapshot runs inside closeWithError once the connection is
+	// marked closed and the outstanding calls have been snapshotted.
+	closerAfterSnapshot func()
+
+	// closerAfterSend runs inside closeWithError between publishing a call's
+	// teardown notification and reporting that call to its observer, so a test
+	// can let the caller act on the value first. Without it the closer almost
+	// always reaches the observer first and hides what the caller decided.
+	closerAfterSend func()
+
+	// closerBeforeCancel runs inside closeWithError after the notification loop
+	// and before the connection context is cancelled.
+	closerBeforeCancel func()
+
+	// onFramerRelease counts response framers returned to the pool by a drain.
+	onFramerRelease func()
 }
 
 // ConnErrorHandler handles connection errors and state changes for connections.
@@ -678,6 +744,10 @@ func (c *Conn) closeWithError(err error) {
 		callsToClose = c.calls.snapshot()
 	}
 
+	if hooks := c.hooks(); hooks != nil && hooks.closerAfterSnapshot != nil {
+		hooks.closerAfterSnapshot()
+	}
+
 	for _, req := range callsToClose {
 		// Only an actual error is worth delivering. A nil-error notification would
 		// reach the caller's success branch with no framer behind it.
@@ -687,8 +757,15 @@ func (c *Conn) closeWithError(err error) {
 			case req.resp <- callResp{err: err, closing: true}:
 			case <-req.timeout:
 			}
+			if hooks := c.hooks(); hooks != nil && hooks.closerAfterSend != nil {
+				hooks.closerAfterSend()
+			}
 		}
 		c.notifyStreamEnd(req, streamAbandoned)
+	}
+
+	if hooks := c.hooks(); hooks != nil && hooks.closerBeforeCancel != nil {
+		hooks.closerBeforeCancel()
 	}
 
 	// if error was nil then unblock the quit channel
@@ -1023,11 +1100,25 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 
 	// we either, return a response to the caller, the caller timedout, or the
 	// connection has closed. Either way we should never block indefinatly here
+	if hooks := c.hooks(); hooks != nil && hooks.forceDeliverArm {
+		// Delivery is a legal outcome of the select below whenever the buffer is
+		// free; taking it unconditionally lets a test pin that schedule.
+		call.resp <- callResp{framer: framer, err: err}
+		c.drainAbandoned(call)
+		if hooks.afterDeliver != nil {
+			hooks.afterDeliver(head.op)
+		}
+		return nil
+	}
+
 	select {
 	case call.resp <- callResp{framer: framer, err: err}:
 		// The caller may have given up between the check above and this send, in
 		// which case nobody is left to read what was just delivered.
 		c.drainAbandoned(call)
+		if hooks := c.hooks(); hooks != nil && hooks.afterDeliver != nil {
+			hooks.afterDeliver(head.op)
+		}
 	case <-call.timeout:
 		framer.release()
 		c.releaseStream(call)
@@ -1066,6 +1157,22 @@ func (c *Conn) releaseStream(call *callReq) {
 	c.notifyStreamEnd(call, streamFinished)
 }
 
+// endCallOnResponse ends call for a value delivered on its response channel.
+//
+// A response that came off the wire ends the call, whatever the connection is
+// doing by now: the call may already have been taken out of the call map, in
+// which case a teardown running concurrently cannot see it and would never
+// report it, so asking the connection whether it is closed gives the wrong
+// answer. Only a notification produced by closeWithError is left alone — that
+// one belongs to the closer, which reports it and takes the allocator with it.
+func (c *Conn) endCallOnResponse(call *callReq, resp callResp) {
+	if resp.closing {
+		return
+	}
+
+	c.releaseStream(call)
+}
+
 // drainAbandoned discards whatever is left for a call whose caller has gone
 // away, and claims the call's termination when a real response is among it.
 //
@@ -1092,6 +1199,9 @@ func (c *Conn) drainAbandoned(call *callReq) {
 		case resp := <-call.resp:
 			if resp.framer != nil {
 				resp.framer.release()
+				if hooks := c.hooks(); hooks != nil && hooks.onFramerRelease != nil {
+					hooks.onFramerRelease()
+				}
 			}
 			if !resp.closing {
 				c.releaseStream(call)
@@ -1663,12 +1773,6 @@ func (c *Conn) addCall(call *callReq) error {
 	return nil
 }
 
-// testBeforeCallerRecv runs just before a caller waits for its response, if a
-// test has set it. Whether a caller sees its response or its cancellation first
-// is a race the runtime decides, so a test that needs one specific order has to
-// arrange the world at this point. Always nil in production.
-var testBeforeCallerRecv func()
-
 func (c *Conn) exec(ctx context.Context, req frameBuilder, tracer Tracer) (*framer, error) {
 	return c.execInternal(ctx, req, tracer, true)
 }
@@ -1779,8 +1883,24 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 		ctxDone = ctx.Done()
 	}
 
-	if testBeforeCallerRecv != nil {
-		testBeforeCallerRecv()
+	hooks := c.hooks()
+	if hooks != nil && hooks.beforeCallerRecv != nil {
+		hooks.beforeCallerRecv(req)
+	}
+
+	if hooks != nil && hooks.forceAbandonArm != nil && hooks.forceAbandonArm(req) {
+		// Take an abandonment arm without consulting call.resp, so the caller's
+		// own drain is the only thing that can reclaim the call.
+		select {
+		case <-timeoutCh:
+			close(call.timeout)
+			c.drainAbandoned(call)
+			return nil, ErrTimeoutNoResponse
+		case <-ctxDone:
+			close(call.timeout)
+			c.drainAbandoned(call)
+			return nil, ctx.Err()
+		}
 	}
 
 	select {
@@ -1790,13 +1910,7 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 			if resp.framer != nil {
 				resp.framer.release()
 			}
-			if !resp.closing {
-				// A response that came off the wire ends this call, whatever the
-				// connection is doing by now. Only a notification from
-				// closeWithError leaves the stream alone: that one belongs to the
-				// closer, which reports it and takes the whole allocator with it.
-				c.releaseStream(call)
-			}
+			c.endCallOnResponse(call, resp)
 			return nil, resp.err
 		}
 		// dont release the stream if detect a timeout as another request can reuse

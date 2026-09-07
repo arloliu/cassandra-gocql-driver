@@ -616,6 +616,14 @@ type fillHarnessOpts struct {
 	// request is processed; ip is the server's loopback address without the port.
 	// Blocking in it holds that connection's request in flight.
 	recvHook func(ip string, f *framer)
+
+	// proto selects the protocol version for both the servers and the cluster.
+	// Zero means defaultProto. Setting it on the cluster alone would not do:
+	// the fixture servers speak whatever they were started with.
+	proto protoVersion
+
+	// hooks pins interleavings inside the driver; see connTestHooks.
+	hooks *connTestHooks
 }
 
 // newFillHarness starts servers hosts and returns a connected session wired to a
@@ -648,6 +656,11 @@ func newFillHarness(t *testing.T, hosts int, tune func(*ClusterConfig)) *fillHar
 func newFillHarnessOpts(t *testing.T, hosts int, opts fillHarnessOpts) *fillHarness {
 	t.Helper()
 
+	proto := opts.proto
+	if proto == 0 {
+		proto = defaultProto
+	}
+
 	startServer := func(addr string) *TestServer {
 		ip, _, err := net.SplitHostPort(addr)
 		require.NoError(t, err, "split %q", addr)
@@ -655,7 +668,7 @@ func newFillHarnessOpts(t *testing.T, hosts int, opts fillHarnessOpts) *fillHarn
 		if opts.recvHook != nil {
 			recvHook = func(f *framer) { opts.recvHook(ip, f) }
 		}
-		srv := newTestServerOpts{addr: addr, protocol: defaultProto, recvHook: recvHook}.newServer(t, testServerContext(t))
+		srv := newTestServerOpts{addr: addr, protocol: uint8(proto), recvHook: recvHook}.newServer(t, testServerContext(t))
 		t.Cleanup(srv.Stop)
 		return srv
 	}
@@ -677,8 +690,9 @@ func newFillHarnessOpts(t *testing.T, hosts int, opts fillHarnessOpts) *fillHarn
 	events := newPoolEventRecorder()
 	collector := newHostStateCollector()
 
-	cluster := testCluster(defaultProto, addresses...)
+	cluster := testCluster(proto, addresses...)
 	cluster.NumConns = 1
+	cluster.testHooks = opts.hooks
 	cluster.HostDialer = dialer
 	cluster.PoolConfig.HostSelectionPolicy = collector
 	cluster.ReconnectionPolicy = &ConstantReconnectionPolicy{MaxRetries: 1, Interval: time.Millisecond}
