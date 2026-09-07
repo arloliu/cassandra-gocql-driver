@@ -558,6 +558,11 @@ func TestRemoveHost_RingFirst(t *testing.T) {
 
 // TestStartPoolFill_PublicationSerialisedWithRemoval: a publication holding
 // hostPublishMu blocks removeHost, and removal follows it.
+//
+// removeHost takes the host out of the ring inside that mutex, so the ring entry
+// survives for as long as the publication holds it: the removal is one
+// transaction that waits, not a ring change that lands early and un-publishes
+// later.
 func TestStartPoolFill_PublicationSerialisedWithRemoval(t *testing.T) {
 	f := newOwnershipFixture(t)
 	f.session.pool.removeHost(f.host)
@@ -578,13 +583,15 @@ func TestStartPoolFill_PublicationSerialisedWithRemoval(t *testing.T) {
 		f.session.removeHost(f.host)
 		close(removed)
 	}()
-	require.Eventually(t, func() bool { return !f.session.ring.owns(f.host) }, ownershipBudget, 5*time.Millisecond,
-		"removeHost must have taken the host out of the ring")
 	requireNotReturned(t, removed, "removeHost while a publication holds hostPublishMu")
+	require.True(t, f.session.ring.owns(f.host),
+		"the ring removal is inside the transaction, so it must not land while the publication holds the mutex")
 
 	f.recorder.releaseGate("AddHost")
 	awaitDone(t, filled, "startPoolFill")
 	awaitDone(t, removed, "removeHost")
+	require.False(t, f.session.ring.owns(f.host),
+		"the ring removal must complete once the transaction gets the mutex")
 
 	// The fill's own connected callback may publish HostUp before startPoolFill
 	// reaches AddHost; that is ordinary. What the mutex guarantees is that the
@@ -848,7 +855,8 @@ func (b *bulkRecordingPolicy) AddHosts(hosts []*HostInfo) {
 }
 
 // TestInit_PublicationWinsBeforeRemoval: init's publication holds hostPublishMu, so
-// a removal issued meanwhile waits for it and then un-publishes the object.
+// a removal issued meanwhile waits for it and then takes the object out of the ring
+// and un-publishes it, both inside the same transaction.
 func TestInit_PublicationWinsBeforeRemoval(t *testing.T) {
 	_, srv, _ := startLocalHostServer(t)
 
@@ -886,12 +894,14 @@ func TestInit_PublicationWinsBeforeRemoval(t *testing.T) {
 		session.removeHost(original)
 		close(removed)
 	}()
-	require.Eventually(t, func() bool { return !session.ring.owns(original) }, ownershipBudget, 5*time.Millisecond,
-		"removeHost must have taken the host out of the ring")
 	requireNotReturned(t, removed, "removeHost while init's publication holds hostPublishMu")
+	require.True(t, session.ring.owns(original),
+		"the ring removal is inside the transaction, so it must not land while init's publication holds the mutex")
 
 	recorder.releaseGate("AddHost")
 	awaitDone(t, removed, "removeHost")
+	require.False(t, session.ring.owns(original),
+		"the ring removal must complete once the transaction gets the mutex")
 	_, existed := session.ring.addHostIfMissing(replacement)
 	require.False(t, existed)
 	session.startPoolFill(replacement)

@@ -172,8 +172,9 @@ func TestPublicationLedger_RecordsEverySite(t *testing.T) {
 // TestPublicationLedger_RetirementIsPointerSensitive: a replacement under the same
 // host ID does not have its record dropped by the removal of its predecessor.
 //
-// removeHost takes the ring entry out before it un-publishes, so a replacement can
-// already hold the ID by the time unpublishHost runs.
+// removeHost takes the ring entry out and un-publishes in one hostPublishMu
+// transaction, but the entry is keyed by host ID and carries no pointer check, so a
+// replacement can already hold the ID by the time the un-publication runs.
 // Deleting the record by key alone would retire the replacement's publication, and
 // the next refresh would announce it to the policy a second time.
 func TestPublicationLedger_RetirementIsPointerSensitive(t *testing.T) {
@@ -187,7 +188,13 @@ func TestPublicationLedger_RetirementIsPointerSensitive(t *testing.T) {
 	require.Same(t, b, publishedRecord(f.session, b.HostID()), "the replacement holds the record")
 
 	// The stale object's removal must not take the replacement's record with it.
-	f.session.unpublishHost(stale)
+	// The helper runs inside removeHost's critical section, so the test holds the
+	// same mutex the caller would.
+	func() {
+		f.session.hostPublishMu.Lock()
+		defer f.session.hostPublishMu.Unlock()
+		f.session.unpublishHostLocked(stale)
+	}()
 	require.Same(t, b, publishedRecord(f.session, b.HostID()),
 		"retiring a superseded object must leave the replacement's record alone")
 }

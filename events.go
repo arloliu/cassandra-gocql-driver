@@ -439,6 +439,10 @@ func (s *Session) handleNodeConnected(host *HostInfo) {
 			NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldInt("port", host.Port()), NewLogFieldString("host_id", host.HostID()))
 
 		host.setState(NodeUp)
+		// Recorded before the filter is consulted: a host the filter excludes is
+		// still up, and leaving it in the outage ledger would hold an outage
+		// open for a host that nothing is waiting to reconnect.
+		s.outageRemove(host.HostID())
 
 		if s.cfg.filterHost(host) {
 			return false
@@ -501,7 +505,33 @@ func (s *Session) markHostDown(host *HostInfo) {
 	// evict a replacement that took the same address.
 	if s.withOwnedHost(host, func() bool {
 		host.setState(NodeDown)
-		if s.cfg.filterHost(host) {
+
+		// The ledger is updated before the policy callback and the pool
+		// teardown, and is made panic-safe by the defer rather than by moving
+		// the filter ahead of setState. That order is a contract: HostFilter
+		// sees the host already DOWN today, and Accept is not required to be
+		// independent of state, so a filter written as "accept only what is not
+		// up" would start answering the other way if the two were swapped.
+		//
+		// When the filter returns by panicking, the defer records the host as
+		// irrelevant. That direction is the safe one: the scheduler recomputes
+		// membership every round, so the worst case is a delayed retry, never a
+		// host wrongly held in an outage.
+		recorded := false
+		defer func() {
+			if !recorded {
+				s.outageRemove(host.HostID())
+			}
+		}()
+		filtered := s.cfg.filterHost(host)
+		if filtered {
+			s.outageRemove(host.HostID())
+		} else {
+			s.outageAdd(host.HostID())
+		}
+		recorded = true
+
+		if filtered {
 			return false
 		}
 

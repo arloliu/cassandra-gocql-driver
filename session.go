@@ -150,6 +150,13 @@ type Session struct {
 	// host event, and never replaced afterwards.
 	publishedHosts map[string]*HostInfo
 
+	// outage is the session's outage ledger. It is allocated in NewSession,
+	// before the control connection can produce a host event, and never
+	// replaced afterwards: a later allocation would drop generations, nudges
+	// and membership that the control connection's own UP and DOWN events have
+	// already recorded.
+	outage outageState
+
 	// Per-instance test hooks, invoked immediately after ring.owns returned true
 	// in handleHostDown / handleNodeConnected so tests can replace the ring entry
 	// inside the check-to-mutation window.
@@ -213,6 +220,10 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		logger:          cfg.newLogger(),
 		trace:           cfg.Tracer,
 		publishedHosts:  make(map[string]*HostInfo),
+		outage: outageState{
+			downSet: make(map[string]struct{}),
+			nudge:   make(chan struct{}, 1),
+		},
 	}
 	if cfg.RegisteredTypes == nil {
 		s.types = GlobalTypes.Copy()
@@ -1046,36 +1057,166 @@ func (s *Session) executeQuery(qry *internalQuery) (it *Iter) {
 	return iter
 }
 
-// removeHost takes h out of the ring, the selection policy and the pool, in that order.
+// outageState is the session's outage ledger.
 //
-// The ring goes first so that no later pool admission or policy publication
-// of h can pass its ownership check (policyConnPool.addHost, withOwnedHost).
-// The policy un-publication runs under hostPublishMu,
-// so a publication that already passed its ownership check either completes before it
-// (and is undone here) or finds the ring changed (and does nothing).
-// The pool is pointer-checked, so an admission that raced ahead of the ring removal
-// registered h's own pool, and this call removes exactly that.
+// It answers exactly one question - has a new outage begun - and deliberately
+// answers neither "which hosts should be reconnected" nor "how long to wait
+// before trying". Both of those belong to the scheduler, which recomputes
+// membership every round and keeps its backoff as goroutine-local state.
+//
+// Every field is written only by the three producers that run inside a
+// hostPublishMu transaction: markHostDown, handleNodeConnected and removeHost.
+// Those are the whole set. A host can only enter DOWN through markHostDown, and
+// can only leave it by coming up or by leaving the ring, because HostInfo.state
+// is written nowhere else. The scheduler reads gen and startedAt and receives
+// from nudge; it never writes here. A ledger the scheduler could correct would
+// lose whatever a producer recorded while it was sampling.
+//
+// Membership is a set of host IDs rather than a count because a repeated DOWN
+// report for a host already down must not open a second outage, and a set is
+// idempotent where a count is not. The empty state is len(downSet) == 0.
+//
+// Lock order is hostPublishMu then mu, never the reverse. Nothing but a map
+// operation, a comparison and one non-blocking send may run under mu: no
+// application callback, no dial, no logging, no ring lock.
+type outageState struct {
+	mu sync.Mutex
+
+	// downSet holds the host IDs that are relevant - not excluded by the
+	// HostFilter - and not UP.
+	downSet map[string]struct{}
+
+	// gen counts outages. It advances only when downSet goes from empty to
+	// non-empty, so a host that fails while another is already down joins the
+	// outage under way instead of starting a new one.
+	gen uint64
+
+	// startedAt is when the current outage began. It is the base the scheduler
+	// arms the outage's first retry from, so that deadline is absolute and does
+	// not slide with when the scheduler happens to wake. It is meaningless
+	// while downSet is empty.
+	startedAt time.Time
+
+	// nudge carries at most one pending "an outage has begun" hint.
+	//
+	// It is a hint and nothing more. The channel has room for one item and
+	// keeps no history, so a receive is not evidence of an unseen generation:
+	// the notification can still be sitting in the channel after its generation
+	// has already been read. A reader must re-read gen every time it wakes.
+	nudge chan struct{}
+}
+
+// outageAdd records that the host with the given ID is relevant and not UP.
+//
+// The caller must hold hostPublishMu.
+//
+// The first member of an empty ledger opens a new outage: the generation
+// advances, the start time is stamped and the scheduler is nudged. A member
+// joining an outage already under way changes nothing else, so one host failing
+// while another is already down can neither reset a backoff nor push a pending
+// retry out. A repeated report for a host already in the set does nothing at
+// all.
+//
+// Parameters:
+//   - id: the host ID to record
+func (s *Session) outageAdd(id string) {
+	s.outage.mu.Lock()
+	defer s.outage.mu.Unlock()
+
+	// Idempotence comes from the set, not from a guard: adding an ID that is
+	// already there leaves the set non-empty, so opened is false and a repeated
+	// DOWN report changes nothing.
+	opened := len(s.outage.downSet) == 0
+	s.outage.downSet[id] = struct{}{}
+	if !opened {
+		return
+	}
+
+	s.outage.gen++
+	s.outage.startedAt = time.Now()
+	// Sent here, under outage.mu, so opening an outage and announcing it are
+	// indivisible: a producer whose policy callback later blocks or panics can
+	// neither delay the wake-up nor lose it. A non-blocking send on a buffered
+	// channel cannot block, which is what makes it safe to do under the lock,
+	// and it is the only thing besides map work allowed here.
+	select {
+	case s.outage.nudge <- struct{}{}:
+	default:
+	}
+}
+
+// outageRemove drops the host with the given ID from the ledger.
+//
+// The caller must hold hostPublishMu.
+//
+// Emptying the ledger does not advance the generation. An empty ledger means
+// there is no outage and so nothing to schedule; the reset that matters happens
+// at the next empty-to-non-empty transition instead, which is the same
+// observable behaviour and one fewer rule.
+//
+// Parameters:
+//   - id: the host ID to drop
+func (s *Session) outageRemove(id string) {
+	s.outage.mu.Lock()
+	defer s.outage.mu.Unlock()
+
+	delete(s.outage.downSet, id)
+}
+
+// removeHost takes h out of the ring, the outage ledger, the selection policy
+// and the pool.
+//
+// The ring removal, the ledger update and the policy un-publication are one
+// transaction under hostPublishMu. That is what keeps the ledger honest: were
+// the ring removal outside, another host could transition DOWN in the window
+// between it and this call's bookkeeping, find h still in the ledger, and so
+// join an outage that the real membership had already left. The backoff of a
+// finished outage would then be inherited by a new one.
+//
+// Every path that checks ring ownership under hostPublishMu - withOwnedHost and
+// completeAdmission - therefore cannot interleave with a removal: whichever
+// runs second sees the other's result. The one admission path that checks
+// ownership outside this mutex, policyConnPool.addHost under the pool's own
+// lock, stays safe for a different reason that has not changed: pool.removeHost
+// compares pointers, so an admission that raced ahead registered h's own pool
+// and this call removes exactly that.
+//
+// What the transaction does not do is stop setupConn from inserting a fresh
+// object for the same host ID while it runs - that path takes only the ring's
+// lock. What it does stop is that object's DOWN transition being recorded
+// before this removal's bookkeeping, because every DOWN must take
+// hostPublishMu and so queues behind it.
+//
+// pool.removeHost does not touch the ledger: taking a pool away is not a
+// membership transition, and recording it as one would open outages for hosts
+// that never went down.
 //
 // Parameters:
 //   - h: the ring object to remove
 func (s *Session) removeHost(h *HostInfo) {
 	s.logger.Warning("Removing host.", NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", h.HostID()))
-	s.ring.removeHost(h.HostID())
-	s.unpublishHost(h)
+	func() {
+		// The unlock is deferred: the policy is application code, and a panic
+		// in it is recovered by the calling goroutine's recoverGoroutine, which
+		// must not leave every later host transition blocked on this mutex.
+		s.hostPublishMu.Lock()
+		defer s.hostPublishMu.Unlock()
+		if s.ring.removeHost(h.HostID()) {
+			s.outageRemove(h.HostID())
+		}
+		s.unpublishHostLocked(h)
+	}()
 	s.pool.removeHost(h)
 }
 
-// unpublishHost removes h from the selection policy under hostPublishMu.
+// unpublishHostLocked retires h's publication record and removes it from the
+// selection policy.
 //
-// The unlock is deferred: the policy is application code,
-// and a panic in it is recovered by the calling goroutine's recoverGoroutine,
-// which must not leave every later host transition blocked on this mutex.
+// The caller must hold hostPublishMu.
 //
 // Parameters:
 //   - h: the object to remove from the policy
-func (s *Session) unpublishHost(h *HostInfo) {
-	s.hostPublishMu.Lock()
-	defer s.hostPublishMu.Unlock()
+func (s *Session) unpublishHostLocked(h *HostInfo) {
 	// Retire the publication record, but only while it still names h. A
 	// replacement that took this host ID has its own record under the same key,
 	// and dropping that would make a later repair publish it a second time.
@@ -1090,9 +1231,9 @@ func (s *Session) unpublishHost(h *HostInfo) {
 // moment.
 //
 // Every membership or state transition of a host in the selection policy goes
-// through here, and removeHost un-publishes under the same mutex after taking the
-// host out of the ring, so a transition and a removal of the same host cannot
-// interleave: whichever runs second sees the other's result.
+// through here, and removeHost takes the host out of the ring and un-publishes it
+// as one transaction under the same mutex, so a transition and a removal of the
+// same host cannot interleave: whichever runs second sees the other's result.
 //
 // The shutdown gate rejects any transition not yet admitted once Close has set
 // hostPublishClosed: a pool fill that finishes after Close and reaches here does
