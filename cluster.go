@@ -117,6 +117,16 @@ type ClusterConfig struct {
 	// so that retries don't overload the server.
 	// Timeout has a default value of 11 seconds, which is higher than default server timeout for most query types.
 	// Timeout is not applied to requests during initial connection setup, see ConnectTimeout.
+	//
+	// As the read timeout, Timeout bounds each read of a response: a frame body,
+	// or a protocol v5 segment payload, its CRC and each continuation segment.
+	// The wait for the next response to begin arriving is deliberately not bounded
+	// by it, so that an idle connection is not torn down.
+	//
+	// Timeout is also the default for WriteTimeout. Setting both to zero leaves a
+	// write that has reached the socket with no bound at all: no write deadline is
+	// armed, and a caller blocked in that write cannot be released by cancelling
+	// its context. Prefer a non-zero WriteTimeout to relying on this.
 	Timeout time.Duration
 
 	// ConnectTimeout limits the time spent during connection setup.
@@ -167,6 +177,13 @@ type ClusterConfig struct {
 	// WriteTimeout limits the time the driver waits to write a request to a network connection.
 	// WriteTimeout should be lower than or equal to Timeout.
 	// WriteTimeout defaults to the value of Timeout.
+	//
+	// It is the only bound on a write once the frame has been accepted for
+	// writing: a caller's context is not consulted from that point on, so with
+	// the default coalescer a caller can wait past its own deadline before any of
+	// its frame has been written. A zero WriteTimeout with a zero Timeout arms no
+	// write deadline whatsoever, leaving such a caller blocked for as long as the
+	// socket does not accept the write.
 	WriteTimeout time.Duration
 
 	// Port used when dialing.

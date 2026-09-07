@@ -1412,6 +1412,14 @@ type contextWriter interface {
 	// p is not written and ctx.Err() is returned. Context is ignored after we start writing p (i.e. we don't interrupt
 	// blocked writes that are in progress) so that we always either write the full frame or not write it at all.
 	//
+	// "After we start writing p" is weaker than it sounds under the default
+	// coalescer: a frame it has accepted but not yet flushed is no longer subject
+	// to ctx either, so a caller can be parked past its own deadline before a
+	// single byte of its frame has reached the socket. What bounds that wait is
+	// ClusterConfig.WriteTimeout, and WriteCoalesceWaitTime before it — not the
+	// caller's context. See ClusterConfig.Timeout for the case where neither
+	// bounds it at all.
+	//
 	// It returns the number of bytes written from p (0 <= n <= len(p)) and any error that caused the write to stop
 	// early. writeContext must return a non-nil error if it returns n < len(p). writeContext must not modify the
 	// data in p, even temporarily.
