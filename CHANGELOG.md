@@ -5,6 +5,92 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0-otter] - 2026-09-07
+
+Auto-healing. A ring that has gone quiet now repairs itself, and a node that comes back is
+readmitted in about a second instead of up to a minute. No new exported API, but
+`ReconnectInterval` changes meaning - it is now the ceiling on a retry delay rather than the
+interval between retries - which is why this is a minor release.
+
+### Added
+
+- **The driver re-reads the cluster metadata every five minutes, even while every node is
+  UP.** Nothing did that before: the only unprompted re-read was the one the reconnect sweep
+  issued while a host was DOWN, so a cluster where everything is up read nothing at all, and
+  a driver that lost the event announcing a node's new address kept dialling the old one
+  until something else happened to force a refresh.
+
+  The period is fixed and deliberately not derived from `ReconnectInterval`. It is a safety
+  net for topology events that never arrived, so a thirty-minute reconnect interval must not
+  stretch it to thirty minutes, and a zero one must not remove it. There is no configuration
+  field, by design.
+
+  One consequence: a session with `ReconnectInterval` at zero now has one goroutine it did
+  not have before. `Close` cancels its context but does not join it.
+
+### Changed
+
+- **`ReconnectInterval` is now a cap, not a rhythm.** Retries for a known DOWN node start one
+  second after it goes down - also limited by `ReconnectInterval` - and the delay doubles
+  after every round until it reaches the configured value. At the 60s default that is 1, 2, 4,
+  8, 16, 32, 60, 60 seconds, so a node that comes straight back is readmitted in about a
+  second rather than after up to a minute, while a node that is gone for hours no longer
+  produces a dial a minute for ever. An interval under one second collapses the ramp into the
+  fixed rhythm it asks for, since the first step is already the cap.
+
+  The delay returns to the start only once nothing is waiting to be reconnected. A node
+  failing while another is already down joins the retry rhythm under way rather than
+  restarting it; otherwise a cluster with nodes constantly entering and leaving would reset to
+  one second for ever and defer every retry, and there would be no backoff left.
+
+  Zero still means the same thing it did: no scheduled retries for DOWN nodes the driver
+  already knows about and whose description has not changed. It does not stop the driver
+  connecting - the periodic refresh above still discovers new nodes and still notices that a
+  known node answers at a different address, and both of those dial.
+
+- **A refresh that changed nothing is logged at Debug.** The closing line used to dump every
+  host in the ring at Info on every refresh, which is several kilobytes on a hundred nodes;
+  with the periodic refresh above running for ever, that would have become the bulk of what
+  the driver writes on a cluster that is not changing. A round that changed ring membership
+  now reports what changed, at Info.
+
+### Fixed
+
+- **A ring refresh no longer abandons the rest of a snapshot when one host collides with the
+  control connection.** `controlConn.setupConn` inserts a host under the same ID while a
+  refresh is running, and both ways that could collide returned an error and left every host
+  later in the snapshot unreconciled.
+
+  Worse, the entry that caused the collision was left half-admitted, and permanently: it
+  defaults to UP, so the reconnect sweep skipped it, and a later refresh saw an unchanged
+  endpoint and only updated its metadata. Such a host had no pool and had never been announced
+  to the selection policy, for the life of the session. Every branch of the apply loop now
+  settles on the object the ring owns, and the loop tail completes that object's admission -
+  treating the pool and the first policy publication as the two separate obligations they are,
+  since a host recovered by the reconnect path has a pool but was never announced through
+  `AddHost`, and so was absent from token-aware routing.
+
+- **A scheduled retry can no longer readmit a node ahead of the delay a newer outage owes
+  it.** A node that went UP and DOWN again while a retry round was in flight belongs to a new
+  outage whose own first retry has not come due; nothing stopped the in-flight round from
+  registering its pool anyway, because it is the same ring object throughout and the pool's
+  guards compare closed state and object identity. Admission is now authorised by the outage
+  generation in force at registration, checked in the same critical section.
+
+### Internal
+
+- The reconnect sweep and the periodic refresh are served by one deadline-driven loop rather
+  than a ticker, each phase with its own deadline, its own recovery boundary and its own rule
+  for advancing after a failure. A panic out of the sweep - the phase that calls application
+  code, `HostFilter` included - can neither stop the loop nor delay the refresh, and a phase
+  that panicked consumes its interval exactly as a completed one does, so a callback that
+  panics every round is retried on a rhythm instead of spinning.
+
+- Host DOWN/UP/removal bookkeeping records outage generations inside the existing
+  `hostPublishMu` transaction, which is what lets the backoff tell a new outage from another
+  node joining the one under way. Ring removal moved inside that transaction for the same
+  reason.
+
 ## [2.5.1-otter] - 2026-09-06
 
 Ring convergence. Several independent paths could make a live node disappear from the ring,
