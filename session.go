@@ -1012,9 +1012,14 @@ func (w *hostScheduler) reconcile(now time.Time, gen uint64, startedAt time.Time
 // ReconnectInterval past half of time.Duration's range would otherwise overflow
 // into a negative delay, and a negative delay is a deadline that is already due
 // - exactly the immediate retry the floor exists to prevent.
+//
+// The comparison is strict so the doubling still happens when a step is exactly
+// half the interval. That case cannot overflow - the product is the interval
+// itself, or one nanosecond under it when the interval is odd - and rounding it
+// up to the cap instead would let an odd interval skip a step of the ramp.
 func (w *hostScheduler) advanceReconnect() {
 	step := max(w.backoff, w.baseRetryInterval())
-	if step >= w.reconnectInterval/2 {
+	if step > w.reconnectInterval/2 {
 		w.backoff = w.reconnectInterval
 	} else {
 		w.backoff = step * 2

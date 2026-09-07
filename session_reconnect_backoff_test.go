@@ -258,9 +258,11 @@ func TestReconnectSweep_AbandonsTheBatchWhenTheGenerationMoves(t *testing.T) {
 	f.session.markHostDown(second)
 
 	authGen, _ := f.session.outageSnapshot()
+	// The order below is the batch's, chosen here; the ring's own enumeration is
+	// a map walk, so only membership can be asserted against it.
 	eligible := []*HostInfo{f.host, second}
-	require.Equal(t, eligible, f.session.eligibleDownHosts(f.session.ring.allHosts()),
-		"the fixture must present both hosts to the sweep, in this order")
+	require.ElementsMatch(t, eligible, f.session.eligibleDownHosts(f.session.ring.allHosts()),
+		"the fixture must present both hosts to the sweep")
 
 	gate.armTrap(second.HostID())
 	f.hooks.drain()
@@ -994,4 +996,36 @@ func TestHostScheduler_HugeIntervalDoesNotOverflowIntoAnImmediateRetry(t *testin
 			"round %d must arm a deadline in the future, not one that is already due", round)
 	}
 	require.Equal(t, intv, w.backoff, "the ramp must settle on the cap")
+}
+
+// TestHostScheduler_OddIntervalStillDoublesBeforeItCaps pins the boundary the
+// cap-by-comparison introduced.
+//
+// The cap is compared against half the interval, and that half is an integer
+// division. Rounding a step that is exactly half up to the cap would skip the
+// last doubling whenever the interval is odd, so a 2s+1ns cap would jump from
+// one second straight to the cap instead of passing through two seconds. The
+// comparison is therefore strict, which is safe because a step at exactly half
+// doubles to at most the interval itself.
+func TestHostScheduler_OddIntervalStillDoublesBeforeItCaps(t *testing.T) {
+	const intv = 2*time.Second + time.Nanosecond
+
+	f := newTickFixture(t, nil)
+	f.driveDown(t)
+	_, startedAt := f.session.outageSnapshot()
+
+	clock := newFakeSchedulerClock()
+	clock.rebase(startedAt)
+	w := newSessionScheduler(f.session, clock, intv)
+
+	w.serveReconnect(clock.now())
+	require.Equal(t, time.Second, w.backoff, "the base is one second, well under this cap")
+
+	want := []time.Duration{2 * time.Second, intv, intv}
+	for round, expected := range want {
+		clock.advance(w.reconnectDeadline.Sub(clock.now()))
+		w.serveReconnect(clock.now())
+		require.Equal(t, expected, w.backoff,
+			"round %d: an odd cap must not swallow the last doubling", round)
+	}
 }
