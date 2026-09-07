@@ -1071,6 +1071,13 @@ type newTestServerOpts struct {
 	// opSupported reply. This lets tests intercept *some* opOptions
 	// (e.g. heartbeats) while allowing startup negotiation to succeed.
 	optionsRespFn func(respFrame *framer, stream int) bool
+
+	// rawRespFn, when set, is offered every request once startup has completed,
+	// with the raw connection. Returning true means it has written whatever the
+	// client should see and the normal response path is skipped, which is how a
+	// test produces a reply that is not a well-formed frame: a header promising
+	// more body than ever arrives, say.
+	rawRespFn func(conn net.Conn, reqFrame *framer) bool
 }
 
 func (nts newTestServerOpts) newServer(t testing.TB, ctx context.Context) *TestServer {
@@ -1099,6 +1106,7 @@ func (nts newTestServerOpts) newServer(t testing.TB, ctx context.Context) *TestS
 		customRequestHandler:       nts.customRequestHandler,
 		dontFailOnProtocolMismatch: nts.dontFailOnProtocolMismatch,
 		optionsRespFn:              nts.optionsRespFn,
+		rawRespFn:                  nts.rawRespFn,
 	}
 
 	go srv.closeWatch()
@@ -1172,6 +1180,10 @@ type TestServer struct {
 	// preserving all other default handling. Returns true if it wrote a
 	// response; false to fall through to the default opSupported reply.
 	optionsRespFn func(respFrame *framer, stream int) bool
+
+	// rawRespFn lets a test answer a post-startup request by writing raw bytes,
+	// bypassing the framer entirely. Returning true skips normal processing.
+	rawRespFn func(conn net.Conn, reqFrame *framer) bool
 
 	// swallowPostStartupOptions makes process drop every OPTIONS received after
 	// a connection completed its startup negotiation, without writing a reply.
@@ -1272,6 +1284,10 @@ func (srv *TestServer) serve() {
 
 				if srv.onRecv != nil {
 					srv.onRecv(framer)
+				}
+
+				if startupCompleted && srv.rawRespFn != nil && srv.rawRespFn(conn, framer) {
+					continue
 				}
 
 				srv.process(conn, framer, &useProtoV5, &startupCompleted, optionCount)

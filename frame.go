@@ -705,15 +705,35 @@ func (f *framer) payload() {
 	f.flags |= flagCustomPayload
 }
 
+// frameReadError marks a read failure that left this connection unable to
+// locate the next frame boundary: part of a frame is still on the wire, or the
+// header's length is not usable at all.
+//
+// The distinction is wire consumption, not error type. A connection carrying
+// one of these must be closed: delivering the error to the caller and carrying
+// on would read leftover body bytes as the next frame header. Errors raised
+// once a body has been fully consumed — a frame that was discarded whole, or a
+// payload that would not decompress — leave the boundary intact and are not
+// marked, whatever their dynamic type.
+type frameReadError struct{ err error }
+
+func (e *frameReadError) Error() string { return e.err.Error() }
+
+func (e *frameReadError) Unwrap() error { return e.err }
+
 // reads a frame form the wire into the framers buffer
 func (f *framer) readFrame(r io.Reader, head *frameHeader) error {
 	if head.length < 0 {
-		return fmt.Errorf("frame body length can not be less than 0: %d", head.length)
+		// Nothing can be discarded to recover: the length itself is unusable, so
+		// the next frame boundary is unknowable.
+		return &frameReadError{fmt.Errorf("frame body length can not be less than 0: %d", head.length)}
 	} else if head.length > maxFrameSize {
 		// need to free up the connection to be used again
 		_, err := io.CopyN(ioutil.Discard, r, int64(head.length))
 		if err != nil {
-			return fmt.Errorf("error whilst trying to discard frame with invalid length: %w", err)
+			// The oversized body was only partly discarded, so the wire is still
+			// mid-frame.
+			return &frameReadError{fmt.Errorf("error whilst trying to discard frame with invalid length: %w", err)}
 		}
 		return ErrFrameTooBig
 	}
@@ -728,7 +748,9 @@ func (f *framer) readFrame(r io.Reader, head *frameHeader) error {
 	// assume the underlying reader takes care of timeouts and retries
 	n, err := io.ReadFull(r, f.buf)
 	if err != nil {
-		return fmt.Errorf("unable to read frame body: read %d/%d bytes: %w", n, head.length, err)
+		// Covers a read deadline, a truncated body and a peer that closed
+		// mid-frame alike: in every case the rest of this body is still owed.
+		return &frameReadError{fmt.Errorf("unable to read frame body: read %d/%d bytes: %w", n, head.length, err)}
 	}
 
 	if f.proto < protoVersion5 && head.flags&flagCompress == flagCompress {

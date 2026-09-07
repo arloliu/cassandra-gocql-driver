@@ -682,13 +682,7 @@ func (c *Conn) closeWithError(err error) {
 		case req.resp <- callResp{err: err}:
 		case <-req.timeout:
 		}
-		if req.streamObserverContext != nil {
-			req.streamObserverEndOnce.Do(func() {
-				req.streamObserverContext.StreamAbandoned(ObservedStream{
-					Host: c.host,
-				})
-			})
-		}
+		c.notifyStreamEnd(req, streamAbandoned)
 	}
 
 	// if error was nil then unblock the quit channel
@@ -1005,10 +999,18 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 
 	err = framer.readFrame(r, &head)
 	if err != nil {
-		// only net errors should cause the connection to be closed. Though
-		// cassandra returning corrupt frames will be returned here as well.
-		if _, ok := err.(net.Error); ok {
+		// Close the connection only when the frame boundary is gone. That is a
+		// property of how much of the frame was consumed, which readFrame reports
+		// with frameReadError -- not something the error's dynamic type can be
+		// asked about, since a compressor may return anything it likes for a body
+		// that was read in full.
+		//
+		// This call has already left the call map, so closeWithError's snapshot
+		// will not find it and nobody else would report it to the observer.
+		var desync *frameReadError
+		if errors.As(err, &desync) {
 			framer.release()
+			c.notifyStreamEnd(call, streamAbandoned)
 			return err
 		}
 	}
@@ -1027,16 +1029,49 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 	return nil
 }
 
-func (c *Conn) releaseStream(call *callReq) {
-	c.streams.Clear(call.streamID)
+// streamOutcome says which terminal event a call's stream observer is owed.
+type streamOutcome int
 
-	if call.streamObserverContext != nil {
-		call.streamObserverEndOnce.Do(func() {
-			call.streamObserverContext.StreamFinished(ObservedStream{
-				Host: c.host,
-			})
-		})
+const (
+	// streamFinished means a response for the call arrived, whatever it said.
+	streamFinished streamOutcome = iota
+	// streamAbandoned means no response will be delivered for the call.
+	streamAbandoned
+)
+
+// releaseStream returns call's stream id to the connection and reports the call
+// as finished.
+//
+// Only the first caller for a given call does anything: reclaiming an id twice
+// would free whichever request holds it by then.
+func (c *Conn) releaseStream(call *callReq) {
+	if !call.released.CompareAndSwap(false, true) {
+		return
 	}
+
+	c.streams.Clear(call.streamID)
+	c.notifyStreamEnd(call, streamFinished)
+}
+
+// notifyStreamEnd delivers a call's terminal observer event.
+//
+// It never touches the stream allocator, which is what makes it safe on a
+// connection that is being retired but has not yet started refusing new calls:
+// returning the id there would hand it to a caller that would then write into a
+// connection already known to be unusable.
+func (c *Conn) notifyStreamEnd(call *callReq, outcome streamOutcome) {
+	if call.streamObserverContext == nil {
+		return
+	}
+
+	call.streamObserverEndOnce.Do(func() {
+		observed := ObservedStream{Host: c.host}
+		if outcome == streamFinished {
+			call.streamObserverContext.StreamFinished(observed)
+		} else {
+			call.streamObserverContext.StreamAbandoned(observed)
+		}
+	})
 }
 
 func (c *Conn) recvSegment(ctx context.Context) error {
@@ -1255,6 +1290,12 @@ type callReq struct {
 	resp     chan callResp
 	timeout  chan struct{} // indicates to recv() that a call has timed out
 	streamID int           // current stream in use
+
+	// released is claimed exactly once, by whichever goroutine reclaims this
+	// call's stream id. Without it a second reclamation would clear a *different*
+	// request's stream once the id had been handed out again: IDGenerator.Clear
+	// inspects only the bit, it has no notion of allocation generation.
+	released atomic.Bool
 
 	// The request timer is deliberately NOT held here. It is created by the
 	// caller after its frame has been written, so any goroutine that reached
