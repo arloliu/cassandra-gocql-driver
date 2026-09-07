@@ -669,18 +669,24 @@ func (c *Conn) closeWithError(err error) {
 	c.closed = true
 	c.mu.Unlock()
 
-	// We should attempt to deliver the error back to the caller if it exists.
 	// Snapshot call handlers so we don't hold any shard locks while sending.
+	// The snapshot is taken even for a nil error: every outstanding call is owed
+	// a terminal observer event, and Conn.Close() closes with a nil error, so
+	// gating the snapshot on err != nil left those calls with no event at all.
 	var callsToClose []*callReq
-	if err != nil && c.calls != nil {
+	if c.calls != nil {
 		callsToClose = c.calls.snapshot()
 	}
 
 	for _, req := range callsToClose {
-		// we need to send the error to all waiting queries.
-		select {
-		case req.resp <- callResp{err: err}:
-		case <-req.timeout:
+		// Only an actual error is worth delivering. A nil-error notification would
+		// reach the caller's success branch with no framer behind it.
+		if err != nil {
+			// we need to send the error to all waiting queries.
+			select {
+			case req.resp <- callResp{err: err, closing: true}:
+			case <-req.timeout:
+			}
 		}
 		c.notifyStreamEnd(req, streamAbandoned)
 	}
@@ -1019,11 +1025,18 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 	// connection has closed. Either way we should never block indefinatly here
 	select {
 	case call.resp <- callResp{framer: framer, err: err}:
+		// The caller may have given up between the check above and this send, in
+		// which case nobody is left to read what was just delivered.
+		c.drainAbandoned(call)
 	case <-call.timeout:
 		framer.release()
 		c.releaseStream(call)
 	case <-ctx.Done():
 		framer.release()
+		// The call has already left the call map, so closeWithError's snapshot
+		// cannot find it to report. Leave the stream id alone: the connection is
+		// on its way out and the allocator goes with it.
+		c.notifyStreamEnd(call, streamAbandoned)
 	}
 
 	return nil
@@ -1051,6 +1064,42 @@ func (c *Conn) releaseStream(call *callReq) {
 
 	c.streams.Clear(call.streamID)
 	c.notifyStreamEnd(call, streamFinished)
+}
+
+// drainAbandoned discards whatever is left for a call whose caller has gone
+// away, and claims the call's termination when a real response is among it.
+//
+// A caller that gives up closes call.timeout and returns without reading, so a
+// response arriving afterwards would otherwise sit in the buffer with nobody to
+// return its framer or its stream. Both the receive side and the abandoning
+// caller run this, and between them exactly one claims the call: the caller
+// closes call.timeout before draining, so a response delivered after that drain
+// is guaranteed to be seen by the receive side's own drain.
+//
+// It loops because closeWithError sends to a snapshot without deleting, so it
+// can publish to a call processFrame has already taken out of the map, leaving
+// two values behind.
+func (c *Conn) drainAbandoned(call *callReq) {
+	select {
+	case <-call.timeout:
+	default:
+		// The caller is still waiting for this response and will read it itself.
+		return
+	}
+
+	for {
+		select {
+		case resp := <-call.resp:
+			if resp.framer != nil {
+				resp.framer.release()
+			}
+			if !resp.closing {
+				c.releaseStream(call)
+			}
+		default:
+			return
+		}
+	}
 }
 
 // notifyStreamEnd delivers a call's terminal observer event.
@@ -1318,6 +1367,10 @@ type callResp struct {
 	framer *framer
 	// err is error encountered, if any.
 	err error
+	// closing marks a notification produced by closeWithError rather than a
+	// response that came off the wire. The closer owns the call's termination for
+	// these, so whoever drains one must discard it without claiming the stream.
+	closing bool
 }
 
 // contextWriter is like io.Writer, but takes context as well.
@@ -1571,6 +1624,12 @@ func (c *Conn) addCall(call *callReq) error {
 	return nil
 }
 
+// testBeforeCallerRecv runs just before a caller waits for its response, if a
+// test has set it. Whether a caller sees its response or its cancellation first
+// is a race the runtime decides, so a test that needs one specific order has to
+// arrange the world at this point. Always nil in production.
+var testBeforeCallerRecv func()
+
 func (c *Conn) exec(ctx context.Context, req frameBuilder, tracer Tracer) (*framer, error) {
 	return c.execInternal(ctx, req, tracer, true)
 }
@@ -1681,6 +1740,10 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 		ctxDone = ctx.Done()
 	}
 
+	if testBeforeCallerRecv != nil {
+		testBeforeCallerRecv()
+	}
+
 	select {
 	case resp := <-call.resp:
 		close(call.timeout)
@@ -1688,11 +1751,11 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 			if resp.framer != nil {
 				resp.framer.release()
 			}
-			if !c.Closed() {
-				// if the connection is closed then we cant release the stream,
-				// this is because the request is still outstanding and we have
-				// been handed another error from another stream which caused the
-				// connection to close.
+			if !resp.closing {
+				// A response that came off the wire ends this call, whatever the
+				// connection is doing by now. Only a notification from
+				// closeWithError leaves the stream alone: that one belongs to the
+				// closer, which reports it and takes the whole allocator with it.
 				c.releaseStream(call)
 			}
 			return nil, resp.err
@@ -1727,6 +1790,9 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 		return resp.framer, nil
 	case <-timeoutCh:
 		close(call.timeout)
+		// A response may already be sitting in the buffer: this select and the
+		// receive side's can both have been ready at once.
+		c.drainAbandoned(call)
 		c.logger.Debug("Request timed out on connection.",
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()))
 		return nil, ErrTimeoutNoResponse
@@ -1735,11 +1801,15 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()),
 			NewLogFieldError("ctx_err", ctx.Err()))
 		close(call.timeout)
+		c.drainAbandoned(call)
+		// Returned unwrapped: query_executor classifies context errors by equality,
+		// so wrapping one turns a caller giving up into a host failure.
 		return nil, ctx.Err()
 	case <-c.ctx.Done():
 		c.logger.Debug("Request failed because connection closed.",
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()))
 		close(call.timeout)
+		c.drainAbandoned(call)
 		return nil, ErrConnectionClosed
 	}
 }
