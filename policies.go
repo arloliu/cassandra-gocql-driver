@@ -1141,6 +1141,11 @@ func (e *ExponentialReconnectionPolicy) GetMaxRetries() int {
 
 // SpeculativeExecutionPolicy defines the interface for speculative execution policies.
 // These policies determine when and how many speculative queries to execute.
+//
+// Attempts is the number of runs launched in addition to the main one.
+// A negative value is treated as zero: the query runs once, with no speculative launch.
+// Delay is only read when Attempts is positive, and must be positive itself,
+// because it drives a ticker.
 type SpeculativeExecutionPolicy interface {
 	Attempts() int
 	Delay() time.Duration

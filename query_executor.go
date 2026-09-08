@@ -264,6 +264,17 @@ type queryExecutor struct {
 	// budget snapshot and before the first draw.
 	// Nil in production.
 	testAfterSnapshot func()
+	// testBeforeDrainClose runs in drainRunners on each drained iterator, before it
+	// is closed, and carries no cleanup of its own.
+	// Nil in production.
+	testBeforeDrainClose func(iter *Iter)
+	// testAfterConsume runs in coordinate on the coordinate goroutine, immediately
+	// after each terminal message is counted and before it is acted on; consumed is
+	// the running count.
+	// drainRunners deliberately does not call it: what it reports is the accounting
+	// coordinate did, not the messages the drain took afterwards.
+	// Nil in production.
+	testAfterConsume func(consumed int)
 }
 
 // closeIfHeld closes iter when the frame that produced it is still holding it.
@@ -319,6 +330,20 @@ func (q *queryExecutor) attemptQuery(ctx context.Context, qry internalRequest, c
 // The query fails with ErrNoConnections as soon as every launched runner reported
 // no host, whether or not a further launch is still scheduled.
 //
+// Every launched runner publishes exactly one terminal message, on results or on
+// noHostCh; consumed counts the ones this frame took.
+// The runners whose message nobody read are handed to drainRunners, which closes their
+// iterators.
+// The winner is not among them: it was counted as consumed.
+//
+// Returning does not wait for that cleanup.
+// While any launched runner has not published, a drain goroutine may exist
+// indefinitely: Session.Close cancels the session context and closes the session's
+// resources, but it does not join the runners, and several of the waits a runner can
+// sit in are not bounded by any context - an accepted socket write, an
+// ExponentialBackoffRetryPolicy sleep, a retry or selection callback.
+// That lifetime is unchanged by this cleanup; see drainRunners for what it guarantees.
+//
 // Parameters:
 //   - ctx: cancelled by executeQuery once a result is returned
 //   - sp: the speculative execution policy; sp.Attempts() extra runners
@@ -330,10 +355,27 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 	sel *hostSelector) *Iter {
 	// remaining counts scheduled launches that have not started yet.
 	remaining := sp.Attempts()
+	if remaining < 0 {
+		// A negative count would make the capacities below smaller than the number of
+		// runners, and a capacity under -1 is not even representable.
+		remaining = 0
+	}
 	results := make(chan *Iter, 1+remaining)
 	// Buffered so a runner reporting no host never blocks.
 	noHostCh := make(chan struct{}, 1+remaining)
 	launched, noHost := 1, 0
+	// consumed counts the terminal messages taken off the two channels.
+	consumed := 0
+
+	// The one cleanup point, installed before the first launch: sp.Delay() below runs
+	// when a runner already exists and is user code that may panic.
+	// Both counts are final when this runs: only the ticker raises launched, and the
+	// ticker is gone once the loop has returned.
+	defer func() {
+		if outstanding := launched - consumed; outstanding > 0 {
+			go q.drainRunners(results, noHostCh, outstanding)
+		}
+	}()
 
 	// Every runner, the main one included, gets its own snapshot: sharing one
 	// request would let a RetryPolicy's SetConsistency on one runner decide what
@@ -354,8 +396,16 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 		select {
 		case iter := <-results:
 			// Any real result wins.
+			consumed++
+			if q.testAfterConsume != nil {
+				q.testAfterConsume(consumed)
+			}
 			return iter
 		case <-noHostCh:
+			consumed++
+			if q.testAfterConsume != nil {
+				q.testAfterConsume(consumed)
+			}
 			// A no-host report never consumes a launch.
 			noHost++
 			// noHost == launched means no launched runner is still viable, so the
@@ -380,6 +430,49 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 			}
 		case <-ctx.Done():
 			return newErrIter(ctx.Err(), qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
+		}
+	}
+}
+
+// drainRunners consumes the terminal messages of the runners coordinate left behind and
+// closes the iterators among them.
+//
+// Those iterators reach no caller, so nothing else would return their response framer to
+// the pool: they never carry a leak detector either.
+//
+// The guarantee is conditional:
+//
+//	coordinate does not wait for this cleanup.
+//	While any launched runner has not published, this goroutine may exist indefinitely.
+//	If every launched runner publishes exactly once, and every close completes normally,
+//	the drain ends once it has consumed all the remaining messages.
+//
+// Two shapes are excluded from that termination, both because the runner never publishes:
+// a callback that ends its runner with runtime.Goexit, which raises no recoverable panic
+// for run's teardown to answer, and a panic inside that teardown itself, which builds its
+// error iterator out of the request and so can fail before it ever sends.
+//
+// Each close is isolated, so one panicking cleanup cannot stop the remaining messages
+// from being consumed; the recoverGoroutine at the top is the backstop for the loop
+// itself, as it is for every driver-spawned goroutine.
+//
+// Parameters:
+//   - results: the channel the runners publish their iterators on
+//   - noHost: the channel the runners report an unreached host on
+//   - outstanding: how many messages are still owed, launched minus consumed
+func (q *queryExecutor) drainRunners(results <-chan *Iter, noHost <-chan struct{}, outstanding int) {
+	logger := q.pool.session.logger
+	defer recoverGoroutine(logger, "queryExecutor.drainRunners", nil)
+
+	for ; outstanding > 0; outstanding-- {
+		select {
+		case iter := <-results:
+			if q.testBeforeDrainClose != nil {
+				q.testBeforeDrainClose(iter)
+			}
+			safely(logger, "queryExecutor.drainRunners.Close", func() { iter.Close() })
+		case <-noHost:
+			// A no-host report carries no iterator, so there is nothing to reclaim.
 		}
 	}
 }
@@ -741,13 +834,18 @@ func (q *queryExecutor) run(ctx context.Context, qry internalRequest, sel *hostS
 	// Coordination teardown: parent at coordinate selects on <-results, <-noHost or <-ctx.Done().
 	// If q.do panics, no result is sent and the parent waits until ctx cancel.
 	// Push a panic-error iter so the parent unblocks immediately.
+	//
+	// Every send below is a plain send, never a select on ctx.Done().
+	// Both channels hold 1+S messages, S being the sp.Attempts() coordinate sampled;
+	// only coordinate launches runners, at most 1+S of them, and each one publishes
+	// exactly one message - so no send here can block.
+	// A ctx.Done() case would be picked at random against a send that is ready anyway,
+	// dropping an iterator with its framer and leaving coordinate's drain accounting
+	// waiting for a message that was never sent.
 	defer recoverGoroutine(q.pool.session.logger, "queryExecutor.run", func(err error) {
 		errIter := newErrIter(err, qry.getQueryMetrics(), qry.Keyspace(),
 			qry.getRoutingInfo(), qry.getKeyspaceFunc())
-		select {
-		case results <- errIter:
-		case <-ctx.Done():
-		}
+		results <- errIter
 	})
 
 	// Speculative runners share one selector, so its budget is query-wide
@@ -761,20 +859,14 @@ func (q *queryExecutor) run(ctx context.Context, qry internalRequest, sel *hostS
 		if q.testRunHook != nil {
 			q.testRunHook(runNoHost)
 		}
-		select {
-		case noHost <- struct{}{}:
-		case <-ctx.Done():
-		}
+		noHost <- struct{}{}
 		return
 	}
 
 	if q.testRunHook != nil {
 		q.testRunHook(runResult)
 	}
-	select {
-	case results <- iter:
-	case <-ctx.Done():
-	}
+	results <- iter
 }
 
 type queryOptions struct {
