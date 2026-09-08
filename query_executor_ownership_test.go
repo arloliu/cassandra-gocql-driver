@@ -76,10 +76,20 @@ func newHeldIter(err error) *heldIter {
 // released reports whether the framer went through framer.release().
 //
 // The gate is the identity of the readBuffer's backing array, not its capacity:
-// release() swapped the oversized slice for a fresh one, and nothing else in the driver
-// replaces readBuffer. Comparing identity rather than capacity also survives the framer
-// being taken back out of the global pool and regrown by another user, while staying red
-// for a framer that was never released — one that never reached the pool cannot change.
+// release() replaces an oversized readBuffer with a fresh defaultBufSize slice,
+// and reset() never touches readBuffer at all, so the swap is release()'s own signature
+// where release() is the only thing that could have run.
+//
+// That premise is this fixture's quiescence, and the claim reaches no further.
+// Identity is not a substitute for synchronization:
+// reading a slice header still has to be ordered against whoever writes it,
+// and release() has by then put the framer back in the global pool,
+// where other production paths replace readBuffer in turn —
+// readFrame when a frame outgrows the buffer (frame.go:741-745)
+// and the write path when it adopts a grown f.buf (frame.go:1141-1142).
+// The fixture keeps that from mattering by running no session, no connection and no
+// other framer user for the whole test,
+// so this framer is only ever touched by the test's own goroutine.
 //
 // Returns:
 //   - bool: true once release() ran on the framer

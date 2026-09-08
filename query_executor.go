@@ -655,41 +655,25 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 			return iter
 		}
 
-		attemptsReached := !rt.Attempt(qry)
-		retryType := rt.GetRetryType(iter.err)
-
-		var stopRetries bool
-
 		// If query is unsuccessful, check the error with RetryPolicy to retry
-		switch retryType {
-		case Retry:
-			// retry on the same host
-		case RetryNextHost:
-			// retry on the next host
-			if attemptsReached {
-				// The terminal pass discards its selection below; advance the iterator
-				// once, as always, without spending a replacement on it.
-				sel.advance()
-			} else {
-				selectedHost = sel.draw()
-			}
-		case Ignore:
-			iter.err = nil
-			stopRetries = true
-		case Rethrow:
-			stopRetries = true
-		default:
+		attemptsReached := !rt.Attempt(qry)
+		next, step := planRetry(rt.GetRetryType(iter.err), sel, selectedHost, attemptsReached)
+
+		if step == retryStepUnknown {
 			// Undefined? Return nil and error, this will panic in the requester
 			iter.Close()
 			owned = nil
 			return newErrIter(ErrUnknownRetryType, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
 		}
-
-		if stopRetries || attemptsReached {
+		if step == retryStepIgnore {
+			iter.err = nil
+		}
+		if step != retryStepAgain || attemptsReached {
 			owned = nil
 			return iter
 		}
 
+		selectedHost = next
 		lastErr = iter.err
 		iter.Close()
 		owned = nil
@@ -701,6 +685,59 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 	}
 
 	return newErrIter(ErrNoConnections, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
+}
+
+// retryStep is what a retry policy's answer means to do's loop.
+type retryStep uint8
+
+const (
+	// retryStepAgain runs a further attempt, subject to the attempt budget.
+	retryStepAgain retryStep = iota
+	// retryStepIgnore hands the iterator to the caller with its error cleared.
+	retryStepIgnore
+	// retryStepStop hands the iterator to the caller as it stands.
+	retryStepStop
+	// retryStepUnknown reports an answer outside the defined set.
+	retryStepUnknown
+)
+
+// planRetry turns a retry policy's answer into do's next move,
+// moving the selection on when the policy asked for another host.
+//
+// It holds no iterator and closes none: do keeps ownership across the call and acts on
+// the step returned, so every hand-over and every Close stays in do's own frame.
+//
+// Parameters:
+//   - retryType: the policy's answer for this attempt's error
+//   - sel: the selector to advance or draw the next host from
+//   - current: the host this attempt ran on
+//   - attemptsReached: true when the policy refused a further attempt
+//
+// Returns:
+//   - SelectedHost: the host a further attempt would run on; current when the policy
+//     asked to stay put or when no further attempt follows
+//   - retryStep: what do does next
+func planRetry(retryType RetryType, sel *hostSelector, current SelectedHost, attemptsReached bool) (SelectedHost, retryStep) {
+	switch retryType {
+	case Retry:
+		// retry on the same host
+		return current, retryStepAgain
+	case RetryNextHost:
+		// retry on the next host
+		if attemptsReached {
+			// The terminal pass discards its selection; advance the iterator once,
+			// as always, without spending a replacement on it.
+			sel.advance()
+			return current, retryStepAgain
+		}
+		return sel.draw(), retryStepAgain
+	case Ignore:
+		return current, retryStepIgnore
+	case Rethrow:
+		return current, retryStepStop
+	default:
+		return current, retryStepUnknown
+	}
 }
 
 // pickForHost selects a connection for selectedHost.
