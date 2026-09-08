@@ -616,6 +616,13 @@ type fillHarnessOpts struct {
 	// request is processed; ip is the server's loopback address without the port.
 	// Blocking in it holds that connection's request in flight.
 	recvHook func(ip string, f *framer)
+	// respHook, when set, is offered every request of every test server before
+	// the server's default handling; ip is the server's loopback address without
+	// the port.
+	// Returning true means it wrote the response into resp and the default
+	// handling is skipped; returning false falls through, so a fixture only has
+	// to answer the requests it cares about.
+	respHook func(ip string, srv *TestServer, req, resp *framer) bool
 
 	// proto selects the protocol version for both the servers and the cluster.
 	// Zero means defaultProto. Setting it on the cluster alone would not do:
@@ -668,7 +675,18 @@ func newFillHarnessOpts(t *testing.T, hosts int, opts fillHarnessOpts) *fillHarn
 		if opts.recvHook != nil {
 			recvHook = func(f *framer) { opts.recvHook(ip, f) }
 		}
-		srv := newTestServerOpts{addr: addr, protocol: uint8(proto), recvHook: recvHook}.newServer(t, testServerContext(t))
+		var respFn func(srv *TestServer, req, resp *framer) bool
+		if opts.respHook != nil {
+			respFn = func(srv *TestServer, req, resp *framer) bool {
+				return opts.respHook(ip, srv, req, resp)
+			}
+		}
+		srv := newTestServerOpts{
+			addr:     addr,
+			protocol: uint8(proto),
+			recvHook: recvHook,
+			respFn:   respFn,
+		}.newServer(t, testServerContext(t))
 		t.Cleanup(srv.Stop)
 		return srv
 	}

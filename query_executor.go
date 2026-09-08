@@ -61,6 +61,27 @@ type internalRequest interface {
 	attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo)
 	retryPolicy() RetryPolicy
 	speculativeExecutionPolicy() SpeculativeExecutionPolicy
+	// snapshotForRunner returns a copy one speculative runner owns.
+	//
+	// Pointer fields stay shared - metrics, routing info and host metrics are
+	// per-page, not per-runner.
+	// Only the value fields a RetryPolicy may write become per-runner.
+	snapshotForRunner() internalRequest
+	// getQueryMetrics returns the counters one page execution shares.
+	//
+	// Every runner of a speculative execution, and every retry inside a runner,
+	// accounts against the same completed-attempt count, and a per-runner
+	// snapshot keeps sharing it: the count a RetryPolicy reads through Attempts
+	// is per page execution, not per runner.
+	//
+	// It is not an admission cap on requests. attemptQuery sends the request and
+	// records the attempt only afterwards, and a speculative launch never
+	// consults the retry policy at all, so several requests can already be in
+	// flight before the first Attempt decision is taken; NumRetries+1 is
+	// therefore not a hard ceiling on the number of requests sent.
+	//
+	// It does not carry across pages: the request that fetches the next page
+	// starts from a fresh queryMetrics, so the count resets per page.
 	getQueryMetrics() *queryMetrics
 	getRoutingInfo() *queryRoutingInfo
 	getKeyspaceFunc() func() string
@@ -280,7 +301,13 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 	noHostCh := make(chan struct{}, 1+remaining)
 	launched, noHost := 1, 0
 
-	go q.run(ctx, qry, sel, results, noHostCh)
+	// Every runner, the main one included, gets its own snapshot: sharing one
+	// request would let a RetryPolicy's SetConsistency on one runner decide what
+	// a sibling sends next, and would leave the next-page copy reading a field a
+	// sibling writes.
+	// Giving the main runner the original instead would only be safe under the
+	// extra premise that nobody writes the original.
+	go q.run(ctx, qry.snapshotForRunner(), sel, results, noHostCh)
 
 	var tick <-chan time.Time
 	if remaining > 0 {
@@ -313,7 +340,7 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 			// Only the ticker launches.
 			remaining--
 			launched++
-			go q.run(ctx, qry, sel, results, noHostCh)
+			go q.run(ctx, qry.snapshotForRunner(), sel, results, noHostCh)
 			if remaining == 0 {
 				tick = nil
 			}
@@ -765,6 +792,27 @@ func newQueryOptions(q *Query, ctx context.Context) *queryOptions {
 	}
 }
 
+// internalQuery is the per-execution state of one Query.
+//
+// Two sites copy an existing internalQuery, and both are bound by one contract:
+// build the copy field by field, and read consistency through GetConsistency.
+//
+//   - (*internalQuery).snapshotForRunner, below: the request one speculative
+//     runner owns.
+//   - Conn.executeQueryWithUnprepRetries (conn.go): the request that fetches the
+//     next page.
+//
+// newInternalQuery below builds one from the public Query instead of copying
+// one, so it is a constructor and not a copy site.
+//
+// No copy site may read the struct as a whole.
+// A RetryPolicy writes consistency through SetConsistency while a sibling runner
+// or the page that just arrived is being copied,
+// so a whole-struct read of it is a data race that an atomic reload afterwards
+// cannot undo.
+//
+// Adding a field means adding it to both copy sites; forgetting one is a silent
+// bug, which TestInternalRequestFieldsAreSnapshotted turns into a failing test.
 type internalQuery struct {
 	originalQuery      *Query
 	qryOpts            *queryOptions
@@ -800,6 +848,30 @@ func newInternalQuery(q *Query, ctx context.Context) *internalQuery {
 		conn:               nil,
 		session:            q.session,
 		routingInfo:        &queryRoutingInfo{},
+	}
+}
+
+// snapshotForRunner returns the copy of the query one speculative runner owns.
+//
+// consistency is read through GetConsistency, so the copy never races the
+// SetConsistency a sibling's RetryPolicy may be making.
+// Every pointer field keeps its identity: metrics, routing info and host metrics
+// belong to the page execution rather than to one runner,
+// and pageState is read-only for the whole execution.
+//
+// Returns:
+//   - internalRequest: the runner's own request
+func (q *internalQuery) snapshotForRunner() internalRequest {
+	return &internalQuery{
+		originalQuery:      q.originalQuery,
+		qryOpts:            q.qryOpts,
+		pageState:          q.pageState,
+		conn:               q.conn,
+		consistency:        uint32(q.GetConsistency()),
+		session:            q.session,
+		routingInfo:        q.routingInfo,
+		metrics:            q.metrics,
+		hostMetricsManager: q.hostMetricsManager,
 	}
 }
 
@@ -983,6 +1055,21 @@ func newBatchOptions(b *Batch, ctx context.Context) *batchOptions {
 	}
 }
 
+// internalBatch is the per-execution state of one Batch.
+//
+// One site copies an existing internalBatch, and it is bound by the same
+// contract internalQuery states: (*internalBatch).snapshotForRunner below builds
+// the copy field by field and reads consistency through GetConsistency.
+// A batch has no next page - nextIter is built only for a rows result, in
+// conn.go - so there is no second copy site, and there is no pageState or conn
+// field to carry.
+//
+// newInternalBatch below builds one from the public Batch instead of copying
+// one, so it is a constructor and not a copy site.
+//
+// Adding a field means adding it to snapshotForRunner; forgetting one is a
+// silent bug, which TestInternalRequestFieldsAreSnapshotted turns into a failing
+// test.
 type internalBatch struct {
 	originalBatch      *Batch
 	batchOpts          *batchOptions
@@ -1008,6 +1095,27 @@ func newInternalBatch(batch *Batch, ctx context.Context) *internalBatch {
 		consistency:        uint32(batch.GetConsistency()),
 		metrics:            &queryMetrics{},
 		hostMetricsManager: hostMetricsMgr,
+	}
+}
+
+// snapshotForRunner returns the copy of the batch one speculative runner owns.
+//
+// consistency is read through GetConsistency, so the copy never races the
+// SetConsistency a sibling's RetryPolicy may be making.
+// Every pointer field keeps its identity, hostMetricsManager included: it is an
+// interface value that is carried over, not a manager that is rebuilt.
+//
+// Returns:
+//   - internalRequest: the runner's own request
+func (b *internalBatch) snapshotForRunner() internalRequest {
+	return &internalBatch{
+		originalBatch:      b.originalBatch,
+		batchOpts:          b.batchOpts,
+		consistency:        uint32(b.GetConsistency()),
+		routingInfo:        b.routingInfo,
+		session:            b.session,
+		metrics:            b.metrics,
+		hostMetricsManager: b.hostMetricsManager,
 	}
 }
 

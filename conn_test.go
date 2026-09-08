@@ -1065,6 +1065,12 @@ type newTestServerOpts struct {
 	customRequestHandler       func(srv *TestServer, reqFrame, respFrame *framer) error
 	dontFailOnProtocolMismatch bool
 
+	// respFn, when set, is offered every request before the default handling.
+	// Returning true means it wrote the response into respFrame and the default
+	// switch is skipped; returning false falls through to the default handling,
+	// so a test only has to answer the requests it cares about.
+	respFn func(srv *TestServer, reqFrame, respFrame *framer) bool
+
 	// optionsRespFn, when set, may override the default opOptions
 	// response generation. The hook returns true if it wrote a
 	// response; false makes the server fall through to the default
@@ -1104,6 +1110,7 @@ func (nts newTestServerOpts) newServer(t testing.TB, ctx context.Context) *TestS
 		onRecv: nts.recvHook,
 
 		customRequestHandler:       nts.customRequestHandler,
+		respFn:                     nts.respFn,
 		dontFailOnProtocolMismatch: nts.dontFailOnProtocolMismatch,
 		optionsRespFn:              nts.optionsRespFn,
 		rawRespFn:                  nts.rawRespFn,
@@ -1175,6 +1182,11 @@ type TestServer struct {
 	// customRequestHandler allows overriding the default request handling for testing purposes.
 	customRequestHandler       func(srv *TestServer, reqFrame, respFrame *framer) error
 	dontFailOnProtocolMismatch bool
+
+	// respFn lets a test answer selected requests itself while leaving every
+	// other request to the default handling. Returning true means it wrote the
+	// response; false falls through.
+	respFn func(srv *TestServer, reqFrame, respFrame *framer) bool
 
 	// optionsRespFn lets tests override only the opOptions response while
 	// preserving all other default handling. Returns true if it wrote a
@@ -1395,6 +1407,10 @@ func (srv *TestServer) process(conn net.Conn, reqFrame *framer, useProtoV5, star
 			return
 		}
 		// Dont like this but...
+		goto finish
+	}
+
+	if srv.respFn != nil && srv.respFn(srv, reqFrame, respFrame) {
 		goto finish
 	}
 

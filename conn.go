@@ -231,6 +231,14 @@ type connTestHooks struct {
 
 	// onFramerRelease counts response framers returned to the pool by a drain.
 	onFramerRelease func()
+
+	// beforeNextPage runs inside a query execution once a rows result reporting
+	// more pages has been parsed, immediately before the request that fetches
+	// the next page is built from q.
+	// Parking here holds the winning response outside the copy, which is what
+	// lets a test order a sibling runner's retry against that copy.
+	// It carries no cleanup of its own: whatever it holds, production releases.
+	beforeNextPage func(q *internalQuery)
 }
 
 // ConnErrorHandler handles connection errors and state changes for connections.
@@ -2390,11 +2398,28 @@ func (c *Conn) executeQueryWithUnprepRetries(ctx context.Context, q *internalQue
 		}
 
 		if x.meta.morePages() && !qryOpts.disableAutoPage {
-			newQry := new(internalQuery)
-			*newQry = *q
-			newQry.pageState = copyBytes(x.meta.pagingState)
-			newQry.metrics = &queryMetrics{}
-			if newQry.qryOpts.observer != nil {
+			if hooks := c.hooks(); hooks != nil && hooks.beforeNextPage != nil {
+				hooks.beforeNextPage(q)
+			}
+			// Built field by field, and never as a whole-struct copy of q: a
+			// RetryPolicy that kept the request it was handed can still be
+			// calling SetConsistency on it, and reading the whole struct would
+			// read that field non-atomically.
+			// See the copy contract on internalQuery.
+			newQry := &internalQuery{
+				originalQuery: q.originalQuery,
+				qryOpts:       q.qryOpts,
+				// The next page resumes where this one stopped, on the same
+				// connection when the caller pinned one.
+				pageState:   copyBytes(x.meta.pagingState),
+				conn:        q.conn,
+				consistency: uint32(q.GetConsistency()),
+				session:     q.session,
+				routingInfo: q.routingInfo,
+				// The attempt budget is per page, so the next page starts over.
+				metrics: &queryMetrics{},
+			}
+			if qryOpts.observer != nil {
 				newQry.hostMetricsManager = newHostMetricsManager()
 			} else {
 				newQry.hostMetricsManager = emptyHostMetricsManager
