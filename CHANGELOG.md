@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.3-otter] - 2026-09-08
+
+Host metadata reads on the query hot path no longer take a lock. `HostInfo`'s data center,
+rack, host id and up/down state were each read under the host's `RWMutex`, and every
+concurrent query serialised on that lock's reader count: the token-aware policy's classify
+loop takes it once or twice per replica, `IsUp` once more on the chosen host, and the
+statement-cache key takes it on every prepared execution even when the cache is warm. The
+four identity fields now live in an immutable snapshot behind an atomic pointer and the
+state in its own atomic; the two writers that can touch a published host still serialise
+on the mutex, readers never do. No exported API and no exported symbol changes meaning,
+so this is a patch release.
+
+### Changed
+
+- **`HostInfo.DataCenter()`, `Rack()`, `HostID()`, `State()` and `IsUp()` are lock-free.**
+  Measured on the same machine at 32 threads, ten samples each, p<0.001: a contended `IsUp`
+  went from 116.6 ns to 0.10 ns, `HostID` from 132.2 ns to 0.13 ns, and the rack-aware
+  `HostTier` (which reads data center and rack) from 249.8 ns to 0.70 ns. The token-aware
+  `Pick` benchmarks improved 13–32% at every thread count with round-robin, DC-aware and
+  rack-aware fallbacks. Allocations per operation are unchanged on every benchmark in the
+  read path, including the paging and frame-parsing suites. Filling in a host's metadata
+  from a later ring read allocates one small snapshot, which it did not before, and only
+  when something actually changed; a no-op update allocates nothing.
+
+  The four identity fields are published together, so a reader that takes one snapshot
+  sees a combination the host was actually in. Two separate accessor calls were never one
+  coherent read -- under the mutex a metadata update could land between them too -- and
+  still are not; this is now stated on `HostTierer`. The driver's own multi-field consumers
+  (`RackAwareRoundRobinPolicy`'s tier calculation, the replica-map build, `String()`, peer
+  validation) read one snapshot. State is deliberately kept out of the identity snapshot:
+  a late identity publication can never carry a stale up/down state back past the
+  session's outage bookkeeping, whose only writer is unchanged.
+
+  **Upgrading:** nothing to do. A custom `HostSelectionPolicy` or `HostTierer` that reads
+  two accessors and needs them consistent has the same exposure it always had; there is
+  no exported single-snapshot read, and adding one is out of scope for a patch.
+
+### Fixed
+
+- **A replica-map build could see a host under two different racks.** Building the token
+  replica map reads each host's data center and rack in an inventory pass and again in the
+  selection pass. A metadata update landing between the two -- which the policy's lock did
+  not exclude, because host updates take only the host's own lock -- could record the host
+  under one rack and look it up under another, skip it as an unknown rack, and with
+  replication factor 1 in that data center leave the token with no replicas at all, which
+  panics. The build now captures each host's identity once and uses it for every pass.
+  This window existed before this release; the snapshot made it cheap to close.
+
+- **`BenchmarkFramerReadCol_Tuple` panicked on a nil `*resultMetadata`** and took the rest
+  of the package's benchmark run down with it, so the tuple read path had no regression
+  signal. Test-only; `readCol` is unchanged.
+
+### Internal
+
+- Nine concurrency tests pin the new invariants (coherent snapshot, serialised writers,
+  independent state, fill-only update semantics, zero-allocation reads, no plain-field
+  mirrors), each exercised against a mutation that breaks its invariant with recorded
+  detection counts. Nine new benchmarks give the hot path before/after instruments.
+
 ## [2.6.2-otter] - 2026-09-08
 
 Speculative execution, and the iterator ownership around it. Each speculative runner now
