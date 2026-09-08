@@ -212,10 +212,9 @@ type doFixture struct {
 //   - *doFixture: the fixture
 func newDoFixture() *doFixture {
 	host := (&HostInfo{
-		hostId:         "ownership-1",
 		connectAddress: net.IPv4(127, 0, 0, 1),
 		port:           9042,
-	}).setState(NodeUp)
+	}).withIdentity("ownership-1", "", "").setState(NodeUp)
 	conn := &Conn{host: host, streams: streams.New(int(protoVersion4), 64)}
 	pool := &policyConnPool{
 		hostConnPools: map[string]*hostConnPool{

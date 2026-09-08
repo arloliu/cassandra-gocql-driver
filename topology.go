@@ -255,6 +255,22 @@ func (n *networkTopology) haveRF(replicaCounts map[string]int) bool {
 	return true
 }
 
+// replicaMap places every token in the ring on the replicas this strategy's
+// per-data-center replication factors call for.
+//
+// Replicas are picked walking the ring from each token, preferring an unseen
+// rack within each data center and falling back to the racks already used once
+// every rack has been seen.
+//
+// A token whose primary host is in a data center this strategy does not
+// replicate to is skipped; a token that reaches the selection loop and comes out
+// with no replica at all is a contradiction, and panics.
+//
+// Parameters:
+//   - tokenRing: the ring to place, whose hosts are the candidate replicas
+//
+// Returns:
+//   - tokenRingReplicas: one entry per placed token, in the ring's token order
 func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 	dcRacks := make(map[string]map[string]struct{}, len(n.dcs))
 	// skipped hosts in a dc
@@ -264,9 +280,20 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 	// dc -> racks
 	seenDCRacks := make(map[string]map[string]struct{}, len(n.dcs))
 
+	// One identity snapshot per host for the whole build.
+	// Building the replica map is a single logical decision that reads each host
+	// across three passes - the rack inventory below, the primary-DC check, and
+	// the selection loop - and a HostInfo.update landing between two of them (it
+	// takes only the host's own lock, not t.mu) would let the inventory record a
+	// host under one rack and the selection loop look it up under another, which
+	// reads as an unknown rack and can leave a token with no replicas at all.
+	ids := make(map[*HostInfo]*hostIdentity, len(tokenRing.hosts))
+
 	for _, h := range tokenRing.hosts {
-		dc := h.DataCenter()
-		rack := h.Rack()
+		id := h.identity()
+		ids[h] = id
+		dc := id.dataCenter
+		rack := id.rack
 
 		racks, ok := dcRacks[dc]
 		if !ok {
@@ -290,7 +317,13 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 	}
 
 	for i, th := range tokenRing.tokens {
-		if rf := n.dcs[th.host.DataCenter()]; rf == 0 {
+		// tokens only name hosts in tokenRing.hosts, so ids has an entry; the
+		// fallback is defensive rather than reachable.
+		thID := ids[th.host]
+		if thID == nil {
+			thID = th.host.identity()
+		}
+		if rf := n.dcs[thID.dataCenter]; rf == 0 {
 			// skip this token since no replica in this datacenter.
 			continue
 		}
@@ -315,8 +348,12 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 			}
 			h := tokens[p].host
 
-			dc := h.DataCenter()
-			rack := h.Rack()
+			id := ids[h]
+			if id == nil {
+				id = h.identity()
+			}
+			dc := id.dataCenter
+			rack := id.rack
 
 			rf := n.dcs[dc]
 			if rf == 0 {

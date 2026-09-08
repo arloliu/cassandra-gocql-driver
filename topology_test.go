@@ -36,10 +36,10 @@ import (
 )
 
 func TestPlacementStrategy_SimpleStrategy(t *testing.T) {
-	host0 := &HostInfo{hostId: "0"}
-	host25 := &HostInfo{hostId: "25"}
-	host50 := &HostInfo{hostId: "50"}
-	host75 := &HostInfo{hostId: "75"}
+	host0 := (&HostInfo{}).withIdentity("0", "", "")
+	host25 := (&HostInfo{}).withIdentity("25", "", "")
+	host50 := (&HostInfo{}).withIdentity("50", "", "")
+	host75 := (&HostInfo{}).withIdentity("75", "", "")
 
 	tokens := []hostToken{
 		{intToken(0), host0},
@@ -71,7 +71,7 @@ func TestPlacementStrategy_SimpleStrategy(t *testing.T) {
 		for j, replica := range ht.hosts {
 			exp := tokens[(i+j)%len(tokens)].host
 			if exp != replica {
-				t.Errorf("expected host %v to be a replica of %v got %v", exp.hostId, token, replica.hostId)
+				t.Errorf("expected host %v to be a replica of %v got %v", exp.HostID(), token, replica.HostID())
 			}
 		}
 	}
@@ -132,10 +132,10 @@ func TestPlacementStrategy_NetworkStrategy(t *testing.T) {
 				for j := 0; j < hostsPerDC; j++ {
 					rack := fmt.Sprintf("rack%d", (j%racksPerDC)+1)
 
-					h := &HostInfo{hostId: fmt.Sprintf("%s:%s:%d", dc, rack, j), dataCenter: dc, rack: rack}
+					h := (&HostInfo{}).withIdentity(fmt.Sprintf("%s:%s:%d", dc, rack, j), dc, rack)
 
 					token := hostToken{
-						token: orderedToken([]byte(h.hostId)),
+						token: orderedToken([]byte(h.HostID())),
 						host:  h,
 					}
 
@@ -188,7 +188,7 @@ func TestPlacementStrategy_NetworkStrategy(t *testing.T) {
 
 					var replicas []*HostInfo
 					for _, replica := range allReplicas.hosts {
-						if replica.dataCenter == dc {
+						if replica.DataCenter() == dc {
 							replicas = append(replicas, replica)
 						}
 					}
@@ -210,16 +210,16 @@ func TestPlacementStrategy_NetworkStrategy(t *testing.T) {
 								// next rack
 								p := (i + j + k) % len(dcTokens)
 								h := dcTokens[p].host
-								if h.rack != lastRack {
+								if h.Rack() != lastRack {
 									exp = h
 									break
 								}
 							}
-							if exp.rack == lastRack {
+							if exp.Rack() == lastRack {
 								panic("no more racks")
 							}
 						}
-						lastRack = replica.rack
+						lastRack = replica.Rack()
 					}
 				}
 			}
@@ -238,15 +238,15 @@ func TestPlacementStrategy_NetworkStrategy_DoNotPanicWhenNoReplicasInRing(t *tes
 
 	// Hosts in ring only from dc2, so no replicas should be returned.
 	hosts := []*HostInfo{
-		{hostId: "dc2:rack1:0", dataCenter: "dc2", rack: "rack1"},
-		{hostId: "dc2:rack2:1", dataCenter: "dc2", rack: "rack2"},
-		{hostId: "dc2:rack3:2", dataCenter: "dc2", rack: "rack3"},
+		(&HostInfo{}).withIdentity("dc2:rack1:0", "dc2", "rack1"),
+		(&HostInfo{}).withIdentity("dc2:rack2:1", "dc2", "rack2"),
+		(&HostInfo{}).withIdentity("dc2:rack3:2", "dc2", "rack3"),
 	}
 
 	tokens := make([]hostToken, 0, len(hosts))
 	for _, h := range hosts {
 		tokens = append(tokens, hostToken{
-			token: orderedToken(h.hostId),
+			token: orderedToken(h.HostID()),
 			host:  h,
 		})
 	}

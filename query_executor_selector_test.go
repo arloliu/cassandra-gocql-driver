@@ -46,7 +46,10 @@ func adv() selectorStep { return selectorStep{adv: true} }
 // before they yield, ineligible hosts are skipped for free, both counters cap
 // replacement, nil is final, and advance consumes one raw entry and charges it.
 func TestHostSelector(t *testing.T) {
-	hostA, hostB, hostC, hostD := &HostInfo{hostId: "A"}, &HostInfo{hostId: "B"}, &HostInfo{hostId: "C"}, &HostInfo{hostId: "D"}
+	hostA := (&HostInfo{}).withIdentity("A", "", "")
+	hostB := (&HostInfo{}).withIdentity("B", "", "")
+	hostC := (&HostInfo{}).withIdentity("C", "", "")
+	hostD := (&HostInfo{}).withIdentity("D", "", "")
 	all := []*HostInfo{hostA, hostB, hostC}
 
 	cases := []struct {
@@ -174,7 +177,7 @@ func TestHostSelector(t *testing.T) {
 					require.Nil(t, got, "step %d: expected exhaustion", i)
 					continue
 				}
-				require.NotNil(t, got, "step %d: expected %s, got exhaustion", i, step.want.hostId)
+				require.NotNil(t, got, "step %d: expected %s, got exhaustion", i, step.want.HostID())
 				require.Same(t, step.want, got.Info(), "step %d: wrong host", i)
 			}
 

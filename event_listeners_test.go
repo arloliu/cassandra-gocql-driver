@@ -394,8 +394,8 @@ func TestSchemaListenersMux_OnlyTargetCategoryReceivesEvents(t *testing.T) {
 func TestHostListenersMux_HostStatus(t *testing.T) {
 	t.Run("no listeners", func(t *testing.T) {
 		mux := HostListenersMux{}
-		mux.OnHostUp(HostUpEvent{Host: &HostInfo{hostId: "h1"}})
-		mux.OnHostDown(HostDownEvent{Host: &HostInfo{hostId: "h1"}})
+		mux.OnHostUp(HostUpEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
+		mux.OnHostDown(HostDownEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
 	})
 
 	t.Run("single listener", func(t *testing.T) {
@@ -404,8 +404,8 @@ func TestHostListenersMux_HostStatus(t *testing.T) {
 			HostStateChangeListeners: []HostStatusChangeListener{l},
 		}
 
-		mux.OnHostUp(HostUpEvent{Host: &HostInfo{hostId: "h1"}})
-		mux.OnHostDown(HostDownEvent{Host: &HostInfo{hostId: "h1"}})
+		mux.OnHostUp(HostUpEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
+		mux.OnHostDown(HostDownEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
 
 		assertCounts(t, "host up", l.hostUpCount, 1)
 		assertCounts(t, "host down", l.hostDownCount, 1)
@@ -419,8 +419,8 @@ func TestHostListenersMux_HostStatus(t *testing.T) {
 			HostStateChangeListeners: []HostStatusChangeListener{l1, l2, l3},
 		}
 
-		mux.OnHostUp(HostUpEvent{Host: &HostInfo{hostId: "h1"}})
-		mux.OnHostDown(HostDownEvent{Host: &HostInfo{hostId: "h1"}})
+		mux.OnHostUp(HostUpEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
+		mux.OnHostDown(HostDownEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
 
 		for i, l := range []*mockHostStatusChangeListener{l1, l2, l3} {
 			assertCountsIdx(t, i, "host up", l.hostUpCount, 1)
@@ -432,8 +432,8 @@ func TestHostListenersMux_HostStatus(t *testing.T) {
 func TestHostListenersMux_Topology(t *testing.T) {
 	t.Run("no listeners", func(t *testing.T) {
 		mux := HostListenersMux{}
-		mux.OnNewHost(NewHostEvent{Host: &HostInfo{hostId: "h1"}})
-		mux.OnRemovedHost(RemovedHostEvent{Host: &HostInfo{hostId: "h1"}})
+		mux.OnNewHost(NewHostEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
+		mux.OnRemovedHost(RemovedHostEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
 	})
 
 	t.Run("single listener", func(t *testing.T) {
@@ -442,8 +442,8 @@ func TestHostListenersMux_Topology(t *testing.T) {
 			TopologyChangeListeners: []TopologyChangeListener{l},
 		}
 
-		mux.OnNewHost(NewHostEvent{Host: &HostInfo{hostId: "h1"}})
-		mux.OnRemovedHost(RemovedHostEvent{Host: &HostInfo{hostId: "h1"}})
+		mux.OnNewHost(NewHostEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
+		mux.OnRemovedHost(RemovedHostEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
 
 		assertCounts(t, "new host", l.newHostCount, 1)
 		assertCounts(t, "removed host", l.removedHostCount, 1)
@@ -457,8 +457,8 @@ func TestHostListenersMux_Topology(t *testing.T) {
 			TopologyChangeListeners: []TopologyChangeListener{l1, l2, l3},
 		}
 
-		mux.OnNewHost(NewHostEvent{Host: &HostInfo{hostId: "h1"}})
-		mux.OnRemovedHost(RemovedHostEvent{Host: &HostInfo{hostId: "h1"}})
+		mux.OnNewHost(NewHostEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
+		mux.OnRemovedHost(RemovedHostEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
 
 		for i, l := range []*mockTopologyChangeListener{l1, l2, l3} {
 			assertCountsIdx(t, i, "new host", l.newHostCount, 1)
@@ -476,7 +476,7 @@ func TestHostListenersMux_OnlyTargetCategoryReceivesEvents(t *testing.T) {
 		TopologyChangeListeners:  []TopologyChangeListener{topoListener},
 	}
 
-	mux.OnHostUp(HostUpEvent{Host: &HostInfo{hostId: "h1"}})
+	mux.OnHostUp(HostUpEvent{Host: (&HostInfo{}).withIdentity("h1", "", "")})
 
 	assertCounts(t, "host up", statusListener.hostUpCount, 1)
 	assertCounts(t, "host down", statusListener.hostDownCount, 0)

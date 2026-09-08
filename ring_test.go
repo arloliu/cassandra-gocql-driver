@@ -35,7 +35,7 @@ import (
 func TestRing_AddHostIfMissing_Missing(t *testing.T) {
 	ring := &ring{}
 
-	host := &HostInfo{hostId: MustRandomUUID().String(), connectAddress: net.IPv4(1, 1, 1, 1)}
+	host := (&HostInfo{connectAddress: net.IPv4(1, 1, 1, 1)}).withIdentity(MustRandomUUID().String(), "", "")
 	h1, ok := ring.addHostIfMissing(host)
 	if ok {
 		t.Fatal("host was reported as already existing")
@@ -49,10 +49,10 @@ func TestRing_AddHostIfMissing_Missing(t *testing.T) {
 func TestRing_AddHostIfMissing_Existing(t *testing.T) {
 	ring := &ring{}
 
-	host := &HostInfo{hostId: MustRandomUUID().String(), connectAddress: net.IPv4(1, 1, 1, 1)}
+	host := (&HostInfo{connectAddress: net.IPv4(1, 1, 1, 1)}).withIdentity(MustRandomUUID().String(), "", "")
 	ring.addHostIfMissing(host)
 
-	h2 := &HostInfo{hostId: host.hostId, connectAddress: net.IPv4(2, 2, 2, 2)}
+	h2 := (&HostInfo{connectAddress: net.IPv4(2, 2, 2, 2)}).withIdentity(host.HostID(), "", "")
 
 	h1, ok := ring.addHostIfMissing(h2)
 	if !ok {
@@ -78,13 +78,13 @@ func TestRing_AddHostIfMissing_Existing(t *testing.T) {
 // value, leaving the original one behind.
 func TestRingGetHostByIPRejectsAStaleIndexEntry(t *testing.T) {
 	r := &ring{}
-	host := &HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), hostId: "id1"}
+	host := (&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1)}).withIdentity("id1", "", "")
 	r.addHostIfMissing(host)
 	staleKey := host.nodeToNodeAddress().String()
 
 	// HostInfo.update fills in fields the entry did not have, which moves the address
 	// the host would be keyed by without moving the key.
-	host.update(&HostInfo{broadcastAddress: net.IPv4(10, 0, 0, 1), hostId: "id1"})
+	host.update((&HostInfo{broadcastAddress: net.IPv4(10, 0, 0, 1)}).withIdentity("id1", "", ""))
 	r.removeHost("id1")
 
 	got, ok := r.getHostByIP(staleKey)
@@ -107,8 +107,8 @@ func TestRingGetHostByIPRejectsAStaleIndexEntry(t *testing.T) {
 func TestRingRemoveHostKeepsAnIndexEntryTheSurvivorOwns(t *testing.T) {
 	r := &ring{}
 	shared := net.IPv4(10, 0, 0, 9)
-	departing := &HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), broadcastAddress: shared, hostId: "idA"}
-	survivor := &HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), broadcastAddress: shared, hostId: "idB"}
+	departing := (&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), broadcastAddress: shared}).withIdentity("idA", "", "")
+	survivor := (&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), broadcastAddress: shared}).withIdentity("idB", "", "")
 
 	r.addHostIfMissing(departing)
 	r.addHostIfMissing(survivor) // repoints the shared key at idB

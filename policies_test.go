@@ -45,8 +45,8 @@ func TestRoundRobbin(t *testing.T) {
 	policy := RoundRobinHostPolicy()
 
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(0, 0, 0, 1)},
-		{hostId: "1", connectAddress: net.IPv4(0, 0, 0, 2)},
+		(&HostInfo{connectAddress: net.IPv4(0, 0, 0, 1)}).withIdentity("0", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(0, 0, 0, 2)}).withIdentity("1", "", ""),
 	}
 
 	for _, host := range hosts {
@@ -56,7 +56,7 @@ func TestRoundRobbin(t *testing.T) {
 	got := make(map[string]bool)
 	it := policy.Pick(nil)
 	for h := it(); h != nil; h = it() {
-		id := h.Info().hostId
+		id := h.Info().HostID()
 		if got[id] {
 			t.Fatalf("got duplicate host: %v", id)
 		}
@@ -105,10 +105,10 @@ func TestHostPolicy_TokenAware_SimpleStrategy(t *testing.T) {
 
 	// set the hosts
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"25"}},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
-		{hostId: "3", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"75"}},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}}).withIdentity("0", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"25"}}).withIdentity("1", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}}).withIdentity("2", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"75"}}).withIdentity("3", "", ""),
 	}
 	for _, host := range &hosts {
 		policy.AddHost(host)
@@ -141,7 +141,7 @@ func TestHostPolicy_TokenAware_SimpleStrategy(t *testing.T) {
 func TestHostPolicy_RoundRobin_NilHostInfo(t *testing.T) {
 	policy := RoundRobinHostPolicy()
 
-	host := &HostInfo{hostId: "host-1"}
+	host := (&HostInfo{}).withIdentity("host-1", "", "")
 	policy.AddHost(host)
 
 	iter := policy.Pick(nil)
@@ -404,10 +404,10 @@ func TestHostPolicy_DCAwareRR(t *testing.T) {
 	p := DCAwareRoundRobinPolicy("local")
 
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.ParseIP("10.0.0.1"), dataCenter: "local"},
-		{hostId: "1", connectAddress: net.ParseIP("10.0.0.2"), dataCenter: "local"},
-		{hostId: "2", connectAddress: net.ParseIP("10.0.0.3"), dataCenter: "remote"},
-		{hostId: "3", connectAddress: net.ParseIP("10.0.0.4"), dataCenter: "remote"},
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.1")}).withIdentity("0", "local", ""),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.2")}).withIdentity("1", "local", ""),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.3")}).withIdentity("2", "remote", ""),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.4")}).withIdentity("3", "remote", ""),
 	}
 
 	for _, host := range hosts {
@@ -419,8 +419,8 @@ func TestHostPolicy_DCAwareRR(t *testing.T) {
 
 	it := p.Pick(nil)
 	for h := it(); h != nil; h = it() {
-		id := h.Info().hostId
-		dc := h.Info().dataCenter
+		id := h.Info().HostID()
+		dc := h.Info().DataCenter()
 
 		if got[id] {
 			t.Fatalf("got duplicate host %s", id)
@@ -469,18 +469,18 @@ func TestHostPolicy_TokenAware(t *testing.T) {
 
 	// set the hosts
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"05"}, dataCenter: "remote1"},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"10"}, dataCenter: "local"},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"15"}, dataCenter: "remote2"},
-		{hostId: "3", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"20"}, dataCenter: "remote1"},
-		{hostId: "4", connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"25"}, dataCenter: "local"},
-		{hostId: "5", connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"30"}, dataCenter: "remote2"},
-		{hostId: "6", connectAddress: net.IPv4(10, 0, 0, 7), tokens: []string{"35"}, dataCenter: "remote1"},
-		{hostId: "7", connectAddress: net.IPv4(10, 0, 0, 8), tokens: []string{"40"}, dataCenter: "local"},
-		{hostId: "8", connectAddress: net.IPv4(10, 0, 0, 9), tokens: []string{"45"}, dataCenter: "remote2"},
-		{hostId: "9", connectAddress: net.IPv4(10, 0, 0, 10), tokens: []string{"50"}, dataCenter: "remote1"},
-		{hostId: "10", connectAddress: net.IPv4(10, 0, 0, 11), tokens: []string{"55"}, dataCenter: "local"},
-		{hostId: "11", connectAddress: net.IPv4(10, 0, 0, 12), tokens: []string{"60"}, dataCenter: "remote2"},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"05"}}).withIdentity("0", "remote1", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"10"}}).withIdentity("1", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"15"}}).withIdentity("2", "remote2", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"20"}}).withIdentity("3", "remote1", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"25"}}).withIdentity("4", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"30"}}).withIdentity("5", "remote2", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 7), tokens: []string{"35"}}).withIdentity("6", "remote1", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 8), tokens: []string{"40"}}).withIdentity("7", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 9), tokens: []string{"45"}}).withIdentity("8", "remote2", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 10), tokens: []string{"50"}}).withIdentity("9", "remote1", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 11), tokens: []string{"55"}}).withIdentity("10", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 12), tokens: []string{"60"}}).withIdentity("11", "remote2", ""),
 	}
 	for _, host := range hosts {
 		policy.AddHost(host)
@@ -571,18 +571,18 @@ func TestHostPolicy_TokenAware_NetworkStrategy(t *testing.T) {
 
 	// set the hosts
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"05"}, dataCenter: "remote1"},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"10"}, dataCenter: "local"},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"15"}, dataCenter: "remote2"},
-		{hostId: "3", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"20"}, dataCenter: "remote1"}, // 1
-		{hostId: "4", connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"25"}, dataCenter: "local"},   // 2
-		{hostId: "5", connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"30"}, dataCenter: "remote2"}, // 3
-		{hostId: "6", connectAddress: net.IPv4(10, 0, 0, 7), tokens: []string{"35"}, dataCenter: "remote1"}, // 4
-		{hostId: "7", connectAddress: net.IPv4(10, 0, 0, 8), tokens: []string{"40"}, dataCenter: "local"},   // 5
-		{hostId: "8", connectAddress: net.IPv4(10, 0, 0, 9), tokens: []string{"45"}, dataCenter: "remote2"}, // 6
-		{hostId: "9", connectAddress: net.IPv4(10, 0, 0, 10), tokens: []string{"50"}, dataCenter: "remote1"},
-		{hostId: "10", connectAddress: net.IPv4(10, 0, 0, 11), tokens: []string{"55"}, dataCenter: "local"},
-		{hostId: "11", connectAddress: net.IPv4(10, 0, 0, 12), tokens: []string{"60"}, dataCenter: "remote2"},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"05"}}).withIdentity("0", "remote1", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"10"}}).withIdentity("1", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"15"}}).withIdentity("2", "remote2", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"20"}}).withIdentity("3", "remote1", ""), // 1
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"25"}}).withIdentity("4", "local", ""),   // 2
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"30"}}).withIdentity("5", "remote2", ""), // 3
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 7), tokens: []string{"35"}}).withIdentity("6", "remote1", ""), // 4
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 8), tokens: []string{"40"}}).withIdentity("7", "local", ""),   // 5
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 9), tokens: []string{"45"}}).withIdentity("8", "remote2", ""), // 6
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 10), tokens: []string{"50"}}).withIdentity("9", "remote1", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 11), tokens: []string{"55"}}).withIdentity("10", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 12), tokens: []string{"60"}}).withIdentity("11", "remote2", ""),
 	}
 	for _, host := range hosts {
 		policy.AddHost(host)
@@ -645,14 +645,14 @@ func TestHostPolicy_RackAwareRR(t *testing.T) {
 	p := RackAwareRoundRobinPolicy("local", "b")
 
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.ParseIP("10.0.0.1"), dataCenter: "local", rack: "a"},
-		{hostId: "1", connectAddress: net.ParseIP("10.0.0.2"), dataCenter: "local", rack: "a"},
-		{hostId: "2", connectAddress: net.ParseIP("10.0.0.3"), dataCenter: "local", rack: "b"},
-		{hostId: "3", connectAddress: net.ParseIP("10.0.0.4"), dataCenter: "local", rack: "b"},
-		{hostId: "4", connectAddress: net.ParseIP("10.0.0.5"), dataCenter: "remote", rack: "a"},
-		{hostId: "5", connectAddress: net.ParseIP("10.0.0.6"), dataCenter: "remote", rack: "a"},
-		{hostId: "6", connectAddress: net.ParseIP("10.0.0.7"), dataCenter: "remote", rack: "b"},
-		{hostId: "7", connectAddress: net.ParseIP("10.0.0.8"), dataCenter: "remote", rack: "b"},
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.1")}).withIdentity("0", "local", "a"),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.2")}).withIdentity("1", "local", "a"),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.3")}).withIdentity("2", "local", "b"),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.4")}).withIdentity("3", "local", "b"),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.5")}).withIdentity("4", "remote", "a"),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.6")}).withIdentity("5", "remote", "a"),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.7")}).withIdentity("6", "remote", "b"),
+		(&HostInfo{connectAddress: net.ParseIP("10.0.0.8")}).withIdentity("7", "remote", "b"),
 	}
 
 	for _, host := range hosts {
@@ -698,18 +698,18 @@ func TestHostPolicy_TokenAware_RackAware(t *testing.T) {
 
 	// set the hosts
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"05"}, dataCenter: "remote", rack: "a"},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"10"}, dataCenter: "remote", rack: "b"},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"15"}, dataCenter: "local", rack: "a"},
-		{hostId: "3", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"20"}, dataCenter: "local", rack: "b"},
-		{hostId: "4", connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"25"}, dataCenter: "remote", rack: "a"},
-		{hostId: "5", connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"30"}, dataCenter: "remote", rack: "b"},
-		{hostId: "6", connectAddress: net.IPv4(10, 0, 0, 7), tokens: []string{"35"}, dataCenter: "local", rack: "a"},
-		{hostId: "7", connectAddress: net.IPv4(10, 0, 0, 8), tokens: []string{"40"}, dataCenter: "local", rack: "b"},
-		{hostId: "8", connectAddress: net.IPv4(10, 0, 0, 9), tokens: []string{"45"}, dataCenter: "remote", rack: "a"},
-		{hostId: "9", connectAddress: net.IPv4(10, 0, 0, 10), tokens: []string{"50"}, dataCenter: "remote", rack: "b"},
-		{hostId: "10", connectAddress: net.IPv4(10, 0, 0, 11), tokens: []string{"55"}, dataCenter: "local", rack: "a"},
-		{hostId: "11", connectAddress: net.IPv4(10, 0, 0, 12), tokens: []string{"60"}, dataCenter: "local", rack: "b"},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"05"}}).withIdentity("0", "remote", "a"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"10"}}).withIdentity("1", "remote", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"15"}}).withIdentity("2", "local", "a"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"20"}}).withIdentity("3", "local", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"25"}}).withIdentity("4", "remote", "a"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"30"}}).withIdentity("5", "remote", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 7), tokens: []string{"35"}}).withIdentity("6", "local", "a"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 8), tokens: []string{"40"}}).withIdentity("7", "local", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 9), tokens: []string{"45"}}).withIdentity("8", "remote", "a"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 10), tokens: []string{"50"}}).withIdentity("9", "remote", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 11), tokens: []string{"55"}}).withIdentity("10", "local", "a"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 12), tokens: []string{"60"}}).withIdentity("11", "local", "b"),
 	}
 	for _, host := range hosts {
 		policy.AddHost(host)
@@ -839,10 +839,10 @@ func TestHostPolicy_TokenAware_MultiKeyspace(t *testing.T) {
 
 	// Add hosts with tokens
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"25"}},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
-		{hostId: "3", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"75"}},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}}).withIdentity("0", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"25"}}).withIdentity("1", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}}).withIdentity("2", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"75"}}).withIdentity("3", "", ""),
 	}
 	for _, host := range &hosts {
 		policy.AddHost(host)
@@ -921,10 +921,10 @@ func TestHostPolicy_TokenAware_MultiKeyspace_WithShuffleReplicas(t *testing.T) {
 	}
 
 	hosts := [...]*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"25"}},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
-		{hostId: "3", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"75"}},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}}).withIdentity("0", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"25"}}).withIdentity("1", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}}).withIdentity("2", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"75"}}).withIdentity("3", "", ""),
 	}
 	for _, host := range &hosts {
 		policy.AddHost(host)
@@ -989,9 +989,9 @@ func TestHostPolicy_TokenAware_TopologyChangeUpdatesAllKeyspaces(t *testing.T) {
 
 	// Initial topology: 3 hosts
 	initialHosts := []*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"33"}},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"66"}},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}}).withIdentity("0", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"33"}}).withIdentity("1", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"66"}}).withIdentity("2", "", ""),
 	}
 	for _, host := range initialHosts {
 		policy.AddHost(host)
@@ -1009,11 +1009,10 @@ func TestHostPolicy_TokenAware_TopologyChangeUpdatesAllKeyspaces(t *testing.T) {
 
 	// Test: Add a new host (topology change)
 	t.Run("AddHost", func(t *testing.T) {
-		newHost := &HostInfo{
-			hostId:         "3",
+		newHost := (&HostInfo{
 			connectAddress: net.IPv4(10, 0, 0, 4),
 			tokens:         []string{"99"},
-		}
+		}).withIdentity("3", "", "")
 		policy.AddHost(newHost)
 
 		// Verify: Get updated metadata
@@ -1165,10 +1164,10 @@ func TestHostPolicy_TokenAware_Shuffle_DownReplica(t *testing.T) {
 	// OrderedPartitioner with routing key "05" walks the ring from token 10,
 	// producing replicas [A@10, B@30, C@50].
 	hosts := [...]*HostInfo{
-		{hostId: "A", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}},
-		{hostId: "B", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}},
-		{hostId: "C", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
-		{hostId: "D", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}}).withIdentity("A", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}}).withIdentity("B", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}}).withIdentity("C", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}}).withIdentity("D", "", ""),
 	}
 	for _, host := range &hosts {
 		policy.AddHost(host)
@@ -1216,12 +1215,12 @@ func TestHostPolicy_TokenAware_Shuffle_ClusteredLocalReplicas(t *testing.T) {
 	// RF=4 the replica list is [L0, L1, R0, R1] -- locals clustered at front.
 	// DCAware fallback classifies L0, L1 as tier 0 and R0, R1 as tier 1.
 	hosts := [...]*HostInfo{
-		{hostId: "L0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}, dataCenter: "local"},
-		{hostId: "L1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}, dataCenter: "local"},
-		{hostId: "R0", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}, dataCenter: "remote"},
-		{hostId: "R1", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}, dataCenter: "remote"},
-		{hostId: "R2", connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"50"}, dataCenter: "remote"},
-		{hostId: "R3", connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"60"}, dataCenter: "remote"},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}}).withIdentity("L0", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}}).withIdentity("L1", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}}).withIdentity("R0", "remote", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}}).withIdentity("R1", "remote", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"50"}}).withIdentity("R2", "remote", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"60"}}).withIdentity("R3", "remote", ""),
 	}
 	for _, host := range &hosts {
 		policy.AddHost(host)
@@ -1270,12 +1269,12 @@ func TestHostPolicy_TokenAware_Shuffle_RemoteFallback(t *testing.T) {
 	// ring walk. With DCAware("local") fallback: L0/L1 are tier 0, R0/R1 are
 	// tier 1 and stashed for non-local fallback.
 	hosts := [...]*HostInfo{
-		{hostId: "L0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}, dataCenter: "local"},
-		{hostId: "L1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}, dataCenter: "local"},
-		{hostId: "R0", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}, dataCenter: "remote"},
-		{hostId: "R1", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}, dataCenter: "remote"},
-		{hostId: "R2", connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"50"}, dataCenter: "remote"},
-		{hostId: "R3", connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"60"}, dataCenter: "remote"},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}}).withIdentity("L0", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}}).withIdentity("L1", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}}).withIdentity("R0", "remote", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}}).withIdentity("R1", "remote", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"50"}}).withIdentity("R2", "remote", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 6), tokens: []string{"60"}}).withIdentity("R3", "remote", ""),
 	}
 	for _, host := range &hosts {
 		policy.AddHost(host)
@@ -1330,10 +1329,10 @@ func TestHostPolicy_TokenAware_Shuffle_AllReplicasDown(t *testing.T) {
 	// D is not a replica for this token but should still appear via the
 	// RoundRobin fallback once the (now-dead) replicas are exhausted.
 	hosts := [...]*HostInfo{
-		{hostId: "A", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}},
-		{hostId: "B", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}},
-		{hostId: "C", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
-		{hostId: "D", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}}).withIdentity("A", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}}).withIdentity("B", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}}).withIdentity("C", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}}).withIdentity("D", "", ""),
 	}
 	for _, host := range &hosts {
 		policy.AddHost(host)
@@ -1388,10 +1387,10 @@ func TestHostPolicy_TokenAware_Shuffle_EmptyMiddleTier(t *testing.T) {
 	//   D is local DC, rack a but is NOT in this token's replica set.
 	// So tier 1 (local DC, other rack) is empty within the replica set.
 	hosts := [...]*HostInfo{
-		{hostId: "A", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}, dataCenter: "local", rack: "b"},
-		{hostId: "B", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}, dataCenter: "local", rack: "b"},
-		{hostId: "C", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}, dataCenter: "remote", rack: "a"},
-		{hostId: "D", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}, dataCenter: "local", rack: "a"},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}}).withIdentity("A", "local", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}}).withIdentity("B", "local", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}}).withIdentity("C", "remote", "a"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"40"}}).withIdentity("D", "local", "a"),
 	}
 	for _, host := range &hosts {
 		policy.AddHost(host)
@@ -1432,10 +1431,10 @@ func TestHostPolicy_TokenAware_Shuffle_CrossPolicyIndependence(t *testing.T) {
 		minDistinct = 2 // at least 2 of 3 replicas chosen as first across policies
 	)
 	hosts := []*HostInfo{
-		{hostId: "A", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}},
-		{hostId: "B", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}},
-		{hostId: "C", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}},
-		{hostId: "D", connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}}).withIdentity("A", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"30"}}).withIdentity("B", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"50"}}).withIdentity("C", "", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"70"}}).withIdentity("D", "", ""),
 	}
 
 	firstHosts := make(map[string]int)
@@ -1462,13 +1461,17 @@ func TestHostPolicy_TokenAware_Shuffle_CrossPolicyIndependence(t *testing.T) {
 
 // benchmarkShufflePolicyWith builds a token-aware policy with shuffle enabled
 // over the given fallback, modelling a production-scale workload: 100 hosts
-// with RF=5, so each token has 5 replicas. hostFn builds host i; the routing
-// key is fixed so every Pick targets the same 5-host replica set -- the
-// steady-state hot path.
+// with RF=5, so each token has 5 replicas.
+// hostFn builds host i.
+// The routing key is fixed so every Pick targets the same 5-host replica set,
+// the steady-state hot path.
 //
 // The fallback decides how much of each HostInfo the classify loop reads:
 // RoundRobinHostPolicy never touches the host, DCAwareRoundRobinPolicy reads
-// DataCenter(), and RackAwareRoundRobinPolicy reads DataCenter() then Rack().
+// DataCenter(), and RackAwareRoundRobinPolicy reads the data center and the
+// rack through HostTier.
+// Before the identity snapshot those were one and two RLocks per replica; now
+// they are one atomic load.
 func benchmarkShufflePolicyWith(b *testing.B, fallback HostSelectionPolicy, hostFn func(i int) *HostInfo) (HostSelectionPolicy, *internalQuery) {
 	b.Helper()
 	const (
@@ -1494,11 +1497,10 @@ func benchmarkShufflePolicyWith(b *testing.B, fallback HostSelectionPolicy, host
 // (dcAwareRR.IsLocal compares "" against its local DC, rackAwareRR.HostTier
 // returns 2) -- use benchmarkShuffleTopologyHost there.
 func benchmarkShuffleHost(i int) *HostInfo {
-	return &HostInfo{
-		hostId:         fmt.Sprintf("%03d", i),
+	return (&HostInfo{
 		connectAddress: net.IPv4(10, 0, byte(i/256), byte(i%256)),
 		tokens:         []string{fmt.Sprintf("%03d", i)},
-	}
+	}).withIdentity(fmt.Sprintf("%03d", i), "", "")
 }
 
 // benchmarkShuffleTopologyHost builds a host spread over 2 DCs x 2 racks,
@@ -1512,9 +1514,11 @@ func benchmarkShuffleHost(i int) *HostInfo {
 // Spanning both DCs is what makes HostTier read rack as well as DC.
 func benchmarkShuffleTopologyHost(i int) *HostInfo {
 	h := benchmarkShuffleHost(i)
-	h.dataCenter = [...]string{"dc1", "dc2"}[(i/2)%2]
-	h.rack = [...]string{"r1", "r2"}[(i/4)%2]
-	return h
+	return h.withIdentity(
+		h.HostID(),
+		[...]string{"dc1", "dc2"}[(i/2)%2],
+		[...]string{"r1", "r2"}[(i/4)%2],
+	)
 }
 
 // BenchmarkTokenAwareHostPolicy_PickShuffleSerial measures per-Pick cost on a
@@ -1553,10 +1557,10 @@ func BenchmarkTokenAwareHostPolicy_PickShuffleParallel(b *testing.B) {
 
 // BenchmarkTokenAwareHostPolicy_PickShuffleRackAwareSerial measures per-Pick
 // cost when the fallback is rack-aware,
-// so the classify loop calls HostTier -- DataCenter() then Rack() -- on every
-// replica before IsUp().
-// This is the Pick shape most exposed to the HostInfo lock: three RLocks per
-// replica rather than one.
+// so the classify loop calls HostTier on every replica before IsUp().
+// This was the Pick shape most exposed to the HostInfo lock: HostTier took two
+// RLocks per replica and IsUp a third.
+// HostTier is now one identity load and IsUp one atomic load.
 func BenchmarkTokenAwareHostPolicy_PickShuffleRackAwareSerial(b *testing.B) {
 	policy, iq := benchmarkShufflePolicyWith(b, RackAwareRoundRobinPolicy("dc1", "r1"), benchmarkShuffleTopologyHost)
 
@@ -1606,9 +1610,10 @@ func BenchmarkTokenAwareHostPolicy_PickShuffleDCAwareSerial(b *testing.B) {
 }
 
 // BenchmarkTokenAwareHostPolicy_PickShuffleDCAwareParallel measures the same
-// DC-aware Pick under contention from GOMAXPROCS goroutines,
-// where the shared DataCenter() RLock serializes every concurrent classify
-// loop on one cache line.
+// DC-aware Pick under contention from GOMAXPROCS goroutines.
+// Before the identity snapshot the shared DataCenter() RLock serialized every
+// concurrent classify loop on one cache line; now DataCenter() is a lock-free
+// load and the benchmark shows what that removed.
 func BenchmarkTokenAwareHostPolicy_PickShuffleDCAwareParallel(b *testing.B) {
 	policy, iq := benchmarkShufflePolicyWith(b, DCAwareRoundRobinPolicy("dc1"), benchmarkShuffleTopologyHost)
 

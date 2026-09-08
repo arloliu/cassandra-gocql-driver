@@ -170,6 +170,32 @@ func (c cassVersion) nodeUpDelay() time.Duration {
 	return 10 * time.Second
 }
 
+// hostIdentity is the identity of a host as published to lock-free readers.
+//
+// A published value is immutable: writers copy it, mutate the copy and publish
+// the copy, so a reader that holds one is looking at a coherent snapshot of all
+// four fields as they were at a single publication.
+// Nothing ever mutates a hostIdentity a reader can reach.
+//
+// The four fields travel together because consumers decide on more than one at
+// a time - rackAwareRR.HostTier compares data center and rack, isValidPeer
+// checks host id, data center and rack - and reading them one accessor call at
+// a time would let a publication land in between and produce a combination that
+// never existed.
+type hostIdentity struct {
+	hostId      string
+	dataCenter  string
+	rack        string
+	missingRack bool
+}
+
+// emptyHostIdentity is what a HostInfo whose identity was never published reports.
+// It is the zero value, so a zero HostInfo reads exactly as it did when these
+// were plain fields, missingRack included.
+//
+// It is shared by every such host and must never be mutated.
+var emptyHostIdentity hostIdentity
+
 // HostInfo represents a server Host/Node. You can create a HostInfo object with either NewHostInfoFromAddrPort or
 // NewTestHostInfoFromRow.
 type HostInfo struct {
@@ -188,20 +214,50 @@ type HostInfo struct {
 	// True when a caller handed over the endpoint this host is reached on, or when
 	// the row itself carried a usable native_port. False when port is only
 	// ClusterConfig.Port, which no source confirmed.
-	portNamed     bool
-	dataCenter    string
-	rack          string
-	missingRack   bool
-	hostId        string
+	portNamed bool
+	// ident is the currently published hostIdentity, or nil when this host has
+	// never published one (emptyHostIdentity is what identity reports then).
+	//
+	// It is read without any lock.
+	// It is Stored under mu's write lock by every writer that can run against a
+	// published host - setHostID and update - so those two serialise against
+	// each other and neither loses the other's fill.
+	// The one exception is construction, in newHostInfoFromRow and in test
+	// helpers, where no other goroutine can hold the host yet.
+	//
+	// The field cannot be named identity: that is the accessor's name.
+	ident atomic.Pointer[hostIdentity]
+	// state is the node's up/down state as a nodeState.
+	//
+	// It is deliberately not part of ident. setState is its only writer, which is
+	// what the session's outage ledger relies on (see outageState in session.go);
+	// folding it into the identity snapshot would let a late identity publication
+	// carry a stale state back and bypass the ledger.
+	state         atomic.Int32
 	workload      string
 	graph         bool
 	dseVersion    string
 	partitioner   string
 	clusterName   string
 	version       cassVersion
-	state         nodeState
 	schemaVersion string
 	tokens        []string
+}
+
+// identity returns the host's currently published identity.
+//
+// The result is shared with every other reader and must not be mutated; a
+// writer that needs to change a field copies the snapshot and publishes the copy.
+// Never allocates: a host that has published nothing reports the shared
+// emptyHostIdentity.
+//
+// Returns:
+//   - *hostIdentity: the current snapshot, never nil
+func (h *HostInfo) identity() *hostIdentity {
+	if p := h.ident.Load(); p != nil {
+		return p
+	}
+	return &emptyHostIdentity
 }
 
 // NewHostInfoFromAddrPort creates HostInfo with provided connectAddress and port.
@@ -318,30 +374,56 @@ func (h *HostInfo) PreferredIP() net.IP {
 	return h.preferredIP
 }
 
+// DataCenter returns the data center this host was reported in.
+//
+// Lock-free.
+// A caller that also needs the rack or the host id and wants the three to
+// describe one publication must use identity instead: two accessor calls are
+// two independent observations.
+//
+// Returns:
+//   - string: the data center, or "" when none was published
 func (h *HostInfo) DataCenter() string {
-	h.mu.RLock()
-	dc := h.dataCenter
-	h.mu.RUnlock()
-	return dc
+	return h.identity().dataCenter
 }
 
+// Rack returns the rack this host was reported in.
+//
+// Lock-free.
+// See DataCenter for the consistency boundary between two accessor calls.
+//
+// Returns:
+//   - string: the rack, or "" when none was published
 func (h *HostInfo) Rack() string {
-	h.mu.RLock()
-	rack := h.rack
-	h.mu.RUnlock()
-	return rack
+	return h.identity().rack
 }
 
+// HostID returns the host's host_id.
+//
+// Lock-free.
+// See DataCenter for the consistency boundary between two accessor calls.
+//
+// Returns:
+//   - string: the host id, or "" when none was published
 func (h *HostInfo) HostID() string {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.hostId
+	return h.identity().hostId
 }
 
+// setHostID publishes hostID as this host's host_id, overwriting whatever was
+// there.
+//
+// Runs under mu's write lock so it serialises with update, the other writer of
+// a published identity: it loads the current snapshot, copies it, and publishes
+// the copy, so update's fills of the other three fields survive.
+//
+// Parameters:
+//   - hostID: the id to publish, written unconditionally
 func (h *HostInfo) setHostID(hostID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.hostId = hostID
+	next := *h.identity()
+	next.hostId = hostID
+	h.ident.Store(&next)
 }
 
 func (h *HostInfo) WorkLoad() string {
@@ -380,16 +462,38 @@ func (h *HostInfo) Version() cassVersion {
 	return h.version
 }
 
+// State returns the host's up/down state.
+//
+// Lock-free.
+// State and the identity accessors are two independent atomics and nothing
+// promises a reader sees both from the same instant, which is what two separate
+// RLocks gave before.
+//
+// Returns:
+//   - nodeState: NodeUp for a host nothing has marked down
 func (h *HostInfo) State() nodeState {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.state
+	return nodeState(h.state.Load())
 }
 
+// setState publishes the host's up/down state.
+//
+// It is the only writer of state anywhere in the driver.
+// The session's outage ledger depends on that: a host enters DOWN only through
+// markHostDown and leaves it only by coming up or leaving the ring (see
+// outageState in session.go), which holds because no other path - update
+// included - touches state.
+//
+// It takes no lock.
+// Its two callers run inside a hostPublishMu transaction, and no reader relies
+// on mu to order state against the rest of the host.
+//
+// Parameters:
+//   - state: the state to publish
+//
+// Returns:
+//   - *HostInfo: h, so callers can chain
 func (h *HostInfo) setState(state nodeState) *HostInfo {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.state = state
+	h.state.Store(int32(state))
 	return h
 }
 
@@ -416,6 +520,21 @@ func (h *HostInfo) portIsNamed() bool {
 	return h.portNamed
 }
 
+// update fills in whatever h does not have yet from another description of the
+// same host.
+//
+// Every rule is "fill only when empty", so two concurrent updates from
+// complementary sources both land.
+// The identity half runs under mu's write lock alongside setHostID, the other
+// writer of a published identity: it loads the current snapshot once, computes
+// the whole next value, and publishes it only if something actually changed, so
+// a no-op update allocates nothing and republishes nothing.
+//
+// It does not touch state.
+// See setState.
+//
+// Parameters:
+//   - from: the other description; only read, under its own read lock
 func (h *HostInfo) update(from *HostInfo) {
 	if h == from {
 		return
@@ -426,6 +545,28 @@ func (h *HostInfo) update(from *HostInfo) {
 
 	from.mu.RLock()
 	defer from.mu.RUnlock()
+
+	// One Load each: every fill rule below decides against the same snapshot,
+	// and from's identity cannot be read field by field either.
+	cur := h.identity()
+	src := from.identity()
+	next := *cur
+	if next.dataCenter == "" {
+		next.dataCenter = src.dataCenter
+	}
+	if next.missingRack {
+		next.rack = src.rack
+		next.missingRack = src.missingRack
+	}
+	if next.hostId == "" {
+		next.hostId = src.hostId
+	}
+	if next != *cur {
+		// Addressed only in here, so next itself does not escape and an update
+		// that changed nothing does not allocate.
+		published := next
+		h.ident.Store(&published)
+	}
 
 	// autogenerated do not update
 	if h.peer == nil {
@@ -448,16 +589,6 @@ func (h *HostInfo) update(from *HostInfo) {
 	}
 	if h.port == 0 {
 		h.port = from.port
-	}
-	if h.dataCenter == "" {
-		h.dataCenter = from.dataCenter
-	}
-	if h.missingRack {
-		h.rack = from.rack
-		h.missingRack = from.missingRack
-	}
-	if h.hostId == "" {
-		h.hostId = from.hostId
 	}
 	if h.workload == "" {
 		h.workload = from.workload
@@ -500,9 +631,25 @@ func (h *HostInfo) ConnectAddressAndPort() string {
 	return net.JoinHostPort(addr.String(), strconv.Itoa(h.port))
 }
 
+// String renders the host as a single diagnostic line.
+//
+// The data center, the rack and the host id are rendered together, so they are
+// taken from one identity snapshot: rendering a combination the host was never
+// in would make the line evidence of a state that never existed.
+//
+// Returns:
+//   - string: the host's addresses, endpoint, identity, version, state and token
+//     count, in one bracketed line
 func (h *HostInfo) String() string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+
+	// identity and State are lock-free, so reading them here is not a reentrant
+	// RLock.
+	// The three identity fields come from one snapshot; state is its own atomic
+	// and, as everywhere else, is not promised to be from that instant.
+	id := h.identity()
+	st := h.State()
 
 	connectAddr, source := h.connectAddressLocked()
 	return fmt.Sprintf("[HostInfo hostname=%q connectAddress=%q peer=%q rpc_address=%q broadcast_address=%q "+
@@ -510,7 +657,7 @@ func (h *HostInfo) String() string {
 		"port=%d data_center=%q rack=%q host_id=%q version=%q state=%s num_tokens=%d]",
 		h.hostname, h.connectAddress, h.peer, h.rpcAddress, h.broadcastAddress, h.preferredIP,
 		connectAddr, source,
-		h.port, h.dataCenter, h.rack, h.hostId, h.version, h.state, len(h.tokens))
+		h.port, id.dataCenter, id.rack, id.hostId, h.version, st, len(h.tokens))
 }
 
 // Polls system.peers at a specific interval to find new hosts
@@ -573,11 +720,36 @@ func NewTestHostInfoFromRow(row map[string]interface{}) (*HostInfo, error) {
 	return newHostInfoFromRow(nil, nil, 9042, row)
 }
 
+// newHostInfoFromRow builds a HostInfo from one system.local or system.peers row.
+//
+// The row's identity fields are accumulated into a local hostIdentity and
+// published once, at the end: the host is not reachable by any other goroutine
+// while the row is walked, and publishing per column would let a reader that got
+// hold of it see a half-built identity.
+//
+// Parameters:
+//   - s: the session whose cluster config supplies the AddressTranslator; nil
+//     leaves the row's endpoint untranslated, which is what the test constructor
+//     passes
+//   - defaultAddr: the endpoint the caller is already connected through, or nil
+//     for a peer row whose address comes out of the row itself
+//   - defaultPort: the port to use when neither the caller nor the row names one
+//   - row: the column name to value map as the driver decoded it
+//
+// Returns:
+//   - *HostInfo: the described host, identity published
+//   - error: when a column holds a type this function cannot accept
 func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map[string]interface{}) (*HostInfo, error) {
 	const assertErrorMsg = "Assertion failed for %s, type was %T"
 	var ok bool
 
-	host := &HostInfo{connectAddress: defaultAddr, port: defaultPort, missingRack: true}
+	host := &HostInfo{connectAddress: defaultAddr, port: defaultPort}
+
+	// The identity this row describes, built up as the row is walked and published
+	// once at the end.
+	// The host is not reachable by any other goroutine yet, so no lock is
+	// involved; missingRack starts true and only a rack column clears it.
+	ident := hostIdentity{missingRack: true}
 
 	// Where this host's endpoint comes from, decided before the row is read.
 	//
@@ -606,7 +778,7 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 	for key, value := range row {
 		switch key {
 		case "data_center":
-			host.dataCenter, ok = value.(string)
+			ident.dataCenter, ok = value.(string)
 			if !ok {
 				return nil, fmt.Errorf(assertErrorMsg, "data_center", value)
 			}
@@ -616,12 +788,12 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 				if rack, ok := value.(string); !ok {
 					return nil, fmt.Errorf(assertErrorMsg, "rack", value)
 				} else {
-					host.rack = rack
-					host.missingRack = false
+					ident.rack = rack
+					ident.missingRack = false
 				}
 			} else if rack != nil {
-				host.rack = *rack
-				host.missingRack = false
+				ident.rack = *rack
+				ident.missingRack = false
 			}
 		case "host_id":
 			hostId, ok := value.(UUID)
@@ -642,7 +814,7 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 			// isValidPeer reject such a row, and what lets a caller that needs to name
 			// the row fall back to its address.
 			if hostId != (UUID{}) {
-				host.hostId = hostId.String()
+				ident.hostId = hostId.String()
 			}
 		case "release_version":
 			version, ok := value.(string)
@@ -756,6 +928,8 @@ func newHostInfoFromRow(s *Session, defaultAddr net.IP, defaultPort int, row map
 			host.schemaVersion = schemaVersion.String()
 		}
 	}
+
+	host.ident.Store(&ident)
 
 	// The endpoint's two halves are settled together, before anything reads either.
 	//
@@ -1149,12 +1323,22 @@ func (r *ringDescriber) getClusterPeerInfo(ch *connHost, localHost *HostInfo) ([
 	return peers, invalid, nil
 }
 
-// Return true if the host is a valid peer
+// isValidPeer reports whether a peer row described a host the driver can use.
+//
+// Parameters:
+//   - host: the host built from the peer row
+//
+// Returns:
+//   - bool: true when the host has an rpc address, a host id, a data center, a
+//     rack and at least one token
 func isValidPeer(host *HostInfo) bool {
+	// One snapshot for the three identity checks: whether a row is a usable peer
+	// is a single decision and must not be made from two different publications.
+	id := host.identity()
 	return !(len(host.RPCAddress()) == 0 ||
-		host.hostId == "" ||
-		host.dataCenter == "" ||
-		host.missingRack ||
+		id.hostId == "" ||
+		id.dataCenter == "" ||
+		id.missingRack ||
 		len(host.tokens) == 0)
 }
 

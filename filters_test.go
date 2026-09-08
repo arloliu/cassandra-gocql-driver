@@ -111,7 +111,7 @@ func TestFilter_DataCenter(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		if f.Accept(&HostInfo{dataCenter: test.dc}) {
+		if f.Accept((&HostInfo{}).withIdentity("", test.dc, "")) {
 			if !test.accept {
 				t.Errorf("%d: should not have been accepted but was", i)
 			}
@@ -119,7 +119,7 @@ func TestFilter_DataCenter(t *testing.T) {
 			t.Errorf("%d: should have been accepted but wasn't", i)
 		}
 
-		if f.Accept(&HostInfo{dataCenter: test.dc}) != fDeprecated.Accept(&HostInfo{dataCenter: test.dc}) {
+		if f.Accept((&HostInfo{}).withIdentity("", test.dc, "")) != fDeprecated.Accept((&HostInfo{}).withIdentity("", test.dc, "")) {
 			t.Errorf("%d: DataCenterHostFilter and DataCentreHostFilter should be the same", i)
 		}
 	}

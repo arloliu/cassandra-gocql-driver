@@ -36,6 +36,27 @@ import (
 	"time"
 )
 
+// withIdentity publishes an identity on a freshly built test host and returns it,
+// so a fixture reads as one expression.
+//
+// It replaces the struct literals that used to write hostId/dataCenter/rack
+// directly. missingRack is false, which is what such a literal produced: it left
+// the field at its zero value.
+//
+// Only safe on a host no other goroutine has yet, which is what a fixture is.
+//
+// Parameters:
+//   - hostId: the host id to publish
+//   - dc: the data center to publish
+//   - rack: the rack to publish
+//
+// Returns:
+//   - *HostInfo: h, so the call can wrap a composite literal
+func (h *HostInfo) withIdentity(hostId, dc, rack string) *HostInfo {
+	h.ident.Store(&hostIdentity{hostId: hostId, dataCenter: dc, rack: rack})
+	return h
+}
+
 func TestUnmarshalCassVersion(t *testing.T) {
 	tests := [...]struct {
 		data    string
@@ -232,20 +253,21 @@ func TestNewHostInfoFromRow(t *testing.T) {
 }
 
 func TestIsValidPeer(t *testing.T) {
-	host := &HostInfo{
+	host := (&HostInfo{
 		rpcAddress: net.ParseIP("0.0.0.0"),
-		rack:       "myRack",
-		hostId:     "0",
-		dataCenter: "datacenter",
 		tokens:     []string{"0", "1"},
-	}
+	}).withIdentity("0", "datacenter", "myRack")
 
 	if !isValidPeer(host) {
 		t.Errorf("expected %+v to be a valid peer", host)
 	}
 
-	host.rack = ""
-	host.missingRack = true
+	// Republish the same identity with the rack missing, leaving the host id and
+	// data center in place so missingRack is the only reason the peer is rejected.
+	id := *host.identity()
+	id.rack = ""
+	id.missingRack = true
+	host.ident.Store(&id)
 	if isValidPeer(host) {
 		t.Errorf("expected %+v to NOT be a valid peer", host)
 	}
@@ -558,16 +580,15 @@ func TestErrorBroadcaster_StopWithoutBroadcast(t *testing.T) {
 var hostInfoBenchSink uint64
 
 // benchmarkHostInfo builds the single shared host every HostInfo accessor
-// benchmark reads. dataCenter/rack are the rack-aware policy's local DC and
-// rack so HostTier takes the tier-0 path, which is the only one that reads
-// both DataCenter() and Rack() -- two independent RLocks, the cost under test.
+// benchmark reads.
+// The data center and rack are the rack-aware policy's local DC and rack so
+// HostTier takes the tier-0 path, which is the only one that reads both of
+// them -- two independent RLocks before this host's identity became a
+// snapshot, one atomic Load after, and the cost under test either way.
 func benchmarkHostInfo() *HostInfo {
-	return &HostInfo{
-		hostId:         "8d4e8b0a-1f6a-4c2e-9e4a-2b7c1d3f5a60",
-		dataCenter:     "dc1",
-		rack:           "r1",
+	return (&HostInfo{
 		connectAddress: net.IPv4(10, 0, 0, 1),
-	}
+	}).withIdentity("8d4e8b0a-1f6a-4c2e-9e4a-2b7c1d3f5a60", "dc1", "r1")
 }
 
 // hostInfoBenchCallsPerOp is the number of accessor calls one iteration makes.
@@ -578,9 +599,11 @@ const hostInfoBenchCallsPerOp = 6
 
 // BenchmarkHostInfo_IsUpParallel measures contended reads of HostInfo.state
 // through IsUp, the accessor the token-aware Pick classify loop calls once per
-// replica and queryExecutor.upPool calls again on the chosen host. It is the
-// direct before/after instrument for replacing the state RWMutex with an
-// atomic: every concurrent query today serializes on the same readerCount.
+// replica and queryExecutor.upPool calls again on the chosen host.
+//
+// It is the direct before/after instrument for replacing the state RWMutex with
+// an atomic: before this change every concurrent query serialized on the same
+// readerCount, and now the read is a single atomic Load.
 func BenchmarkHostInfo_IsUpParallel(b *testing.B) {
 	h := benchmarkHostInfo()
 
@@ -599,11 +622,14 @@ func BenchmarkHostInfo_IsUpParallel(b *testing.B) {
 	})
 }
 
-// BenchmarkHostInfo_HostIDParallel measures contended reads of HostInfo.hostId.
+// BenchmarkHostInfo_HostIDParallel measures contended reads of the host id.
+//
 // This path is invisible to the Pick benchmarks: HostID is what
 // Conn.prepareStatement, Conn.executeQuery/executeBatch and
-// policyConnPool.getPool call to build a statement-cache key, so every
-// prepared execution takes this lock even on a warm cache.
+// policyConnPool.getPool call to build a statement-cache key.
+// Before this change every prepared execution took HostInfo.mu for it even on a
+// warm cache; now the field lives in the identity snapshot and the read is one
+// atomic Load.
 func BenchmarkHostInfo_HostIDParallel(b *testing.B) {
 	h := benchmarkHostInfo()
 
@@ -620,10 +646,12 @@ func BenchmarkHostInfo_HostIDParallel(b *testing.B) {
 	})
 }
 
-// BenchmarkHostInfo_HostTierParallel measures contended reads of
-// HostInfo.dataCenter and .rack through rackAwareRR.HostTier, which takes two
-// independent RLocks per replica. It is the instrument for the identity
-// snapshot: one lock-free Load should replace both.
+// BenchmarkHostInfo_HostTierParallel measures contended reads of the data center
+// and the rack through rackAwareRR.HostTier.
+//
+// It is the instrument for the identity snapshot: before this change HostTier
+// took two independent RLocks per replica, one per accessor, and now a single
+// lock-free Load of the snapshot answers both comparisons.
 func BenchmarkHostInfo_HostTierParallel(b *testing.B) {
 	h := benchmarkHostInfo()
 	tierer := RackAwareRoundRobinPolicy("dc1", "r1").(HostTierer)

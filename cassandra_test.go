@@ -4460,7 +4460,7 @@ func TestHostInfoFromIter(t *testing.T) {
 	if h.DataCenter() != "dc1" {
 		t.Errorf("unexpected data center %s != 'dc1'", h.DataCenter())
 	}
-	if h.missingRack {
+	if h.identity().missingRack {
 		t.Errorf("unexpected missing rack")
 	}
 
@@ -4488,7 +4488,7 @@ func TestHostInfoFromIter(t *testing.T) {
 	if h.DataCenter() != "dc2" {
 		t.Errorf("unexpected data center %s != 'dc2'", h.DataCenter())
 	}
-	if !h.missingRack {
+	if !h.identity().missingRack {
 		t.Errorf("unexpected non-missing rack")
 	}
 }

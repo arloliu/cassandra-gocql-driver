@@ -292,6 +292,10 @@ type HostTierer interface {
 	// 0 - local rack, 1 - local DC, 2 - remote DC
 	// or:
 	// 0 - local DC, 1 - remote DC
+	//
+	// Separate accessor calls on a host are not one coherent read: the host's
+	// identity may change between them, so an implementation that calls
+	// DataCenter() and then Rack() can see a combination the host was never in.
 	HostTier(host *HostInfo) uint
 
 	// This function returns the maximum possible host tier
@@ -961,9 +965,22 @@ func (d *rackAwareRR) MaxHostTier() uint {
 	return 2
 }
 
+// HostTier reports how far host is from this policy's local rack.
+//
+// Parameters:
+//   - host: the host to classify
+//
+// Returns:
+//   - uint: 0 for the local data center and the local rack, 1 for the local data
+//     center in another rack, 2 for another data center
 func (d *rackAwareRR) HostTier(host *HostInfo) uint {
-	if host.DataCenter() == d.localDC {
-		if host.Rack() == d.localRack {
+	// One snapshot for both comparisons.
+	// DataCenter() then Rack() would be two independent observations, and a
+	// publication landing between them could pair an old data center with a new
+	// rack - a tier that describes no state the host was ever in.
+	id := host.identity()
+	if id.dataCenter == d.localDC {
+		if id.rack == d.localRack {
 			return 0
 		} else {
 			return 1

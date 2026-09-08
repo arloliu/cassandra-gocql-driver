@@ -66,9 +66,9 @@ func tokenAwareEmptyRingFixture(t *testing.T, fallback HostSelectionPolicy, with
 	}
 
 	hosts := []*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}, dataCenter: "local", rack: "b"},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}, dataCenter: "local", rack: "b"},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}, dataCenter: "local", rack: "b"},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"10"}}).withIdentity("0", "local", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"20"}}).withIdentity("1", "local", "b"),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"30"}}).withIdentity("2", "local", "b"),
 	}
 	for _, h := range hosts {
 		h.setState(NodeUp)
@@ -134,9 +134,9 @@ func TestHostPolicy_TokenAware_TokenlessHostsDoNotPanic(t *testing.T) {
 	internal.getKeyspaceName = func() string { return "ks" }
 
 	hosts := []*HostInfo{
-		{hostId: "0", connectAddress: net.IPv4(10, 0, 0, 1), dataCenter: "local"},
-		{hostId: "1", connectAddress: net.IPv4(10, 0, 0, 2), dataCenter: "local"},
-		{hostId: "2", connectAddress: net.IPv4(10, 0, 0, 3), dataCenter: "local"},
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1)}).withIdentity("0", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2)}).withIdentity("1", "local", ""),
+		(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3)}).withIdentity("2", "local", ""),
 	}
 	for _, h := range hosts {
 		h.setState(NodeUp)

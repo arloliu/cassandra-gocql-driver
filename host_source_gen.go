@@ -50,6 +50,13 @@ func main() {
 		if f.Type == mu {
 			continue
 		}
+		// atomic.Pointer and atomic.Int32 are structs, so the reflect.Struct arm
+		// below would emit a by-value copy of one.
+		// They are published by hand in HostInfo.update instead, and copying
+		// them is what go vet's copylocks check exists to catch.
+		if f.Type.PkgPath() == "sync/atomic" {
+			continue
+		}
 
 		switch f.Type.Kind() {
 		case reflect.Slice:
