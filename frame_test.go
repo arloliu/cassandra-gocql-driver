@@ -881,6 +881,12 @@ func TestFrameReadTypeInfo(t *testing.T) {
 	}
 }
 
+// BenchmarkFramerReadCol_Tuple measures the per-column decode cost of a tuple
+// type.
+// meta must be a real *resultMetadata: readCol's tuple branch writes
+// meta.actualColCount, so passing nil dereferences a nil pointer.
+// actualColCount is a running counter that affects neither decoding nor
+// allocation nor loop bounds, so it is deliberately not reset per iteration.
 func BenchmarkFramerReadCol_Tuple(b *testing.B) {
 	b.ReportAllocs()
 	framer := newFramer(nil, 4, GlobalTypes)
@@ -891,14 +897,21 @@ func BenchmarkFramerReadCol_Tuple(b *testing.B) {
 	framer.writeShort(uint16(TypeVarchar))
 	buf := framer.buf
 	var col ColumnInfo
+	meta := &resultMetadata{}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		framer.buf = buf
-		_ = framer.readCol(&col, nil, true, "", "")
+		if err := framer.readCol(&col, meta, true, "", ""); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
+// BenchmarkFramerReadCol_Set measures the per-column decode cost of a set
+// type.
+// It shares the tuple benchmark's contract: a real *resultMetadata, and a
+// checked error so that an early return cannot masquerade as a speed-up.
 func BenchmarkFramerReadCol_Set(b *testing.B) {
 	b.ReportAllocs()
 
@@ -908,11 +921,14 @@ func BenchmarkFramerReadCol_Set(b *testing.B) {
 	framer.writeShort(uint16(TypeInt))
 	buf := framer.buf
 	var col ColumnInfo
+	meta := &resultMetadata{}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		framer.buf = buf
-		_ = framer.readCol(&col, nil, true, "", "")
+		if err := framer.readCol(&col, meta, true, "", ""); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

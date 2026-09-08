@@ -1460,23 +1460,24 @@ func TestHostPolicy_TokenAware_Shuffle_CrossPolicyIndependence(t *testing.T) {
 	}
 }
 
-// benchmarkShufflePolicy builds a token-aware policy with shuffle enabled,
-// modelling a production-scale workload: 100 single-DC hosts with RF=5, so
-// each token has 5 replicas. The routing key is fixed so every Pick targets
-// the same 5-host replica set -- the steady-state hot path.
-func benchmarkShufflePolicy(b *testing.B) (HostSelectionPolicy, *internalQuery) {
+// benchmarkShufflePolicyWith builds a token-aware policy with shuffle enabled
+// over the given fallback, modelling a production-scale workload: 100 hosts
+// with RF=5, so each token has 5 replicas. hostFn builds host i; the routing
+// key is fixed so every Pick targets the same 5-host replica set -- the
+// steady-state hot path.
+//
+// The fallback decides how much of each HostInfo the classify loop reads:
+// RoundRobinHostPolicy never touches the host, DCAwareRoundRobinPolicy reads
+// DataCenter(), and RackAwareRoundRobinPolicy reads DataCenter() then Rack().
+func benchmarkShufflePolicyWith(b *testing.B, fallback HostSelectionPolicy, hostFn func(i int) *HostInfo) (HostSelectionPolicy, *internalQuery) {
 	b.Helper()
 	const (
 		numHosts = 100
 		rf       = 5
 	)
-	policy, query := setupShuffleTestPolicy(rf, RoundRobinHostPolicy(), ShuffleReplicas())
+	policy, query := setupShuffleTestPolicy(rf, fallback, ShuffleReplicas())
 	for i := 0; i < numHosts; i++ {
-		policy.AddHost(&HostInfo{
-			hostId:         fmt.Sprintf("%03d", i),
-			connectAddress: net.IPv4(10, 0, byte(i/256), byte(i%256)),
-			tokens:         []string{fmt.Sprintf("%03d", i)},
-		})
+		policy.AddHost(hostFn(i))
 	}
 	policy.SetPartitioner("OrderedPartitioner")
 	// Routing key "005" walks the ring from token "005", yielding 5 replicas
@@ -1485,12 +1486,43 @@ func benchmarkShufflePolicy(b *testing.B) (HostSelectionPolicy, *internalQuery) 
 	return policy, newInternalQuery(query, nil)
 }
 
+// benchmarkShuffleHost builds a host with no DC and no rack,
+// so it is only meaningful with RoundRobinHostPolicy,
+// whose IsLocal is unconditionally true and never reads the host:
+// that is what keeps all 5 replicas in tier 0.
+// A topology-aware fallback would classify these hosts as remote
+// (dcAwareRR.IsLocal compares "" against its local DC, rackAwareRR.HostTier
+// returns 2) -- use benchmarkShuffleTopologyHost there.
+func benchmarkShuffleHost(i int) *HostInfo {
+	return &HostInfo{
+		hostId:         fmt.Sprintf("%03d", i),
+		connectAddress: net.IPv4(10, 0, byte(i/256), byte(i%256)),
+		tokens:         []string{fmt.Sprintf("%03d", i)},
+	}
+}
+
+// benchmarkShuffleTopologyHost builds a host spread over 2 DCs x 2 racks,
+// roughly 25 hosts per combination: DC flips every 2 ring positions, rack
+// every 4.
+// For the fixed routing key the 5 replicas at indices 5..9 land in dc1/r2,
+// dc2/r2, dc2/r2, dc1/r1, dc1/r1 -- so against
+// RackAwareRoundRobinPolicy("dc1", "r1") all three tiers are exercised and
+// tier 0 holds more than one host (the rotation branch),
+// and against DCAwareRoundRobinPolicy("dc1") three replicas are local.
+// Spanning both DCs is what makes HostTier read rack as well as DC.
+func benchmarkShuffleTopologyHost(i int) *HostInfo {
+	h := benchmarkShuffleHost(i)
+	h.dataCenter = [...]string{"dc1", "dc2"}[(i/2)%2]
+	h.rack = [...]string{"r1", "r2"}[(i/4)%2]
+	return h
+}
+
 // BenchmarkTokenAwareHostPolicy_PickShuffleSerial measures per-Pick cost on a
 // single goroutine. Mostly captures allocation/classification overhead -- the
 // global RNG mutex from the prior implementation is uncontended here, so this
 // benchmark is the *least* favorable comparison for the lock-free rotation.
 func BenchmarkTokenAwareHostPolicy_PickShuffleSerial(b *testing.B) {
-	policy, iq := benchmarkShufflePolicy(b)
+	policy, iq := benchmarkShufflePolicyWith(b, RoundRobinHostPolicy(), benchmarkShuffleHost)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -1507,7 +1539,78 @@ func BenchmarkTokenAwareHostPolicy_PickShuffleSerial(b *testing.B) {
 // refactor targets: every concurrent query used to serialize on the global
 // mutRandr mutex inside shuffleHosts.
 func BenchmarkTokenAwareHostPolicy_PickShuffleParallel(b *testing.B) {
-	policy, iq := benchmarkShufflePolicy(b)
+	policy, iq := benchmarkShufflePolicyWith(b, RoundRobinHostPolicy(), benchmarkShuffleHost)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			iter := policy.Pick(iq)
+			iter()
+		}
+	})
+}
+
+// BenchmarkTokenAwareHostPolicy_PickShuffleRackAwareSerial measures per-Pick
+// cost when the fallback is rack-aware,
+// so the classify loop calls HostTier -- DataCenter() then Rack() -- on every
+// replica before IsUp().
+// This is the Pick shape most exposed to the HostInfo lock: three RLocks per
+// replica rather than one.
+func BenchmarkTokenAwareHostPolicy_PickShuffleRackAwareSerial(b *testing.B) {
+	policy, iq := benchmarkShufflePolicyWith(b, RackAwareRoundRobinPolicy("dc1", "r1"), benchmarkShuffleTopologyHost)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		iter := policy.Pick(iq)
+		if iter() == nil {
+			b.Fatal("unexpected nil host")
+		}
+	}
+}
+
+// BenchmarkTokenAwareHostPolicy_PickShuffleRackAwareParallel measures the same
+// rack-aware Pick under contention from GOMAXPROCS goroutines.
+// It is the primary before/after instrument for the identity snapshot: the two
+// independent RLocks inside HostTier should collapse to one lock-free Load.
+func BenchmarkTokenAwareHostPolicy_PickShuffleRackAwareParallel(b *testing.B) {
+	policy, iq := benchmarkShufflePolicyWith(b, RackAwareRoundRobinPolicy("dc1", "r1"), benchmarkShuffleTopologyHost)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			iter := policy.Pick(iq)
+			iter()
+		}
+	})
+}
+
+// BenchmarkTokenAwareHostPolicy_PickShuffleDCAwareSerial measures per-Pick
+// cost when the fallback is DC-aware,
+// so the classify loop calls IsLocal -- one DataCenter() read -- per replica.
+// It sits between the round-robin and rack-aware benchmarks and isolates the
+// cost of a single topology read.
+func BenchmarkTokenAwareHostPolicy_PickShuffleDCAwareSerial(b *testing.B) {
+	policy, iq := benchmarkShufflePolicyWith(b, DCAwareRoundRobinPolicy("dc1"), benchmarkShuffleTopologyHost)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		iter := policy.Pick(iq)
+		if iter() == nil {
+			b.Fatal("unexpected nil host")
+		}
+	}
+}
+
+// BenchmarkTokenAwareHostPolicy_PickShuffleDCAwareParallel measures the same
+// DC-aware Pick under contention from GOMAXPROCS goroutines,
+// where the shared DataCenter() RLock serializes every concurrent classify
+// loop on one cache line.
+func BenchmarkTokenAwareHostPolicy_PickShuffleDCAwareParallel(b *testing.B) {
+	policy, iq := benchmarkShufflePolicyWith(b, DCAwareRoundRobinPolicy("dc1"), benchmarkShuffleTopologyHost)
 
 	b.ReportAllocs()
 	b.ResetTimer()

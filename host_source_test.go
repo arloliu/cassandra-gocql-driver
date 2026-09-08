@@ -549,3 +549,94 @@ func TestErrorBroadcaster_StopWithoutBroadcast(t *testing.T) {
 		t.Errorf("%s", loadedVal.(error).Error())
 	}
 }
+
+// hostInfoBenchSink absorbs the results of the HostInfo accessor benchmarks so
+// the compiler cannot elide the calls being measured. Each parallel goroutine
+// accumulates locally and flushes once, because an atomic add inside the loop
+// would contend on its own cache line and swamp the HostInfo lock contention
+// these benchmarks exist to measure.
+var hostInfoBenchSink uint64
+
+// benchmarkHostInfo builds the single shared host every HostInfo accessor
+// benchmark reads. dataCenter/rack are the rack-aware policy's local DC and
+// rack so HostTier takes the tier-0 path, which is the only one that reads
+// both DataCenter() and Rack() -- two independent RLocks, the cost under test.
+func benchmarkHostInfo() *HostInfo {
+	return &HostInfo{
+		hostId:         "8d4e8b0a-1f6a-4c2e-9e4a-2b7c1d3f5a60",
+		dataCenter:     "dc1",
+		rack:           "r1",
+		connectAddress: net.IPv4(10, 0, 0, 1),
+	}
+}
+
+// hostInfoBenchCallsPerOp is the number of accessor calls one iteration makes.
+// A single query classifies RF=3 replicas and touches each of them twice on
+// the hot path (tier classification, then liveness), so six calls model one
+// query's worth of pressure on a single host's lock.
+const hostInfoBenchCallsPerOp = 6
+
+// BenchmarkHostInfo_IsUpParallel measures contended reads of HostInfo.state
+// through IsUp, the accessor the token-aware Pick classify loop calls once per
+// replica and queryExecutor.upPool calls again on the chosen host. It is the
+// direct before/after instrument for replacing the state RWMutex with an
+// atomic: every concurrent query today serializes on the same readerCount.
+func BenchmarkHostInfo_IsUpParallel(b *testing.B) {
+	h := benchmarkHostInfo()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var local uint64
+		for pb.Next() {
+			for i := 0; i < hostInfoBenchCallsPerOp; i++ {
+				if h.IsUp() {
+					local++
+				}
+			}
+		}
+		atomic.AddUint64(&hostInfoBenchSink, local)
+	})
+}
+
+// BenchmarkHostInfo_HostIDParallel measures contended reads of HostInfo.hostId.
+// This path is invisible to the Pick benchmarks: HostID is what
+// Conn.prepareStatement, Conn.executeQuery/executeBatch and
+// policyConnPool.getPool call to build a statement-cache key, so every
+// prepared execution takes this lock even on a warm cache.
+func BenchmarkHostInfo_HostIDParallel(b *testing.B) {
+	h := benchmarkHostInfo()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var local uint64
+		for pb.Next() {
+			for i := 0; i < hostInfoBenchCallsPerOp; i++ {
+				local += uint64(len(h.HostID()))
+			}
+		}
+		atomic.AddUint64(&hostInfoBenchSink, local)
+	})
+}
+
+// BenchmarkHostInfo_HostTierParallel measures contended reads of
+// HostInfo.dataCenter and .rack through rackAwareRR.HostTier, which takes two
+// independent RLocks per replica. It is the instrument for the identity
+// snapshot: one lock-free Load should replace both.
+func BenchmarkHostInfo_HostTierParallel(b *testing.B) {
+	h := benchmarkHostInfo()
+	tierer := RackAwareRoundRobinPolicy("dc1", "r1").(HostTierer)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var local uint64
+		for pb.Next() {
+			for i := 0; i < hostInfoBenchCallsPerOp; i++ {
+				local += uint64(tierer.HostTier(h))
+			}
+		}
+		atomic.AddUint64(&hostInfoBenchSink, local)
+	})
+}
