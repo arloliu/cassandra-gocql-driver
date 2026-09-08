@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -481,5 +482,124 @@ func TestDo_PanicInCallbackReleasesIter(t *testing.T) {
 
 			require.True(t, held.released(), "the held iter must have released its framer")
 		})
+	}
+}
+
+// stopRetryPolicy answers every attempt with one fixed retry type and counts the answers.
+//
+// The count is the discriminator the stop cases need: do returns the attempt's iterator
+// unchanged for several unrelated reasons - a successful attempt, a request that is not
+// idempotent, no retry policy at all - and every one of them looks like Rethrow from the
+// outside. A consulted count of one proves the hand-over came from the retry arm.
+// Attempt always permits another attempt for the same reason: a spent attempt budget stops
+// do at "step != retryStepAgain || attemptsReached" on its own, which would make the stop
+// unattributable to the retry type.
+type stopRetryPolicy struct {
+	retryType RetryType
+
+	// consulted counts the GetRetryType calls. do runs on the test's own goroutine here,
+	// so a plain int is enough.
+	consulted int
+}
+
+var _ RetryPolicy = (*stopRetryPolicy)(nil)
+
+// Attempt always permits another attempt.
+//
+// Returns:
+//   - bool: true
+func (p *stopRetryPolicy) Attempt(RetryableQuery) bool { return true }
+
+// GetRetryType returns the configured answer and counts the call.
+//
+// Returns:
+//   - RetryType: the configured retry type
+func (p *stopRetryPolicy) GetRetryType(error) RetryType {
+	p.consulted++
+	return p.retryType
+}
+
+// TestDo_StoppingRetryTypesHandOverTheAttemptIter proves the two retry answers that end the
+// loop without a further attempt - Ignore and Rethrow - hand the attempt's own iterator to
+// the caller, and that Ignore is the only one of the two that clears its error.
+//
+// The two arms are pinned together on purpose: they differ in exactly one production
+// statement (do's "iter.err = nil"), and asserting them side by side is what keeps that
+// statement from being mistaken for the shared hand-over.
+//
+// The iterator is not merely equal but the same object, still holding the framer the
+// attempt produced: an Ignore that closed or replaced it would hand the caller a released
+// framer, and nothing else would ever reclaim one it closed twice.
+func TestDo_StoppingRetryTypesHandOverTheAttemptIter(t *testing.T) {
+	// build wires one request kind to the retry policy and the scripted attempt.
+	type build func(rt RetryPolicy, iters []*heldIter) internalRequest
+
+	kinds := []struct {
+		name  string
+		build build
+	}{
+		{
+			name: "query",
+			build: func(rt RetryPolicy, iters []*heldIter) internalRequest {
+				return newScriptedQuery(rt, nil, iters)
+			},
+		},
+		{
+			name: "batch",
+			build: func(rt RetryPolicy, iters []*heldIter) internalRequest {
+				return newScriptedBatch(rt, nil, iters)
+			},
+		},
+	}
+
+	answers := []struct {
+		name      string
+		retryType RetryType
+		wantErr   error
+	}{
+		{name: "ignore", retryType: Ignore, wantErr: nil},
+		{name: "rethrow", retryType: Rethrow, wantErr: errScriptedAttempt},
+	}
+
+	for _, kind := range kinds {
+		for _, answer := range answers {
+			t.Run(kind.name+" "+answer.name, func(t *testing.T) {
+				fixture := newDoFixture()
+				held := newHeldIter(errScriptedAttempt)
+				rt := &stopRetryPolicy{retryType: answer.retryType}
+				req := kind.build(rt, []*heldIter{held})
+
+				// The raw iterator calls are counted rather than the selections, because
+				// the move these two arms must not make - planRetry's sel.advance and
+				// sel.draw - is a raw call whose result the selector may well discard.
+				var draws atomic.Int32
+				sel := &hostSelector{iter: scriptedIterator([]*HostInfo{fixture.host}, &draws)}
+
+				result := fixture.executor.do(context.Background(), req, sel)
+
+				require.Equal(t, 1, rt.consulted, "the retry policy must have decided this hand-over")
+				require.Equal(t, 1, req.Attempts(), "the answer must have stopped do after one attempt")
+				require.Equal(t, int32(1), draws.Load(), "neither answer may move the selection on")
+
+				require.Same(t, held.iter, result, "the caller receives the attempt's own iterator")
+				if answer.wantErr == nil {
+					require.NoError(t, result.err, "Ignore clears the attempt's error")
+				} else {
+					require.ErrorIs(t, result.err, answer.wantErr, "Rethrow keeps the attempt's error")
+				}
+				require.Same(t, fixture.host, result.Host(), "the iterator carries the host it ran on")
+
+				require.False(t, held.released(), "the iterator handed to the caller keeps its framer")
+				require.NotNil(t, result.framer, "the iterator handed to the caller keeps its framer")
+
+				// Closing is the caller's, and it is what returns the framer to the pool.
+				if answer.wantErr == nil {
+					require.NoError(t, result.Close(), "a cleared error stays cleared")
+				} else {
+					require.ErrorIs(t, result.Close(), answer.wantErr)
+				}
+				require.True(t, held.released(), "the caller's Close releases the framer")
+			})
+		}
 	}
 }

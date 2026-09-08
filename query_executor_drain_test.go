@@ -952,3 +952,169 @@ func TestSpeculative_NegativeAttemptsIsTreatedAsZero(t *testing.T) {
 		})
 	}
 }
+
+// hostPanicObserver is a QueryObserver that panics for the attempts made against one host.
+//
+// It is the cheapest way to make q.do panic inside one speculative runner and only that
+// one: the observation runs on the runner's own goroutine, inside attemptQuery, and the
+// host it reports is the host that runner drew.
+// A panicking RetryPolicy would not do - it is consulted only for a failed attempt, and
+// the fixture servers answer successfully.
+type hostPanicObserver struct {
+	// ip is the connect address of the host whose attempts panic.
+	ip string
+	// value is the panic value raised.
+	value any
+}
+
+var _ QueryObserver = hostPanicObserver{}
+
+// ObserveQuery panics for the attempts made against the chosen host.
+func (o hostPanicObserver) ObserveQuery(_ context.Context, q ObservedQuery) {
+	if q.Host != nil && hostIP(q.Host) == o.ip {
+		panic(o.value)
+	}
+}
+
+// TestSpeculative_PanickingRunnerStillPublishes proves a runner whose q.do panics still
+// publishes exactly one terminal message, and that coordinate's accounting is unharmed by
+// it.
+//
+// The publication is the plain send inside run's recoverGoroutine teardown. Without it the
+// panicking runner would go silent: coordinate has no ticker left after its single launch,
+// so it would sit on the query context - which defaults to context.Background() in
+// production - and the drain accounting would wait for a message that never comes.
+//
+// The panicking runner is the second one to draw, so the first runner is holding a
+// publication when the panic decides the query. That leaves the two halves observable
+// separately: the caller receives the panic as an error, and the runner nobody read is
+// still drained.
+func TestSpeculative_PanickingRunnerStillPublishes(t *testing.T) {
+	baseline := drainGoroutines()
+	harness := newFillHarness(t, 2, nil)
+	harness.session.executor.policy = &scriptedIterPolicy{
+		HostSelectionPolicy: harness.session.executor.policy,
+		script:              [][]*HostInfo{{harness.hosts[0], harness.hosts[1]}},
+	}
+
+	seam := newDrainSeam()
+	t.Cleanup(seam.releaseAll)
+	harness.session.executor.testBeforeDrainClose = seam.hook
+	consumes := newConsumeRecorder()
+	harness.session.executor.testAfterConsume = consumes.hook
+
+	stages := newRunStageRecorder()
+	entered := stages.gate(runEntered)
+	t.Cleanup(releaseStageGate(entered))
+	holds := newPublicationHolds(1)
+	t.Cleanup(holds.releaseAll)
+	harness.session.executor.testRunHook = holds.wrap(stages.hook)
+
+	value := callbackPanic{where: "speculative runner"}
+	qry := harness.session.Query("void").WithContext(t.Context()).
+		Observer(hostPanicObserver{ip: hostIP(harness.hosts[1]), value: value})
+	speculative(1, speculativeTick)(qry)
+	result := execAsync(qry)
+
+	// The first runner draws the host whose attempts are observed normally and holds its
+	// result; the second draws the host the observer panics on, so the only message
+	// coordinate can consume is the one run's teardown publishes.
+	stages.await(t, runEntered, "the main runner to start")
+	entered <- struct{}{}
+	stages.await(t, runResult, "the main runner to reach publication")
+	stages.await(t, runEntered, "the speculative runner to start")
+	entered <- struct{}{}
+
+	err := awaitQuery(t, result)
+	require.ErrorContains(t, err, "gocql: panic in goroutine queryExecutor.run",
+		"the caller receives the panic recoverGoroutine converted")
+	require.ErrorContains(t, err, "speculative runner", "the error carries the original panic value")
+
+	require.Equal(t, 2, stages.count(runEntered), "two runners were launched")
+	require.Equal(t, 1, consumes.count(), "coordinate consumed the panicking runner's message and no other")
+
+	// launched 2 - consumed 1 = 1 outstanding: the runner still holding its publication.
+	awaitDrainGoroutines(t, baseline+1, "the drain to wait for the held publication")
+	require.Equal(t, 0, seam.count(), "nothing can have been drained yet")
+
+	holds.releaseAll()
+	late := seam.await(t, "the drain to reach the held publication")
+	require.NotNil(t, late.framer, "the held iterator must still carry its response framer")
+	seam.releaseAll()
+
+	awaitDrainGoroutines(t, baseline, "the drain to finish")
+	awaitRunnersExited(t, stages, 2)
+	require.Equal(t, 1, seam.count(), "the one outstanding iterator was processed")
+}
+
+// TestSpeculative_LateNoHostReportIsDrained proves the drain consumes a no-host report that
+// arrives after coordinate returned with the winner.
+//
+// It is the noHost arm of the drain's select, and the shape is what makes the arm
+// attributable: every message left outstanding is a no-host report, so the drain has
+// nothing to close and only ends if it took that message off the second channel.
+// The counts say who took it. testAfterConsume runs on the coordinate goroutine and the
+// drain deliberately does not report there, so a consumed count that stays where it stood
+// when the query returned means the drain, and not coordinate, consumed the late report.
+//
+// One host and three runners is the only shape that leaves a pure no-host outstanding: the
+// shared selector hands its single host to the first runner and reports exhaustion to the
+// other two, and coordinate consumes one of those reports before the winner.
+func TestSpeculative_LateNoHostReportIsDrained(t *testing.T) {
+	baseline := drainGoroutines()
+	harness := newFillHarness(t, 1, nil)
+
+	seam := newDrainSeam()
+	seam.releaseAll()
+	harness.session.executor.testBeforeDrainClose = seam.hook
+	consumes := newConsumeRecorder()
+	harness.session.executor.testAfterConsume = consumes.hook
+
+	stages := newRunStageRecorder()
+	entered := stages.gate(runEntered)
+	t.Cleanup(releaseStageGate(entered))
+	// The no-host gate is the hold for a report: the checkpoint sits immediately before
+	// the send, so a runner parked there has not published.
+	reported := stages.gate(runNoHost)
+	t.Cleanup(releaseStageGate(reported))
+	holds := newPublicationHolds(1)
+	t.Cleanup(holds.releaseAll)
+	harness.session.executor.testRunHook = holds.wrap(stages.hook)
+
+	qry := harness.session.Query("void").WithContext(t.Context())
+	speculative(2, speculativeTick)(qry)
+	result := execAsync(qry)
+
+	// The first runner takes the only host and holds its result; the other two find the
+	// shared enumeration spent and hold their no-host reports.
+	stages.await(t, runEntered, "the main runner to start")
+	entered <- struct{}{}
+	stages.await(t, runResult, "the main runner to reach publication")
+	for i := range 2 {
+		stages.await(t, runEntered, fmt.Sprintf("speculative runner %d to start", i+1))
+		entered <- struct{}{}
+		stages.await(t, runNoHost, fmt.Sprintf("speculative runner %d to reach its no-host report", i+1))
+	}
+
+	// One report is released and counted before the winner, so the history coordinate
+	// leaves behind is a consumed report followed by a consumed result - and one report
+	// still unsent.
+	reported <- struct{}{}
+	consumes.await(t, 1, "coordinate to consume the first no-host report")
+
+	holds.releaseAll()
+	require.NoError(t, awaitQuery(t, result), "the main runner's result wins")
+
+	require.Equal(t, 3, stages.count(runEntered), "three runners were launched")
+	require.Equal(t, 2, consumes.count(), "coordinate consumed the first report and the winner")
+
+	// launched 3 - consumed 2 = 1 outstanding, and it is a no-host report.
+	awaitDrainGoroutines(t, baseline+1, "the drain to wait for the held no-host report")
+
+	reported <- struct{}{}
+	awaitDrainGoroutines(t, baseline, "the drain to consume the late no-host report and finish")
+
+	awaitRunnersExited(t, stages, 3)
+	require.Equal(t, 0, seam.count(), "a no-host report carries no iterator, so the drain closed nothing")
+	require.Equal(t, 2, consumes.count(), "the drain, not coordinate, took the late report")
+}
