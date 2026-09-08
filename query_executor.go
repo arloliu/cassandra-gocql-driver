@@ -266,13 +266,47 @@ type queryExecutor struct {
 	testAfterSnapshot func()
 }
 
+// closeIfHeld closes iter when the frame that produced it is still holding it.
+//
+// It is the cleanup half of the ownership discipline in attemptQuery and do:
+// the holder clears its owned reference at the hand-over, so a non-nil iter here means
+// the frame is unwinding — a user callback panicked — with an iterator nobody receives.
+// Closing it returns the response framer to the pool;
+// these iterators never carry a leak detector, so nothing else would ever reclaim them.
+//
+// Parameters:
+//   - iter: the held iterator, or nil once it was handed over
+func closeIfHeld(iter *Iter) {
+	if iter != nil {
+		iter.Close()
+	}
+}
+
+// attemptQuery runs one attempt of qry on conn and reports it to the request's observer.
+//
+// The observer is user code that runs while this frame owns the iterator,
+// so the iterator is closed if it panics; on a normal return it is the caller's.
+// This is a pure cleanup defer: it does not recover, so a panic reaches do
+// and the synchronous caller of do unchanged.
+//
+// Parameters:
+//   - ctx: cancels the attempt
+//   - qry: the statement to run
+//   - conn: the connection to run it on
+//
+// Returns:
+//   - *Iter: the attempt's iterator, owned by the caller
 func (q *queryExecutor) attemptQuery(ctx context.Context, qry internalRequest, conn *Conn) *Iter {
 	start := time.Now()
 	iter := qry.execute(ctx, conn)
 	end := time.Now()
 
+	owned := iter
+	defer func() { closeIfHeld(owned) }()
+
 	qry.attempt(q.pool.keyspace, end, start, iter, conn.host)
 
+	owned = nil
 	return iter
 }
 
@@ -441,6 +475,23 @@ func (q *queryExecutor) pooledUp(host *HostInfo) bool {
 // do runs qry against the hosts sel hands out, applying the retry policy between
 // attempts.
 //
+// Ownership of every iterator an attempt produces, one row per way out of the loop:
+//
+//   - an attempt returns: do takes ownership from attemptQuery
+//   - ctx cancelled / ErrNotFound: handed to the caller
+//   - success, or not idempotent, or no retry policy: handed to the caller
+//   - unknown retry type: closed here, the caller gets a fresh ErrUnknownRetryType iter
+//   - retries stopped or the attempt budget reached: handed to the caller
+//   - the retry loop goes round again: closed here, only its error is kept in lastErr
+//   - the loop ends on lastErr or ErrNoConnections: no iterator is held, the round that
+//     produced lastErr already closed its own
+//   - awaitFill fails: no iterator is held
+//
+// The hosts' Mark and the retry policy's Attempt and GetRetryType are user code that
+// runs while do owns an iterator, so a panic out of them closes it.
+// This is a pure cleanup defer: it does not recover, so the synchronous caller in
+// executeQuery still sees the original panic value.
+//
 // Parameters:
 //   - ctx: cancels the execution
 //   - qry: the statement to run
@@ -455,6 +506,9 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 
 	var lastErr error
 	var iter *Iter
+	// owned is the iterator this frame holds and has not handed over yet.
+	var owned *Iter
+	defer func() { closeIfHeld(owned) }()
 	// cands stays nil until a host's pool is found empty with a fill in flight.
 	var cands []fillCandidate
 	for {
@@ -486,6 +540,8 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 			iter = q.attemptQuery(ctx, qry, conn)
 		}
 
+		owned = iter
+
 		iter.host = selectedHost.Info()
 		// Update host
 		switch iter.err {
@@ -493,6 +549,7 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 			// those errors represents logical errors, they should not count
 			// toward removing a node from the pool
 			selectedHost.Mark(nil)
+			owned = nil
 			return iter
 		default:
 			selectedHost.Mark(iter.err)
@@ -501,6 +558,7 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 		// Exit if the query was successful
 		// or query is not idempotent or no retry policy defined
 		if iter.err == nil || !qry.IsIdempotent() || rt == nil {
+			owned = nil
 			return iter
 		}
 
@@ -529,14 +587,19 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 			stopRetries = true
 		default:
 			// Undefined? Return nil and error, this will panic in the requester
+			iter.Close()
+			owned = nil
 			return newErrIter(ErrUnknownRetryType, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
 		}
 
 		if stopRetries || attemptsReached {
+			owned = nil
 			return iter
 		}
 
 		lastErr = iter.err
+		iter.Close()
+		owned = nil
 		continue
 	}
 
