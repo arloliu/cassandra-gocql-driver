@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.2-otter] - 2026-09-08
+
+Speculative execution, and the iterator ownership around it. Each speculative runner now
+works on its own copy of the request, so a retry policy lowering one runner's consistency
+no longer decides what the winner's next page asks for, and every iterator an execution
+produced but never handed to the caller is closed, returning its response buffer to the
+pool. Two of the changes are not specific to speculative execution: the retry loop and the
+callback-panic cleanup run for every query and batch, and the next page of every paged
+query is now built field by field. None of them changes a return value. No new exported
+API and no exported symbol changes meaning, so this is a patch release.
+
+### Fixed
+
+- **A sibling's downgraded consistency leaked into the winner's next page.** Every runner of
+  a speculative execution was handed the same internal request, so
+  `DowngradingConsistencyRetryPolicy` lowering one runner's consistency lowered it for all of
+  them, and the winner's next-page request was built from the lowered value a moment later.
+  The same shared field was also read as a plain whole-struct copy while a sibling wrote it
+  atomically, which `-race` reports. Each runner now receives a field-by-field snapshot whose
+  consistency is read atomically, and the next page is built the same way. The attempt
+  budget is unchanged: every runner and every retry within a page execution still count
+  against one shared completed-attempt count, which resets per page and was never an
+  admission cap on requests in flight.
+
+  **Upgrading:** the object a `HostSelectionPolicy` receives is still the original request,
+  but the object a `RetryPolicy`'s `Attempt` receives is now that runner's snapshot, and
+  different runners receive different snapshots. A custom policy that keeps the argument
+  across calls and keys state on its identity, or expects a `SetConsistency` on one runner to
+  be visible from another, will see the difference. Neither behaviour was documented; the
+  second is the leak this release fixes. A `QueryObserver` still receives the original
+  public `Query` or `Batch`.
+
+- **Iterators nobody received were never closed.** The iterators of the runners that lost a
+  speculative race, the iterator a retry loop replaced before going round again, the one
+  replaced by `ErrUnknownRetryType`, and any iterator held while an observer, `Mark`,
+  `Attempt` or `GetRetryType` callback panicked were all dropped with their response framer
+  still attached. Those iterators never reached a caller, so the GC-time leak detector never
+  saw them either. Each is now closed at the point its owner gives it up, and the
+  coordinator drains the results of runners that finish after it has returned. A panic in a
+  callback still propagates with its original value; only the cleanup was added.
+
+  The retry-loop and callback cases apply to every query and batch, speculative or not. The
+  drain is speculative-only: a speculative query that returns before its losing runners have
+  published now leaves one goroutine behind until they do. A runner that never publishes --
+  a callback that ends it with `runtime.Goexit`, or a panic inside the driver's own panic
+  teardown -- was already a leaked goroutine before this release; the drain waiting on it is
+  one more.
+
+- **A speculative runner could drop its result on the way out.** Publishing a result and
+  noticing the execution had been cancelled were both ready at the same moment, and the
+  runtime picked one at random, so a runner that finished just as the winner cancelled the
+  rest could discard an iterator -- with its framer -- instead of handing it to the drain.
+  Results are now published unconditionally; the channels are sized so that can never block.
+
+- **`SpeculativeExecutionPolicy.Attempts()` returning a negative value is now treated as
+  zero** instead of sizing the coordination channels below the number of runners; `-2` and
+  below previously panicked in `make`.
+
 ## [2.6.1-otter] - 2026-09-07
 
 Request termination. A cancelled or timed-out request now always gives its stream back once
