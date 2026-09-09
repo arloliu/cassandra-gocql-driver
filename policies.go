@@ -1226,8 +1226,8 @@ func (e *ExponentialReconnectionPolicy) GetMaxRetries() int {
 //
 // Attempts is the number of runs launched in addition to the main one.
 // A negative value is treated as zero: the query runs once, with no speculative launch.
-// Delay is only read when Attempts is positive, and must be positive itself,
-// because it drives a ticker.
+// Delay is only read when Attempts is positive; a non-positive value means
+// the speculative executions launch immediately.
 type SpeculativeExecutionPolicy interface {
 	Attempts() int
 	Delay() time.Duration

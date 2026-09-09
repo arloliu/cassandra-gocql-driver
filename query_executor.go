@@ -460,7 +460,13 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 
 	var tick <-chan time.Time
 	if remaining > 0 {
-		ticker := time.NewTicker(sp.Delay())
+		// A non-positive delay means "launch immediately"; NewTicker requires a
+		// positive interval, so clamp to the smallest one.
+		delay := sp.Delay()
+		if delay <= 0 {
+			delay = time.Nanosecond
+		}
+		ticker := time.NewTicker(delay)
 		defer ticker.Stop()
 		tick = ticker.C
 	}
