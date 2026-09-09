@@ -63,6 +63,10 @@ type heldIter struct {
 
 // newHeldIter returns an iterator carrying an oversized framer and failing with err.
 //
+// The framer always carries a header, empty though it is: Iter.Warnings reads through
+// framer.header without a nil check, so a fixture without one cannot be asked for its
+// response metadata at all.
+//
 // Parameters:
 //   - err: the error the iterator reports
 //
@@ -70,8 +74,32 @@ type heldIter struct {
 //   - *heldIter: the iterator and the framer state to assert against
 func newHeldIter(err error) *heldIter {
 	buf := make([]byte, maxPooledBufSize+1)
-	f := &framer{buf: buf[:0], readBuffer: buf}
+	f := &framer{buf: buf[:0], readBuffer: buf, header: &frameHeader{}}
 	return &heldIter{iter: &Iter{framer: f, err: err}, framer: f, buf: buf}
+}
+
+// withWarnings puts warnings on the iterator's response, the way a v4 warning flag does.
+//
+// Parameters:
+//   - warnings: the warnings Iter.Warnings must report
+//
+// Returns:
+//   - *heldIter: the receiver, for chaining
+func (h *heldIter) withWarnings(warnings []string) *heldIter {
+	h.framer.header.warnings = warnings
+	return h
+}
+
+// withCustomPayload puts a custom payload on the iterator's response.
+//
+// Parameters:
+//   - payload: the payload Iter.GetCustomPayload must report
+//
+// Returns:
+//   - *heldIter: the receiver, for chaining
+func (h *heldIter) withCustomPayload(payload map[string][]byte) *heldIter {
+	h.framer.customPayload = payload
+	return h
 }
 
 // released reports whether the framer went through framer.release().
@@ -138,6 +166,7 @@ func newScriptedQuery(rt RetryPolicy, observer QueryObserver, iters []*heldIter)
 func (q *scriptedQuery) execute(context.Context, *Conn) *Iter {
 	iter := scriptedIter(q.iters, q.served)
 	q.served++
+	iter.metrics = q.getQueryMetrics()
 	return iter
 }
 
@@ -179,6 +208,7 @@ func newScriptedBatch(rt RetryPolicy, observer BatchObserver, iters []*heldIter)
 func (b *scriptedBatch) execute(context.Context, *Conn) *Iter {
 	iter := scriptedIter(b.iters, b.served)
 	b.served++
+	iter.metrics = b.getQueryMetrics()
 	return iter
 }
 

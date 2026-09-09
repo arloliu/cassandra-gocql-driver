@@ -579,11 +579,25 @@ func (q *queryExecutor) pooledUp(host *HostInfo) bool {
 //   - the loop ends on lastErr or ErrNoConnections: no iterator is held, the round that
 //     produced lastErr already closed its own
 //   - awaitFill fails: no iterator is held
+//   - a checkpoint sees ctx cancelled: this attempt's iterator is handed to the caller,
+//     carrying the context's error in place of the attempt's own
 //
 // The hosts' Mark and the retry policy's Attempt and GetRetryType are user code that
 // runs while do owns an iterator, so a panic out of them closes it.
 // This is a pure cleanup defer: it does not recover, so the synchronous caller in
 // executeQuery still sees the original panic value.
+//
+// Once ctx is cancelled, do stops consulting the retry policy.
+// Three checkpoints straddle the two policy callbacks - before Attempt, between Attempt
+// and GetRetryType, and after GetRetryType - and the first one to see a cancelled ctx
+// ends the execution: no further callback runs, no further host is drawn, and no further
+// attempt is sent.
+// The guarantee reaches exactly that far.
+// A callback already running is not interrupted,
+// and a cancellation that lands after the last checkpoint still finds the loop going
+// round.
+// The checkpoints sit after the success, non-idempotent and no-policy exits, so an
+// attempt that succeeded still returns its result even under a cancelled ctx.
 //
 // Parameters:
 //   - ctx: cancels the execution
@@ -602,6 +616,19 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 	// owned is the iterator this frame holds and has not handed over yet.
 	var owned *Iter
 	defer func() { closeIfHeld(owned) }()
+	// cancelled ends the execution at a checkpoint: the attempt's own iterator goes to
+	// the caller with the context's error in place of the attempt's, so the host, the
+	// framer and the metrics the attempt gathered stay observable and the framer is
+	// still returned by the caller's Close.
+	// The error is stored bare, so callers can compare it against context.Canceled and
+	// context.DeadlineExceeded by identity the way every other exit from do allows.
+	// Mark is deliberately not called again: the attempt's own error was marked when it
+	// came back, and the cancellation says nothing about the host.
+	cancelled := func(iter *Iter, err error) *Iter {
+		iter.err = err
+		owned = nil
+		return iter
+	}
 	// cands stays nil until a host's pool is found empty with a fill in flight.
 	var cands []fillCandidate
 	for {
@@ -656,8 +683,18 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 		}
 
 		// If query is unsuccessful, check the error with RetryPolicy to retry
+		if err := ctx.Err(); err != nil {
+			return cancelled(iter, err)
+		}
 		attemptsReached := !rt.Attempt(qry)
-		next, step := planRetry(rt.GetRetryType(iter.err), sel, selectedHost, attemptsReached)
+		if err := ctx.Err(); err != nil {
+			return cancelled(iter, err)
+		}
+		retryType := rt.GetRetryType(iter.err)
+		if err := ctx.Err(); err != nil {
+			return cancelled(iter, err)
+		}
+		next, step := planRetry(retryType, sel, selectedHost, attemptsReached)
 
 		if step == retryStepUnknown {
 			// Undefined? Return nil and error, this will panic in the requester
