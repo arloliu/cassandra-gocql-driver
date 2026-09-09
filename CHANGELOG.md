@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1-otter] - 2026-09-09
+
+Patch release from the v2.7.0-otter verification pass: one long-standing panic fixed, the
+package documentation brought in line with the code, and one more ownership test. No
+exported symbol or documented rule changes.
+
+### Fixed
+
+- **A non-positive speculative delay panicked the caller.** `coordinate` handed
+  `SpeculativeExecutionPolicy.Delay()` straight to `time.NewTicker`, so a
+  `SimpleSpeculativeExecution` with `TimeoutDelay: 0`, or any policy answering zero or less,
+  panicked the caller's goroutine with `non-positive interval for NewTicker` once the main
+  runner had been launched. Pre-existing: reproduced against a live cluster on v2.6.3-otter
+  and v2.7.0-otter. A non-positive delay is now
+  clamped to one nanosecond, the value `NonSpeculativeExecution.Delay()` already returns,
+  so the speculative executions start right away. The launch count is still bounded by
+  `Attempts()`.
+
+### Documentation
+
+- The speculative-execution paragraph in the package documentation now says that an error
+  the `RetryPolicy` answers with `Ignore` makes the query succeed with no error, that an
+  attempt ending in `ErrNotFound` and a connection wait ending in `ErrSessionClosed` decide
+  the query too, and that a caller cancellation arriving as the last launched execution
+  retires returns the context error rather than that execution's.
+- `SpeculativeExecutionPolicy.Delay()` documents the non-positive case.
+
+### Internal
+
+- `TestExecuteQuery_SingleExecutionHandsOverLiveFramer` pins that the non-speculative
+  dispatch hands the caller the last attempt's own iterator with a live framer that `Close`
+  releases; the v2.7.0-otter unit coverage had only reached that exit indirectly.
+- The `runRetired` stage's test messages and comments no longer call it a no-host report.
+- Verification of v2.7.0-otter (this branch's evidence directory): exported API byte-identical
+  to v2.6.3-otter; `make test-cassandra` at protocol v5 158/0/8 and at protocol v4 150/0/16
+  against Cassandra 4.1.6; a live before/after e2e confirming the cancellable backoff and
+  the `Host()` preservation; interleaved benchmarks putting `BenchmarkDo_*` within +2% and
+  `BenchmarkCoordinate_MainWins` at +1 alloc/op, +66 B/op, time neutral.
+
 ## [2.7.0-otter] - 2026-09-09
 
 Speculative execution no longer fails faster than a plain query, and a cancelled query no
