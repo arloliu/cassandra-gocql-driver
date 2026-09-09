@@ -762,11 +762,22 @@
 //
 // Idempotent queries are retried in case of errors based on the configured RetryPolicy.
 //
-// Queries can be retried even before they fail by setting a SpeculativeExecutionPolicy. The policy can
-// cause the driver to retry on a different node if the query is taking longer than a specified delay even before the
-// driver receives an error or timeout from the server. When a query is speculatively executed, the original execution
-// is still executing. The two parallel executions of the query race to return a result, the first received result will
-// be returned.
+// Queries can be retried even before they fail by setting a SpeculativeExecutionPolicy.
+// The policy can cause the driver to retry on a different node if the query is taking longer than a specified delay
+// even before the driver receives an error or timeout from the server.
+// When a query is speculatively executed, the original execution is still executing.
+// The executions race: the first decisive outcome is returned
+// — a successful result, an error the RetryPolicy answers with Ignore or Rethrow,
+// an error no retry can follow (no RetryPolicy, an unknown retry type, a panicking callback),
+// or a cancellation.
+// An execution that fails with a retryable error but can make no further attempt,
+// because its RetryPolicy refused one or no further host is available,
+// does not end the query while a sibling execution is still running;
+// it waits.
+// Only when every execution that was started has ended that way is one of their errors returned:
+// an error from an execution that reached a host is preferred over ErrNoConnections from one that did not,
+// and among errors of the same kind the one the driver processed last wins.
+// Executions not yet started when the last one ends are not waited for.
 //
 // # User-defined types
 //

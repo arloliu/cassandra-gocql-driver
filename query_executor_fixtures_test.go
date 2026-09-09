@@ -41,12 +41,22 @@ import (
 type requestGate struct {
 	mu    sync.Mutex
 	armed map[string]bool
+	// startedAt receives one token per parked request at that host, before it parks.
+	//
+	// Per host rather than aggregate because it is the evidence that a particular
+	// runner reached a particular host: the attemptRecorder only records once execute
+	// has returned, which is after the response, so it cannot witness a request in
+	// flight.
+	startedAt map[string]chan struct{}
+	// releases is closed per host by release, letting that host's requests through.
+	releases map[string]chan struct{}
+	onces    map[string]*sync.Once
 
-	// started receives one token per parked request, before it parks.
+	// started receives one token per parked request at any host, before it parks.
 	started chan struct{}
-	// release is closed to let every parked and future request through.
-	release chan struct{}
-	once    sync.Once
+	// allRelease is closed to let every parked and future request through.
+	allRelease chan struct{}
+	once       sync.Once
 }
 
 // newRequestGate returns a gate with no host armed.
@@ -55,27 +65,39 @@ type requestGate struct {
 //   - *requestGate: the gate
 func newRequestGate() *requestGate {
 	return &requestGate{
-		armed:   map[string]bool{},
-		started: make(chan struct{}, 64),
-		release: make(chan struct{}),
+		armed:      map[string]bool{},
+		startedAt:  map[string]chan struct{}{},
+		releases:   map[string]chan struct{}{},
+		onces:      map[string]*sync.Once{},
+		started:    make(chan struct{}, 64),
+		allRelease: make(chan struct{}),
 	}
 }
 
-// arm parks every later QUERY request that reaches the server at ip.
+// arm parks every later QUERY or BATCH request that reaches the server at ip.
 func (g *requestGate) arm(ip string) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
+
 	g.armed[ip] = true
-	g.mu.Unlock()
+	if _, ok := g.releases[ip]; !ok {
+		g.releases[ip] = make(chan struct{})
+		g.onces[ip] = &sync.Once{}
+	}
+	if _, ok := g.startedAt[ip]; !ok {
+		g.startedAt[ip] = make(chan struct{}, 64)
+	}
 }
 
 // hook is the fillHarnessOpts.recvHook.
 func (g *requestGate) hook(ip string, f *framer) {
-	if f.header == nil || f.header.op != opQuery {
+	if f.header == nil || (f.header.op != opQuery && f.header.op != opBatch) {
 		return
 	}
 
 	g.mu.Lock()
 	armed := g.armed[ip]
+	perHost, started := g.releases[ip], g.startedAt[ip]
 	g.mu.Unlock()
 	if !armed {
 		return
@@ -85,7 +107,15 @@ func (g *requestGate) hook(ip string, f *framer) {
 	case g.started <- struct{}{}:
 	default:
 	}
-	<-g.release
+	select {
+	case started <- struct{}{}:
+	default:
+	}
+
+	select {
+	case <-g.allRelease:
+	case <-perHost:
+	}
 }
 
 // awaitStarted blocks until one gated request has parked.
@@ -94,9 +124,151 @@ func (g *requestGate) awaitStarted(t *testing.T, what string) {
 	awaitSignal(t, g.started, what)
 }
 
+// awaitStartedAt blocks until one gated request has parked at the server at ip.
+func (g *requestGate) awaitStartedAt(t *testing.T, ip string, what string) {
+	t.Helper()
+
+	g.mu.Lock()
+	started := g.startedAt[ip]
+	g.mu.Unlock()
+	require.NotNil(t, started, "the gate must be armed for %s before a request there can be awaited", ip)
+	awaitSignal(t, started, what)
+}
+
+// release lets every parked and future request at the server at ip through.
+func (g *requestGate) release(ip string) {
+	g.mu.Lock()
+	perHost, once := g.releases[ip], g.onces[ip]
+	g.mu.Unlock()
+
+	if once != nil {
+		once.Do(func() { close(perHost) })
+	}
+}
+
 // releaseAll lets every parked and future request through.
 func (g *requestGate) releaseAll() {
-	g.once.Do(func() { close(g.release) })
+	g.once.Do(func() { close(g.allRelease) })
+}
+
+// errorRespHook returns a fillHarnessOpts.respHook answering every QUERY and BATCH
+// reaching a server in hosts with a server error carrying the given metadata.
+//
+// The warnings and the custom payload are what make the error iterator distinguishable
+// from a synthetic one, and the payload is also where an oversized response comes from:
+// writeString is length-prefixed with 16 bits, so the message cannot carry enough bytes
+// to outgrow a pooled buffer, while a custom payload value can.
+// Its protocol must therefore be pinned to v4, as the oversized fixtures are: the v5
+// segment encoder rejects a payload of that size.
+//
+// Parameters:
+//   - hosts: the servers that must answer with the error
+//   - code: the CQL error code
+//   - msg: the error message
+//   - warnings: the warnings the response carries, or nil
+//   - payload: the custom payload the response carries, or nil
+//
+// Returns:
+//   - func(string, *TestServer, *framer, *framer) bool: the response hook
+func errorRespHook(hosts *hostSet, code int32, msg string, warnings []string,
+	payload map[string][]byte,
+) func(string, *TestServer, *framer, *framer) bool {
+	return func(ip string, _ *TestServer, req, resp *framer) bool {
+		if req.header == nil || !hosts.has(ip) {
+			return false
+		}
+		if req.header.op != opQuery && req.header.op != opBatch {
+			return false
+		}
+
+		var flags byte
+		if len(warnings) > 0 {
+			flags |= flagWarning
+		}
+		if len(payload) > 0 {
+			flags |= flagCustomPayload
+		}
+		resp.writeHeader(flags, opError, req.header.stream)
+		// The order the response body is parsed in: warnings, then payload, then the
+		// error itself.
+		if len(warnings) > 0 {
+			resp.writeStringList(warnings)
+		}
+		if len(payload) > 0 {
+			resp.writeBytesMap(payload)
+		}
+		resp.writeInt(code)
+		resp.writeString(msg)
+		return true
+	}
+}
+
+// oversizedPayload returns a custom payload whose one value outgrows any pooled buffer.
+//
+// Returns:
+//   - map[string][]byte: the payload
+func oversizedPayload() map[string][]byte {
+	return map[string][]byte{"gocql_test": make([]byte, maxPooledBufSize+1)}
+}
+
+// ctxRecordingPolicy records the context a RetryPolicy sees through RetryableQuery and
+// then delegates.
+//
+// The context is read inside Attempt, which is where a backoff policy would read it, and
+// entered is signalled from there too: a test that waits on it knows the delegate is
+// already inside its nap.
+type ctxRecordingPolicy struct {
+	inner RetryPolicy
+	// entered receives one token as each Attempt records, before it delegates.
+	entered chan struct{}
+
+	mu   sync.Mutex
+	ctxs []context.Context
+}
+
+var _ RetryPolicy = (*ctxRecordingPolicy)(nil)
+
+// newCtxRecordingPolicy returns a recorder wrapping inner.
+//
+// Returns:
+//   - *ctxRecordingPolicy: the policy
+func newCtxRecordingPolicy(inner RetryPolicy) *ctxRecordingPolicy {
+	return &ctxRecordingPolicy{inner: inner, entered: make(chan struct{}, 8)}
+}
+
+// Attempt records the query's context, announces the entry and delegates.
+//
+// Returns:
+//   - bool: the delegate's answer
+func (p *ctxRecordingPolicy) Attempt(q RetryableQuery) bool {
+	p.mu.Lock()
+	p.ctxs = append(p.ctxs, q.Context())
+	p.mu.Unlock()
+
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+
+	return p.inner.Attempt(q)
+}
+
+// GetRetryType delegates.
+//
+// Returns:
+//   - RetryType: the delegate's answer
+func (p *ctxRecordingPolicy) GetRetryType(err error) RetryType {
+	return p.inner.GetRetryType(err)
+}
+
+// recorded returns the contexts Attempt has seen, in order.
+//
+// Returns:
+//   - []context.Context: the contexts
+func (p *ctxRecordingPolicy) recorded() []context.Context {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]context.Context(nil), p.ctxs...)
 }
 
 // hostIP returns the address a requestGate keys on.

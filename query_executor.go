@@ -66,7 +66,11 @@ type internalRequest interface {
 	// Pointer fields stay shared - metrics, routing info and host metrics are
 	// per-page, not per-runner.
 	// Only the value fields a RetryPolicy may write become per-runner.
-	snapshotForRunner() internalRequest
+	//
+	// ctx is the runner context, which the copy's Context reports in place of
+	// the caller's: a RetryPolicy consulted inside a runner then sees the
+	// cancellation a winning sibling causes, so a backoff nap ends with it.
+	snapshotForRunner(ctx context.Context) internalRequest
 	// getQueryMetrics returns the counters one page execution shares.
 	//
 	// Every runner of a speculative execution, and every retry inside a runner,
@@ -96,10 +100,10 @@ type runStage uint8
 const (
 	// runEntered fires as run starts, before any host is selected.
 	runEntered runStage = iota
-	// runNoHost fires just before run reports that it found no host to try.
-	runNoHost
-	// runResult fires after do produced a result, before run publishes it.
-	// A runner that found no host reports and returns before this stage.
+	// runRetired fires just before run publishes that its execution retired.
+	runRetired
+	// runResult fires after do produced a decisive result, before run publishes it.
+	// A runner whose execution retired publishes and returns before this stage.
 	runResult
 	// runExited fires as run returns, after its report or result was sent.
 	runExited
@@ -275,6 +279,48 @@ type queryExecutor struct {
 	// coordinate did, not the messages the drain took afterwards.
 	// Nil in production.
 	testAfterConsume func(consumed int)
+	// testBeforeRetiredClose runs in coordinate on each retirement iterator it
+	// closes, before it is closed, and carries no cleanup of its own.
+	// Every coordinator-side close goes through closeRetired, the deferred one
+	// included, so this seam sees all of them.
+	// Nil in production.
+	testBeforeRetiredClose func(iter *Iter)
+}
+
+// doOutcome is how do classifies the way one execution ended.
+//
+// run and coordinate act on this value alone.
+// The iterator's error never classifies an execution: the same error value is a
+// decisive result under one retry policy answer and a retirement under another.
+type doOutcome uint8
+
+const (
+	// outcomeResult is a decisive result: it ends the query on its own.
+	//
+	// A success, an Ignore or a Rethrow, an error no retry can follow, a
+	// cancellation, or an M5 checkpoint.
+	outcomeResult doOutcome = iota
+	// outcomeRetiredAttempted is a retirement by an execution that reached a host:
+	// it wanted a further attempt and could not have one.
+	//
+	// It carries the last attempt's own iterator, host and framer included.
+	outcomeRetiredAttempted
+	// outcomeRetiredUnattempted is a retirement by an execution that never reached
+	// a host.
+	//
+	// It carries an ErrNoConnections error iterator, which has no framer.
+	outcomeRetiredUnattempted
+)
+
+// retirement is the message a runner publishes when its execution retired.
+//
+// attempted is what orders two retirements against each other: a retirement that
+// reached a host is preferred over one that did not.
+type retirement struct {
+	// iter is the retiring execution's iterator; never nil.
+	iter *Iter
+	// attempted reports whether the execution reached a host.
+	attempted bool
 }
 
 // closeIfHeld closes iter when the frame that produced it is still holding it.
@@ -321,31 +367,43 @@ func (q *queryExecutor) attemptQuery(ctx context.Context, qry internalRequest, c
 	return iter
 }
 
-// coordinate runs the main execution plus the speculative ones and returns the
-// first outcome that decides the query.
+// coordinate runs the main execution plus the speculative ones and returns the first outcome that decides the query.
 //
-// A runner that never reached a host reports on its own channel instead of
-// producing an iterator, so a no-host report can never beat a sibling that is
-// waiting for a fill.
-// The query fails with ErrNoConnections as soon as every launched runner reported
-// no host, whether or not a further launch is still scheduled.
+// A runner whose execution retired - it wanted a further attempt and could not have one -
+// publishes on its own channel instead of deciding the query,
+// so it can never beat a sibling that is still running.
+// Retirements are held rather than returned while any launched runner has not published:
+// only when every launched runner has retired is one of their iterators returned,
+// and a launch that has not started yet is not waited for.
+// That stop rule is the same one the no-host accounting used before it:
+// waiting for the next speculative tick would let the query outlive Session.Timeout,
+// and the query context defaults to context.Background(),
+// so Session.Close could not release it.
+// Which retirement is returned follows one rule:
+// a retirement that reached a host beats one that did not,
+// and between two of the same kind the one consumed last wins.
+// "Consumed" is the order this goroutine takes messages off the channels,
+// unrelated to the order the runners produced them.
 //
-// Every launched runner publishes exactly one terminal message, on results or on
-// noHostCh; consumed counts the ones this frame took.
-// The runners whose message nobody read are handed to drainRunners, which closes their
-// iterators.
+// Every launched runner publishes exactly one terminal message, on results or on retiredCh;
+// consumed counts the ones this frame took.
+// The runners whose message nobody read are handed to drainRunners,
+// which closes their iterators.
 // The winner is not among them: it was counted as consumed.
 //
 // Returning does not wait for that cleanup.
-// While any launched runner has not published, a drain goroutine may exist
-// indefinitely: Session.Close cancels the session context and closes the session's
-// resources, but it does not join the runners, and several of the waits a runner can
-// sit in are not bounded by any context - an accepted socket write, an
-// ExponentialBackoffRetryPolicy sleep, a retry or selection callback.
+// While any launched runner has not published, a drain goroutine may exist indefinitely:
+// Session.Close cancels the session context and closes the session's resources,
+// but it does not join the runners,
+// and some of the waits a runner can sit in are not bounded by any context -
+// an accepted socket write, or a custom retry or selection callback.
+// An ExponentialBackoffRetryPolicy nap is no longer one of them:
+// it ends with the runner context, which executeQuery cancels once this frame returns.
 // That lifetime is unchanged by this cleanup; see drainRunners for what it guarantees.
 //
 // Parameters:
 //   - ctx: cancelled by executeQuery once a result is returned
+//   - qry: the request every runner takes its own snapshot of
 //   - sp: the speculative execution policy; sp.Attempts() extra runners
 //   - sel: the selector shared by every runner
 //
@@ -361,11 +419,17 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 		remaining = 0
 	}
 	results := make(chan *Iter, 1+remaining)
-	// Buffered so a runner reporting no host never blocks.
-	noHostCh := make(chan struct{}, 1+remaining)
-	launched, noHost := 1, 0
+	// Buffered so a retiring runner never blocks.
+	retiredCh := make(chan retirement, 1+remaining)
+	launched, retired := 1, 0
 	// consumed counts the terminal messages taken off the two channels.
 	consumed := 0
+	// held is the retirement candidate this frame owns, heldAttempted its kind.
+	var held *Iter
+	heldAttempted := false
+	// incoming is a retirement iterator taken off the channel but not yet placed,
+	// so an unwinding frame still has a reference to close.
+	var incoming *Iter
 
 	// The one cleanup point, installed before the first launch: sp.Delay() below runs
 	// when a runner already exists and is user code that may panic.
@@ -373,8 +437,17 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 	// ticker is gone once the loop has returned.
 	defer func() {
 		if outstanding := launched - consumed; outstanding > 0 {
-			go q.drainRunners(results, noHostCh, outstanding)
+			go q.drainRunners(results, retiredCh, outstanding)
 		}
+	}()
+
+	// Installed after the drain defer, so it runs before it.
+	// The two are independent: consumed is raised as a retirement is taken off the
+	// channel, before any of the handling below, so the drain's outstanding count
+	// already excludes incoming and only this cleanup can reclaim it.
+	defer func() {
+		q.closeRetired(incoming)
+		q.closeRetired(held)
 	}()
 
 	// Every runner, the main one included, gets its own snapshot: sharing one
@@ -383,7 +456,7 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 	// sibling writes.
 	// Giving the main runner the original instead would only be safe under the
 	// extra premise that nobody writes the original.
-	go q.run(ctx, qry.snapshotForRunner(), sel, results, noHostCh)
+	go q.run(ctx, qry.snapshotForRunner(ctx), sel, results, retiredCh)
 
 	var tick <-chan time.Time
 	if remaining > 0 {
@@ -395,36 +468,52 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 	for {
 		select {
 		case iter := <-results:
-			// Any real result wins.
+			// Any decisive result wins.
 			consumed++
-			if q.testAfterConsume != nil {
-				q.testAfterConsume(consumed)
-			}
+			q.afterConsume(consumed)
 			return iter
-		case <-noHostCh:
+		case r := <-retiredCh:
+			// Taken over first: any panic from here on has this frame's cleanup
+			// defer to fall back on.
+			incoming = r.iter
 			consumed++
-			if q.testAfterConsume != nil {
-				q.testAfterConsume(consumed)
+			retired++
+			q.afterConsume(consumed)
+
+			if held != nil && heldAttempted && !r.attempted {
+				// A retirement that reached no host never displaces one that did.
+				loser := incoming
+				incoming = nil
+				q.closeRetired(loser)
+			} else {
+				loser := held
+				held, heldAttempted = incoming, r.attempted
+				incoming = nil
+				q.closeRetired(loser)
 			}
-			// A no-host report never consumes a launch.
-			noHost++
-			// noHost == launched means no launched runner is still viable, so the
-			// query must not stay alive until the next speculative tick: with a
-			// long delay that wait outlives Session.Timeout, and the query context
-			// defaults to context.Background(), so Session.Close cannot release it.
-			// A runner waiting for a fill has not reported, so it keeps
-			// noHost < launched and the sibling protection intact, and a launch
-			// that has not started yet cannot help either: a no-host report means
-			// the shared selector is exhausted, and it stays exhausted.
-			if noHost == launched {
-				return newErrIter(ErrNoConnections, qry.getQueryMetrics(), qry.Keyspace(),
-					qry.getRoutingInfo(), qry.getKeyspaceFunc())
+
+			if retired == launched {
+				// No launched runner is still viable; a launch that has not
+				// started yet is not waited for.
+				if err := ctx.Err(); err != nil {
+					// Cancellation is its own terminal state and outranks the
+					// last retirement, so the answer does not depend on which
+					// case a ready select happened to pick.
+					loser := held
+					held = nil
+					q.closeRetired(loser)
+					return newErrIter(err, qry.getQueryMetrics(), qry.Keyspace(),
+						qry.getRoutingInfo(), qry.getKeyspaceFunc())
+				}
+				winner := held
+				held = nil
+				return winner
 			}
 		case <-tick:
 			// Only the ticker launches.
 			remaining--
 			launched++
-			go q.run(ctx, qry.snapshotForRunner(), sel, results, noHostCh)
+			go q.run(ctx, qry.snapshotForRunner(ctx), sel, results, retiredCh)
 			if remaining == 0 {
 				tick = nil
 			}
@@ -432,6 +521,46 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 			return newErrIter(ctx.Err(), qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
 		}
 	}
+}
+
+// afterConsume runs the testAfterConsume seam for the message just counted.
+//
+// The seam is test code that runs on coordinate's own goroutine, and coordinate is a
+// synchronous call from executeQuery with no recover of its own, so a panic out of the
+// seam must not unwind it.
+//
+// Parameters:
+//   - consumed: the running count of terminal messages this frame took
+func (q *queryExecutor) afterConsume(consumed int) {
+	if q.testAfterConsume == nil {
+		return
+	}
+	safely(q.pool.session.logger, "queryExecutor.coordinate.testAfterConsume",
+		func() { q.testAfterConsume(consumed) })
+}
+
+// closeRetired closes a retirement iterator coordinate owns and reclaims its framer.
+//
+// It is the one coordinator-side close, the deferred cleanup included, so every
+// retirement iterator that reaches no caller goes through exactly one of these calls.
+// The seam and the close are isolated separately: a panicking seam must not cost the
+// iterator its Close.
+// A panicking Close is not retried, and promises nothing beyond the remaining
+// retirements still being handled: Iter.Close marks itself closed before it releases.
+//
+// Parameters:
+//   - iter: the iterator to close, or nil when there is nothing held
+func (q *queryExecutor) closeRetired(iter *Iter) {
+	if iter == nil {
+		return
+	}
+
+	logger := q.pool.session.logger
+	if q.testBeforeRetiredClose != nil {
+		safely(logger, "queryExecutor.coordinate.testBeforeRetiredClose",
+			func() { q.testBeforeRetiredClose(iter) })
+	}
+	safely(logger, "queryExecutor.coordinate.closeRetired", func() { iter.Close() })
 }
 
 // drainRunners consumes the terminal messages of the runners coordinate left behind and
@@ -452,31 +581,67 @@ func (q *queryExecutor) coordinate(ctx context.Context, qry internalRequest, sp 
 // for run's teardown to answer, and a panic inside that teardown itself, which builds its
 // error iterator out of the request and so can fail before it ever sends.
 //
-// Each close is isolated, so one panicking cleanup cannot stop the remaining messages
-// from being consumed; the recoverGoroutine at the top is the backstop for the loop
-// itself, as it is for every driver-spawned goroutine.
+// A retirement carries an iterator too, so both channels are reclaimed the same way.
+// A retirement that never reached a host carries an error iterator with no framer;
+// closing it still costs nothing and keeps the two branches one shape.
+//
+// The seam and each close are isolated separately, and the loop goes on to the next
+// message after either panics, so one panicking cleanup cannot strand the messages
+// behind it; the recoverGoroutine at the top is the backstop for the loop itself, as it
+// is for every driver-spawned goroutine.
 //
 // Parameters:
-//   - results: the channel the runners publish their iterators on
-//   - noHost: the channel the runners report an unreached host on
+//   - results: the channel the runners publish a decisive iterator on
+//   - retired: the channel the runners publish a retirement on
 //   - outstanding: how many messages are still owed, launched minus consumed
-func (q *queryExecutor) drainRunners(results <-chan *Iter, noHost <-chan struct{}, outstanding int) {
+func (q *queryExecutor) drainRunners(results <-chan *Iter, retired <-chan retirement, outstanding int) {
 	logger := q.pool.session.logger
 	defer recoverGoroutine(logger, "queryExecutor.drainRunners", nil)
 
 	for ; outstanding > 0; outstanding-- {
 		select {
 		case iter := <-results:
-			if q.testBeforeDrainClose != nil {
-				q.testBeforeDrainClose(iter)
-			}
-			safely(logger, "queryExecutor.drainRunners.Close", func() { iter.Close() })
-		case <-noHost:
-			// A no-host report carries no iterator, so there is nothing to reclaim.
+			q.drainClose(logger, iter)
+		case r := <-retired:
+			q.drainClose(logger, r.iter)
 		}
 	}
 }
 
+// drainClose runs the drain's seam on iter and closes it, each isolated on its own.
+//
+// Parameters:
+//   - logger: the session logger the isolation reports to
+//   - iter: the iterator the drain reached
+func (q *queryExecutor) drainClose(logger StructuredLogger, iter *Iter) {
+	if q.testBeforeDrainClose != nil {
+		safely(logger, "queryExecutor.drainRunners.testBeforeDrainClose",
+			func() { q.testBeforeDrainClose(iter) })
+	}
+	safely(logger, "queryExecutor.drainRunners.Close", func() { iter.Close() })
+}
+
+// executeQuery runs one page of a request and returns the iterator that answers it.
+//
+// It is the one place the shape of the execution is chosen.
+// A request that is pinned to a host, is not idempotent,
+// or whose speculative policy schedules no extra attempt gets a single execution,
+// and is answered by it directly:
+// with no sibling to wait for,
+// a retirement is that query's answer just as a decisive outcome is.
+// Everything else is handed to coordinate under a context of this frame's own,
+// which is cancelled on the way out
+// so the runners that lost stop working towards an answer nobody will read.
+//
+// The selector is built here rather than inside do because every runner shares it:
+// the replacement picks, the up-host budget and the enumeration itself are query-wide.
+//
+// Parameters:
+//   - qry: the request to run
+//
+// Returns:
+//   - *Iter: the iterator answering this page; never nil when the error is nil
+//   - error: ErrNoConnections when the request names a host the ring does not hold
 func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	var hostIter NextHost
 
@@ -523,7 +688,10 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	// it is, we force the policy to NonSpeculative
 	sp := qry.speculativeExecutionPolicy()
 	if qry.GetHostID() != "" || !qry.IsIdempotent() || sp.Attempts() == 0 {
-		return q.do(qry.Context(), qry, sel), nil
+		// A single execution has no sibling to wait for, so a retirement is this
+		// query's answer just as a decisive outcome is: the outcome is ignored.
+		iter, _ := q.do(qry.Context(), qry, sel)
+		return iter, nil
 	}
 
 	ctx, cancel := context.WithCancel(qry.Context())
@@ -571,16 +739,21 @@ func (q *queryExecutor) pooledUp(host *HostInfo) bool {
 // Ownership of every iterator an attempt produces, one row per way out of the loop:
 //
 //   - an attempt returns: do takes ownership from attemptQuery
+//   - an attempt returns: do holds it in held, and keeps holding it while the selection
+//     moves across hosts that yield no connection
+//   - the next attempt really starts: the iterator it replaces is closed here
 //   - ctx cancelled / ErrNotFound: handed to the caller
 //   - success, or not idempotent, or no retry policy: handed to the caller
-//   - unknown retry type: closed here, the caller gets a fresh ErrUnknownRetryType iter
-//   - retries stopped or the attempt budget reached: handed to the caller
-//   - the retry loop goes round again: closed here, only its error is kept in lastErr
-//   - the loop ends on lastErr or ErrNoConnections: no iterator is held, the round that
-//     produced lastErr already closed its own
-//   - awaitFill fails: no iterator is held
 //   - a checkpoint sees ctx cancelled: this attempt's iterator is handed to the caller,
 //     carrying the context's error in place of the attempt's own
+//   - Rethrow or Ignore: handed to the caller
+//   - unknown retry type: closed here, the caller gets a fresh ErrUnknownRetryType iter
+//   - the selection is exhausted or the attempt budget is reached, after at least one
+//     attempt: the last attempt's own iterator is handed to the caller as the retirement
+//   - a retirement with no attempt behind it: no iterator is held, the caller gets a
+//     fresh ErrNoConnections iter
+//   - awaitFill fails: no iterator is held
+//   - a callback panics: the deferred cleanup closes held
 //
 // The hosts' Mark and the retry policy's Attempt and GetRetryType are user code that
 // runs while do owns an iterator, so a panic out of them closes it.
@@ -599,6 +772,16 @@ func (q *queryExecutor) pooledUp(host *HostInfo) bool {
 // The checkpoints sit after the success, non-idempotent and no-policy exits, so an
 // attempt that succeeded still returns its result even under a cancelled ctx.
 //
+// An execution that wanted a further attempt and could not have one retires instead of
+// deciding the query: the retry policy asked for Retry or RetryNextHost, and either the
+// selection was exhausted or the policy's own Attempt refused the budget.
+// Retirement is reported through the returned doOutcome, never through the iterator's
+// error: the same error value is decisive under one policy answer and a retirement under
+// another.
+// A retirement that ran at least one attempt carries that attempt's own iterator, so its
+// host, warnings and custom payload stay observable; one that never reached a host
+// carries a fresh ErrNoConnections iterator.
+//
 // Parameters:
 //   - ctx: cancels the execution
 //   - qry: the statement to run
@@ -607,15 +790,23 @@ func (q *queryExecutor) pooledUp(host *HostInfo) bool {
 //
 // Returns:
 //   - *Iter: the query's iterator, or an error iterator
-func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSelector) *Iter {
+//   - doOutcome: whether that iterator decides the query or retires the execution
+func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSelector) (*Iter, doOutcome) {
 	selectedHost := sel.draw()
 	rt := qry.retryPolicy()
 
-	var lastErr error
-	var iter *Iter
-	// owned is the iterator this frame holds and has not handed over yet.
-	var owned *Iter
-	defer func() { closeIfHeld(owned) }()
+	// held is the last attempt's iterator, this frame's to close until it is handed
+	// over or the attempt that replaces it really starts.
+	// It stays held across hosts that yield no connection, so a retirement several
+	// fruitless draws later still carries the attempt that actually ran.
+	var held *Iter
+	defer func() { closeIfHeld(held) }()
+	// retiredUnattempted is the retirement of an execution that never reached a host.
+	// It holds no iterator, so there is nothing to hand over.
+	retiredUnattempted := func() (*Iter, doOutcome) {
+		return newErrIter(ErrNoConnections, qry.getQueryMetrics(), qry.Keyspace(),
+			qry.getRoutingInfo(), qry.getKeyspaceFunc()), outcomeRetiredUnattempted
+	}
 	// cancelled ends the execution at a checkpoint: the attempt's own iterator goes to
 	// the caller with the context's error in place of the attempt's, so the host, the
 	// framer and the metrics the attempt gathered stay observable and the framer is
@@ -624,31 +815,44 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 	// context.DeadlineExceeded by identity the way every other exit from do allows.
 	// Mark is deliberately not called again: the attempt's own error was marked when it
 	// came back, and the cancellation says nothing about the host.
-	cancelled := func(iter *Iter, err error) *Iter {
+	cancelled := func(iter *Iter, err error) (*Iter, doOutcome) {
 		iter.err = err
-		owned = nil
-		return iter
+		held = nil
+		return iter, outcomeResult
 	}
 	// cands stays nil until a host's pool is found empty with a fill in flight.
 	var cands []fillCandidate
 	for {
 		if selectedHost == nil {
+			if held != nil {
+				// An attempt already ran, so there is nothing left to wait for:
+				// retire with that attempt's own iterator.
+				retiring := held
+				held = nil
+				return retiring, outcomeRetiredAttempted
+			}
 			// The hosts are exhausted; wait for a fill before giving up.
-			if lastErr != nil || len(cands) == 0 {
+			if len(cands) == 0 {
 				break
 			}
 
 			conn, host, err := q.awaitFill(ctx, cands)
 			cands = nil
+			if err == ErrNoConnections {
+				// Nothing left to wait for, and no attempt behind it.
+				return retiredUnattempted()
+			}
 			if err != nil {
-				return newErrIter(err, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
+				// A cancellation or a closed session decides the query.
+				return newErrIter(err, qry.getQueryMetrics(), qry.Keyspace(),
+					qry.getRoutingInfo(), qry.getKeyspaceFunc()), outcomeResult
 			}
 			if conn == nil {
 				break
 			}
 
 			selectedHost = host
-			iter = q.attemptQuery(ctx, qry, conn)
+			held = q.attemptQuery(ctx, qry, conn)
 		} else {
 			var conn *Conn
 			conn, cands = q.pickForHost(selectedHost, cands)
@@ -657,10 +861,16 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 				continue
 			}
 
-			iter = q.attemptQuery(ctx, qry, conn)
+			// The next attempt really starts here, and only here is the iterator
+			// it supersedes closed.
+			closeIfHeld(held)
+			// Cleared before the attempt runs: if it panics, the deferred cleanup
+			// must not close that iterator a second time.
+			held = nil
+			held = q.attemptQuery(ctx, qry, conn)
 		}
 
-		owned = iter
+		iter := held
 
 		iter.host = selectedHost.Info()
 		// Update host
@@ -669,8 +879,8 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 			// those errors represents logical errors, they should not count
 			// toward removing a node from the pool
 			selectedHost.Mark(nil)
-			owned = nil
-			return iter
+			held = nil
+			return iter, outcomeResult
 		default:
 			selectedHost.Mark(iter.err)
 		}
@@ -678,8 +888,8 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 		// Exit if the query was successful
 		// or query is not idempotent or no retry policy defined
 		if iter.err == nil || !qry.IsIdempotent() || rt == nil {
-			owned = nil
-			return iter
+			held = nil
+			return iter, outcomeResult
 		}
 
 		// If query is unsuccessful, check the error with RetryPolicy to retry
@@ -696,32 +906,34 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, sel *hostSe
 		}
 		next, step := planRetry(retryType, sel, selectedHost, attemptsReached)
 
-		if step == retryStepUnknown {
+		switch {
+		case step == retryStepUnknown:
 			// Undefined? Return nil and error, this will panic in the requester
 			iter.Close()
-			owned = nil
-			return newErrIter(ErrUnknownRetryType, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
-		}
-		if step == retryStepIgnore {
+			held = nil
+			return newErrIter(ErrUnknownRetryType, qry.getQueryMetrics(), qry.Keyspace(),
+				qry.getRoutingInfo(), qry.getKeyspaceFunc()), outcomeResult
+		case step == retryStepIgnore:
 			iter.err = nil
-		}
-		if step != retryStepAgain || attemptsReached {
-			owned = nil
-			return iter
+			held = nil
+			return iter, outcomeResult
+		case step == retryStepStop:
+			held = nil
+			return iter, outcomeResult
+		case attemptsReached:
+			// The policy refused a further attempt for a retryable error: this
+			// execution can do no more, but it does not decide the query.
+			held = nil
+			return iter, outcomeRetiredAttempted
 		}
 
+		// held keeps this attempt's iterator: next may hand out hosts that yield no
+		// connection before one of them does, and the retirement must still carry
+		// the attempt that ran.
 		selectedHost = next
-		lastErr = iter.err
-		iter.Close()
-		owned = nil
-		continue
 	}
 
-	if lastErr != nil {
-		return newErrIter(lastErr, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
-	}
-
-	return newErrIter(ErrNoConnections, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
+	return retiredUnattempted()
 }
 
 // retryStep is what a retry policy's answer means to do's loop.
@@ -898,14 +1110,27 @@ func (q *queryExecutor) awaitFill(ctx context.Context, cands []fillCandidate) (*
 	}
 }
 
+// run executes one runner of a speculative execution and publishes its single terminal
+// message.
+//
+// The message goes on results when do reports a decisive outcome and on retired when the
+// execution retired; the outcome do returned is the only thing that decides which, so an
+// error value never has to be sniffed for.
+//
+// Parameters:
+//   - ctx: the runner context
+//   - qry: this runner's own snapshot of the request
+//   - sel: the selector shared by every runner
+//   - results: where a decisive iterator is published
+//   - retired: where a retirement is published
 func (q *queryExecutor) run(ctx context.Context, qry internalRequest, sel *hostSelector, results chan<- *Iter,
-	noHost chan<- struct{}) {
+	retired chan<- retirement) {
 	if q.testRunHook != nil {
 		q.testRunHook(runEntered)
 		defer q.testRunHook(runExited)
 	}
 
-	// Coordination teardown: parent at coordinate selects on <-results, <-noHost or <-ctx.Done().
+	// Coordination teardown: parent at coordinate selects on <-results, <-retired or <-ctx.Done().
 	// If q.do panics, no result is sent and the parent waits until ctx cancel.
 	// Push a panic-error iter so the parent unblocks immediately.
 	//
@@ -923,17 +1148,17 @@ func (q *queryExecutor) run(ctx context.Context, qry internalRequest, sel *hostS
 	})
 
 	// Speculative runners share one selector, so its budget is query-wide
-	// and coordinate's no-host accounting can rely on it:
+	// and coordinate's retirement accounting can rely on it:
 	// a runner that found no host has exhausted the selection for every runner, launched or not.
 	// See #812.
-	iter := q.do(ctx, qry, sel)
-	if iter.err == ErrNoConnections {
-		// do returns ErrNoConnections only when it never reached a host, so a
-		// sibling still waiting for a fill must not lose to this report.
+	iter, outcome := q.do(ctx, qry, sel)
+	if outcome != outcomeResult {
+		// This execution wanted a further attempt and could not have one, so it
+		// must not end the query while a sibling is still running.
 		if q.testRunHook != nil {
-			q.testRunHook(runNoHost)
+			q.testRunHook(runRetired)
 		}
-		noHost <- struct{}{}
+		retired <- retirement{iter: iter, attempted: outcome == outcomeRetiredAttempted}
 		return
 	}
 
@@ -1052,6 +1277,14 @@ type internalQuery struct {
 	routingInfo        *queryRoutingInfo
 	metrics            *queryMetrics
 	hostMetricsManager hostMetricsManager
+	// runnerCtx is the context of the speculative runner this request belongs to.
+	//
+	// It is non-nil only on a snapshotForRunner copy, and Context reports it in
+	// place of the caller's context so a RetryPolicy consulted inside the runner
+	// observes the cancellation a winning sibling causes.
+	// The next-page copy in conn.go deliberately leaves it nil: that request
+	// outlives the runner whose context this is.
+	runnerCtx context.Context
 }
 
 func newInternalQuery(q *Query, ctx context.Context) *internalQuery {
@@ -1088,9 +1321,12 @@ func newInternalQuery(q *Query, ctx context.Context) *internalQuery {
 // belong to the page execution rather than to one runner,
 // and pageState is read-only for the whole execution.
 //
+// Parameters:
+//   - ctx: the runner's context, which the copy's Context reports
+//
 // Returns:
 //   - internalRequest: the runner's own request
-func (q *internalQuery) snapshotForRunner() internalRequest {
+func (q *internalQuery) snapshotForRunner(ctx context.Context) internalRequest {
 	return &internalQuery{
 		originalQuery:      q.originalQuery,
 		qryOpts:            q.qryOpts,
@@ -1101,6 +1337,7 @@ func (q *internalQuery) snapshotForRunner() internalRequest {
 		routingInfo:        q.routingInfo,
 		metrics:            q.metrics,
 		hostMetricsManager: q.hostMetricsManager,
+		runnerCtx:          ctx,
 	}
 }
 
@@ -1208,7 +1445,18 @@ func (q *internalQuery) GetConsistency() Consistency {
 	return Consistency(atomic.LoadUint32(&q.consistency))
 }
 
+// Context returns the context this execution runs under.
+//
+// A speculative runner's snapshot reports the runner context, so a RetryPolicy
+// reading it through RetryableQuery observes the cancellation a winning sibling
+// causes; every other request reports the caller's own context.
+//
+// Returns:
+//   - context.Context: the runner context on a snapshot, the caller's otherwise
 func (q *internalQuery) Context() context.Context {
+	if q.runnerCtx != nil {
+		return q.runnerCtx
+	}
 	return q.qryOpts.context
 }
 
@@ -1307,6 +1555,13 @@ type internalBatch struct {
 	session            *Session
 	metrics            *queryMetrics
 	hostMetricsManager hostMetricsManager
+	// runnerCtx is the context of the speculative runner this request belongs to.
+	//
+	// It is non-nil only on a snapshotForRunner copy, and Context reports it in
+	// place of the caller's context; see the field of the same name on
+	// internalQuery.
+	// A batch has no next page, so it has no second copy site to exclude.
+	runnerCtx context.Context
 }
 
 func newInternalBatch(batch *Batch, ctx context.Context) *internalBatch {
@@ -1334,9 +1589,12 @@ func newInternalBatch(batch *Batch, ctx context.Context) *internalBatch {
 // Every pointer field keeps its identity, hostMetricsManager included: it is an
 // interface value that is carried over, not a manager that is rebuilt.
 //
+// Parameters:
+//   - ctx: the runner's context, which the copy's Context reports
+//
 // Returns:
 //   - internalRequest: the runner's own request
-func (b *internalBatch) snapshotForRunner() internalRequest {
+func (b *internalBatch) snapshotForRunner(ctx context.Context) internalRequest {
 	return &internalBatch{
 		originalBatch:      b.originalBatch,
 		batchOpts:          b.batchOpts,
@@ -1345,6 +1603,7 @@ func (b *internalBatch) snapshotForRunner() internalRequest {
 		session:            b.session,
 		metrics:            b.metrics,
 		hostMetricsManager: b.hostMetricsManager,
+		runnerCtx:          ctx,
 	}
 }
 
@@ -1445,7 +1704,17 @@ func (b *internalBatch) GetConsistency() Consistency {
 	return Consistency(atomic.LoadUint32(&b.consistency))
 }
 
+// Context returns the context this execution runs under.
+//
+// A speculative runner's snapshot reports the runner context; see
+// (*internalQuery).Context.
+//
+// Returns:
+//   - context.Context: the runner context on a snapshot, the caller's otherwise
 func (b *internalBatch) Context() context.Context {
+	if b.runnerCtx != nil {
+		return b.runnerCtx
+	}
 	return b.batchOpts.context
 }
 

@@ -103,7 +103,7 @@ func TestSpeculative_RunnersShareOneBudget(t *testing.T) {
 	for !otherAttempted() {
 		select {
 		case <-recorder.updated:
-		case <-stages.arrivals(runNoHost):
+		case <-stages.arrivals(runRetired):
 			otherAttempted = func() bool { return true }
 		case <-deadline:
 			t.Fatalf("timed out after %v waiting for the speculative runner to attempt or give up", fillEventBudget)
@@ -129,10 +129,13 @@ func TestSpeculative_TerminalPassDoesNotReopenEnumeration(t *testing.T) {
 
 	stages := newRunStageRecorder()
 	entered := stages.gate(runEntered)
-	published := stages.gate(runResult)
 	t.Cleanup(releaseStageGate(entered))
-	t.Cleanup(releaseStageGate(published))
-	harness.session.executor.testRunHook = stages.hook
+	// Both runners retire: the main one because NumRetries: 0 refuses it a further
+	// attempt, the sibling because the enumeration is already complete.
+	// Holding both keeps the sibling's draw inside the window this test measures.
+	holds := newPublicationHoldsAt(runRetired, 1, 2)
+	t.Cleanup(holds.releaseAll)
+	harness.session.executor.testRunHook = holds.wrap(stages.hook)
 
 	recorder := newAttemptRecorder()
 	qry := harness.session.Query("kill").WithContext(t.Context()).
@@ -140,18 +143,20 @@ func TestSpeculative_TerminalPassDoesNotReopenEnumeration(t *testing.T) {
 	speculative(1, speculativeTick)(qry)
 	result := execAsync(qry)
 
-	// The main runner attempts one host, fails terminally, advances past the other, and
-	// parks before publishing.
+	// The main runner attempts one host, spends its attempt budget, advances past the
+	// other, and parks before publishing its retirement.
 	stages.await(t, runEntered, "the main runner to start")
 	entered <- struct{}{}
-	stages.await(t, runResult, "the main runner to reach publication")
+	stages.await(t, runRetired, "the main runner to reach publication")
 
 	// The sibling now finds nothing to draw.
 	stages.await(t, runEntered, "the speculative runner to start")
 	entered <- struct{}{}
-	stages.await(t, runNoHost, "the speculative runner to report no host")
+	stages.await(t, runRetired, "the speculative runner to report no host")
 
-	published <- struct{}{}
+	// The query ends only once every launched runner has retired, so both holds go;
+	// the order between them does not affect the selection accounting asserted below.
+	holds.releaseAll()
 	require.Error(t, awaitQuery(t, result), "the test server answers kill with an error")
 	awaitRunnersExited(t, stages, 2)
 
@@ -290,7 +295,7 @@ func TestSpeculative_WaitingRunnerSurvivesSiblingAfterReplacement(t *testing.T) 
 	})
 
 	awaitSignal(t, waiting, "the main runner to wait for the fill")
-	stages.await(t, runNoHost, "the speculative runner to report no host")
+	stages.await(t, runRetired, "the speculative runner to report no host")
 	harness.dialer.releaseAll()
 
 	require.NoError(t, awaitQuery(t, result), "the waiting runner must still win")

@@ -2418,6 +2418,12 @@ func (c *Conn) executeQueryWithUnprepRetries(ctx context.Context, q *internalQue
 				routingInfo: q.routingInfo,
 				// The attempt budget is per page, so the next page starts over.
 				metrics: &queryMetrics{},
+				// runnerCtx is deliberately absent, so it stays nil: it belongs
+				// to the speculative runner that fetched this page, and
+				// coordinate's caller cancels that context as soon as the page
+				// is returned.
+				// Copying it would hand the next page a context that is already
+				// cancelled.
 			}
 			if qryOpts.observer != nil {
 				newQry.hostMetricsManager = newHostMetricsManager()

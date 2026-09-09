@@ -1303,6 +1303,7 @@ var internalQueryFields = []requestField{
 	{"routingInfo", "*gocql.queryRoutingInfo"},
 	{"metrics", "*gocql.queryMetrics"},
 	{"hostMetricsManager", "gocql.hostMetricsManager"},
+	{"runnerCtx", "context.Context"},
 }
 
 // internalBatchFields is the field list internalBatch.snapshotForRunner must carry.
@@ -1314,6 +1315,7 @@ var internalBatchFields = []requestField{
 	{"session", "*gocql.Session"},
 	{"metrics", "*gocql.queryMetrics"},
 	{"hostMetricsManager", "gocql.hostMetricsManager"},
+	{"runnerCtx", "context.Context"},
 }
 
 // requireFields compares a struct's fields against the copy contract's list.
@@ -1541,9 +1543,20 @@ func TestInternalRequestFieldsAreSnapshotted(t *testing.T) {
 		harness, _, _ := pagingHarness(t, 1, 1)
 		pub, orig := populatedInternalQuery(t, harness)
 
-		snap, ok := orig.snapshotForRunner().(*internalQuery)
+		runnerCtx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		snap, ok := orig.snapshotForRunner(runnerCtx).(*internalQuery)
 		require.True(t, ok, "a query snapshot must still be an *internalQuery")
 		require.NotSame(t, orig, snap, "the runner must own a different request object")
+
+		// The runner context is the one field the snapshot adds rather than shares:
+		// a RetryPolicy consulted inside the runner must see the runner's own
+		// cancellation, and the request the caller holds must keep its own context.
+		require.Same(t, runnerCtx, snap.Context(), "the snapshot reports the runner context")
+		require.Same(t, orig.qryOpts.context, orig.Context(),
+			"the original request must still report the caller's context")
+		require.Nil(t, orig.runnerCtx, "the original request must not have acquired a runner context")
 
 		require.Same(t, pub, snap.originalQuery, "originalQuery must stay the public query the caller holds")
 		require.Same(t, orig.qryOpts, snap.qryOpts, "qryOpts")
@@ -1567,9 +1580,17 @@ func TestInternalRequestFieldsAreSnapshotted(t *testing.T) {
 		harness, _, _ := pagingHarness(t, 1, 1)
 		pub, orig := populatedInternalBatch(t, harness)
 
-		snap, ok := orig.snapshotForRunner().(*internalBatch)
+		runnerCtx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		snap, ok := orig.snapshotForRunner(runnerCtx).(*internalBatch)
 		require.True(t, ok, "a batch snapshot must still be an *internalBatch")
 		require.NotSame(t, orig, snap, "the runner must own a different request object")
+
+		require.Same(t, runnerCtx, snap.Context(), "the snapshot reports the runner context")
+		require.Same(t, orig.batchOpts.context, orig.Context(),
+			"the original request must still report the caller's context")
+		require.Nil(t, orig.runnerCtx, "the original request must not have acquired a runner context")
 
 		require.Same(t, pub, snap.originalBatch, "originalBatch must stay the public batch the caller holds")
 		require.Same(t, orig.batchOpts, snap.batchOpts, "batchOpts")
@@ -1632,6 +1653,45 @@ func TestInternalRequestFieldsAreSnapshotted(t *testing.T) {
 		require.False(t, sameBacking(src.pageState, next.pageState),
 			"the next page's state must be the response's, copied, not the source's")
 		require.NoError(t, iter.Close())
+	})
+
+	// runnerCtx is the one field the next page must NOT inherit: it belongs to the
+	// runner that fetched the page it follows, and executeQuery cancels that context
+	// as soon as the page is returned.
+	t.Run("next page does not inherit the runner context", func(t *testing.T) {
+		capture := &nextPageCapture{}
+		script := newPagingScript(2, 4)
+		t.Cleanup(script.releaseAll)
+		harness := newFillHarnessOpts(t, 1, fillHarnessOpts{
+			respHook: script.hook,
+			hooks:    capture.hooks(),
+			tune:     noHeartbeat,
+		})
+
+		callerCtx := boundedContext(t)
+		qry := harness.session.Query(pagingStmt).WithContext(callerCtx).
+			Consistency(Quorum).PageSize(4).Idempotent(true).Prefetch(0)
+		// One speculative attempt an hour away: only the main runner ever starts, so
+		// the request the page is built from is deterministically its snapshot.
+		speculative(1, time.Hour)(qry)
+
+		iter := qry.Iter()
+		require.NotNil(t, iter.next, "the first page must report a next page")
+
+		src, next := capture.source(t, 0), iter.next.q
+		require.NotNil(t, src.runnerCtx, "the page was fetched by a runner, so its request carries one")
+		require.Same(t, src.runnerCtx, src.Context(), "the runner's request reports the runner context")
+		// The query has returned, so executeQuery's deferred cancel has run.
+		requireSameError(t, context.Canceled, src.runnerCtx.Err(),
+			"the runner context is cancelled once the page is returned")
+
+		require.Nil(t, next.runnerCtx, "the next page must not inherit the runner context")
+		require.Same(t, callerCtx, next.Context(), "the next page reports the caller's own context")
+
+		// The proof that matters: a next page built on a cancelled context could not
+		// be fetched at all.
+		got := scanAll(t, iter, script.pages*script.rows)
+		require.Equal(t, wantRows(script), got, "both pages must be delivered in order")
 	})
 
 	t.Run("pinned next page keeps its connection and the empty manager", func(t *testing.T) {

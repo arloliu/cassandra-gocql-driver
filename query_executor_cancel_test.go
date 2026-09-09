@@ -213,12 +213,13 @@ func TestDo_CancelledBeforeAttemptSkipsPolicy(t *testing.T) {
 			req := kind.build(policy, ctx, true, []*heldIter{held})
 
 			cancel()
-			result := fixture.executor.do(ctx, req, fixture.selector(fixture.pinned()))
+			result, outcome := fixture.executor.do(ctx, req, fixture.selector(fixture.pinned()))
 
 			require.Zero(t, policy.attempts.Load(), "a cancelled execution must not ask whether to retry")
 			require.Zero(t, policy.retryTypes.Load(), "a cancelled execution must not ask how to retry")
 			require.Equal(t, 1, kind.served(req), "the cancellation must not have driven a second attempt")
 
+			require.Equal(t, outcomeResult, outcome, "a checkpoint ends the execution decisively, it does not retire it")
 			requireHandedOver(t, req, held, result, fixture.host, context.Canceled)
 		})
 	}
@@ -254,12 +255,13 @@ func TestDo_CancelInsideAttemptSkipsGetRetryType(t *testing.T) {
 				}
 				req := kind.build(policy, ctx, true, []*heldIter{held})
 
-				result := fixture.executor.do(ctx, req, fixture.selector(fixture.pinned()))
+				result, outcome := fixture.executor.do(ctx, req, fixture.selector(fixture.pinned()))
 
 				require.Equal(t, int32(1), policy.attempts.Load(), "Attempt runs before the cancellation lands")
 				require.Zero(t, policy.retryTypes.Load(), "GetRetryType must not be asked after the cancellation")
 				require.Equal(t, 1, kind.served(req), "the cancellation must not have driven a second attempt")
 
+				require.Equal(t, outcomeResult, outcome, "a checkpoint ends the execution decisively, it does not retire it")
 				requireHandedOver(t, req, held, result, fixture.host, context.Canceled)
 			})
 		}
@@ -292,13 +294,14 @@ func TestDo_CancelInsideGetRetryTypeSkipsNextAttempt(t *testing.T) {
 			var draws atomic.Int32
 			sel := &hostSelector{iter: scriptedIterator([]*HostInfo{fixture.host, fixture.host}, &draws)}
 
-			result := fixture.executor.do(ctx, req, sel)
+			result, outcome := fixture.executor.do(ctx, req, sel)
 
 			require.Equal(t, int32(1), policy.attempts.Load(), "Attempt runs before the cancellation lands")
 			require.Equal(t, int32(1), policy.retryTypes.Load(), "GetRetryType runs once and is not asked again")
 			require.Equal(t, int32(1), draws.Load(), "the cancelled execution must not draw a replacement host")
 			require.Equal(t, 1, kind.served(req), "the cancelled execution must not send a second attempt")
 
+			require.Equal(t, outcomeResult, outcome, "a checkpoint ends the execution decisively, it does not retire it")
 			requireHandedOver(t, req, iters[0], result, fixture.host, context.Canceled)
 
 			require.False(t, iters[1].released(), "the unused scripted iterator must be untouched")
@@ -342,9 +345,10 @@ func TestDo_CancelledAfterAnyAnswerStillReturnsContextError(t *testing.T) {
 				}
 				req := kind.build(policy, ctx, true, []*heldIter{held})
 
-				result := fixture.executor.do(ctx, req, fixture.selector(fixture.pinned()))
+				result, outcome := fixture.executor.do(ctx, req, fixture.selector(fixture.pinned()))
 
 				require.Equal(t, 1, kind.served(req), "the cancelled execution must not send a second attempt")
+				require.Equal(t, outcomeResult, outcome, "a checkpoint ends the execution decisively, it does not retire it")
 				requireHandedOver(t, req, held, result, fixture.host, context.Canceled)
 			})
 		}
@@ -385,7 +389,7 @@ func TestDo_SuccessUnderCancelledContextIsStillSuccess(t *testing.T) {
 				req := kind.build(rt, ctx, tc.idempotent, []*heldIter{held})
 
 				cancel()
-				result := fixture.executor.do(ctx, req, fixture.selector(fixture.pinned()))
+				result, outcome := fixture.executor.do(ctx, req, fixture.selector(fixture.pinned()))
 
 				if policy != nil {
 					require.Zero(t, policy.attempts.Load(), "this exit never reaches the retry policy")
@@ -393,6 +397,7 @@ func TestDo_SuccessUnderCancelledContextIsStillSuccess(t *testing.T) {
 				}
 				require.Equal(t, 1, kind.served(req), "one attempt decides these exits")
 				require.Same(t, held.iter, result, "the caller receives the attempt's own iterator")
+				require.Equal(t, outcomeResult, outcome, "these exits decide the query, they do not retire")
 				if tc.attemptErr == nil {
 					require.NoError(t, result.err, "the cancellation must not rewrite this outcome")
 				} else {

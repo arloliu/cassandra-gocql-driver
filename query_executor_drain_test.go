@@ -258,19 +258,22 @@ func (r *consumeRecorder) count() int {
 
 // publicationHolds parks chosen publications of a speculative query.
 //
-// The Nth arrival at runResult parks on the Nth hold, when the test asked for one, so a
-// test decides which runner publishes - and therefore wins - and which runners are left
-// for coordinate's drain.
+// The Nth arrival at the chosen stage parks on the Nth hold, when the test asked for one,
+// so a test decides which runner publishes - and therefore wins - and which runners are
+// left for coordinate's drain.
 // Arrival order is the test's own release order, because the runners are let out of
 // runEntered one at a time.
 type publicationHolds struct {
+	// stage is the run checkpoint the holds count and park at.
+	stage runStage
+
 	mu    sync.Mutex
 	holds map[int]chan struct{}
 	once  map[int]*sync.Once
 	seen  int
 }
 
-// newPublicationHolds returns holds that park the given publications.
+// newPublicationHolds returns holds that park the given result publications.
 //
 // Parameters:
 //   - park: the 1-based publication numbers to hold
@@ -278,7 +281,23 @@ type publicationHolds struct {
 // Returns:
 //   - *publicationHolds: the holds
 func newPublicationHolds(park ...int) *publicationHolds {
-	h := &publicationHolds{holds: map[int]chan struct{}{}, once: map[int]*sync.Once{}}
+	return newPublicationHoldsAt(runResult, park...)
+}
+
+// newPublicationHoldsAt returns holds that park the given arrivals at stage.
+//
+// A retirement publishes at runRetired instead of runResult, and the seam sits before
+// that send just as it does for a result, so the same ordering discipline works for
+// either: the Nth arrival at the stage parks on the Nth hold.
+//
+// Parameters:
+//   - stage: the run checkpoint to count and park at
+//   - park: the 1-based arrival numbers to hold
+//
+// Returns:
+//   - *publicationHolds: the holds
+func newPublicationHoldsAt(stage runStage, park ...int) *publicationHolds {
+	h := &publicationHolds{stage: stage, holds: map[int]chan struct{}{}, once: map[int]*sync.Once{}}
 	for _, n := range park {
 		h.holds[n] = make(chan struct{})
 		h.once[n] = &sync.Once{}
@@ -292,7 +311,7 @@ func newPublicationHolds(park ...int) *publicationHolds {
 //   - func(runStage): the hook to install
 func (h *publicationHolds) wrap(inner func(runStage)) func(runStage) {
 	return func(stage runStage) {
-		if stage != runResult {
+		if stage != h.stage {
 			inner(stage)
 			return
 		}
@@ -568,7 +587,7 @@ func TestSpeculative_DrainReleasesOversizedFramer(t *testing.T) {
 
 	results := make(chan *Iter, 1)
 	results <- iter
-	drainOnlyExecutor().drainRunners(results, make(chan struct{}), 1)
+	drainOnlyExecutor().drainRunners(results, make(chan retirement), 1)
 
 	require.Nil(t, iter.framer, "the drain must close the iterator")
 	require.LessOrEqual(t, cap(framer.readBuffer), defaultBufSize,
@@ -664,7 +683,7 @@ func TestSpeculative_DrainAccountingTerminates(t *testing.T) {
 		stages := newRunStageRecorder()
 		entered := stages.gate(runEntered)
 		t.Cleanup(releaseStageGate(entered))
-		reported := stages.gate(runNoHost)
+		reported := stages.gate(runRetired)
 		t.Cleanup(releaseStageGate(reported))
 		holds := newPublicationHolds(1, 2)
 		t.Cleanup(holds.releaseAll)
@@ -683,7 +702,7 @@ func TestSpeculative_DrainAccountingTerminates(t *testing.T) {
 		}
 		stages.await(t, runEntered, "the third runner to start")
 		entered <- struct{}{}
-		stages.await(t, runNoHost, "the third runner to reach its no-host report")
+		stages.await(t, runRetired, "the third runner to reach its no-host report")
 
 		// The winner is released only once coordinate has counted the no-host report,
 		// so the history is a consumed report followed by a consumed result.
@@ -719,7 +738,7 @@ func TestSpeculative_DrainAccountingTerminates(t *testing.T) {
 		harness.session.executor.testBeforeDrainClose = seam.hook
 
 		stages := newRunStageRecorder()
-		reported := stages.gate(runNoHost)
+		reported := stages.gate(runRetired)
 		t.Cleanup(releaseStageGate(reported))
 		harness.session.executor.testRunHook = stages.hook
 
@@ -729,8 +748,8 @@ func TestSpeculative_DrainAccountingTerminates(t *testing.T) {
 
 		// Both runners hold their report, so both are launched before either is
 		// consumed.
-		stages.await(t, runNoHost, "the main runner to reach its no-host report")
-		stages.await(t, runNoHost, "the speculative runner to reach its no-host report")
+		stages.await(t, runRetired, "the main runner to reach its no-host report")
+		stages.await(t, runRetired, "the speculative runner to reach its no-host report")
 		reported <- struct{}{}
 		reported <- struct{}{}
 
@@ -758,7 +777,7 @@ func TestSpeculative_DrainAccountingTerminates(t *testing.T) {
 		stages := newRunStageRecorder()
 		entered := stages.gate(runEntered)
 		t.Cleanup(releaseStageGate(entered))
-		reported := stages.gate(runNoHost)
+		reported := stages.gate(runRetired)
 		t.Cleanup(releaseStageGate(reported))
 		holds := newPublicationHolds(1, 2)
 		t.Cleanup(holds.releaseAll)
@@ -779,7 +798,7 @@ func TestSpeculative_DrainAccountingTerminates(t *testing.T) {
 		// no-host report, so the query ends with one message consumed and two held.
 		stages.await(t, runEntered, "the third runner to start")
 		entered <- struct{}{}
-		stages.await(t, runNoHost, "the third runner to reach its no-host report")
+		stages.await(t, runRetired, "the third runner to reach its no-host report")
 		reported <- struct{}{}
 		consumes.await(t, 1, "coordinate to consume the no-host report")
 
@@ -875,7 +894,7 @@ func TestSpeculative_DrainAccountingTerminates(t *testing.T) {
 		results := make(chan *Iter, 2)
 		results <- nil
 		results <- iter
-		drainOnlyExecutor().drainRunners(results, make(chan struct{}), 2)
+		drainOnlyExecutor().drainRunners(results, make(chan retirement), 2)
 
 		require.Nil(t, iter.framer, "the drain must consume the messages behind the panic")
 		require.LessOrEqual(t, cap(framer.readBuffer), defaultBufSize,
@@ -1047,20 +1066,27 @@ func TestSpeculative_PanickingRunnerStillPublishes(t *testing.T) {
 	require.Equal(t, 1, seam.count(), "the one outstanding iterator was processed")
 }
 
-// TestSpeculative_LateNoHostReportIsDrained proves the drain consumes a no-host report that
-// arrives after coordinate returned with the winner.
+// TestSpeculative_LateUnattemptedRetirementIsDrained proves the drain consumes a
+// retirement that arrives after coordinate returned with the winner, and closes the
+// iterator it carries.
 //
-// It is the noHost arm of the drain's select, and the shape is what makes the arm
-// attributable: every message left outstanding is a no-host report, so the drain has
-// nothing to close and only ends if it took that message off the second channel.
+// It is the retirement arm of the drain's select, and the shape is what makes the arm
+// attributable: every message left outstanding is a retirement, so the drain only ends if
+// it took that message off the second channel.
 // The counts say who took it. testAfterConsume runs on the coordinate goroutine and the
 // drain deliberately does not report there, so a consumed count that stays where it stood
-// when the query returned means the drain, and not coordinate, consumed the late report.
+// when the query returned means the drain, and not coordinate, consumed the late
+// retirement.
 //
-// One host and three runners is the only shape that leaves a pure no-host outstanding: the
-// shared selector hands its single host to the first runner and reports exhaustion to the
-// other two, and coordinate consumes one of those reports before the winner.
-func TestSpeculative_LateNoHostReportIsDrained(t *testing.T) {
+// The iterator a retirement with no attempt behind it carries has no framer, so the only
+// evidence Close ran on it is its closed flag; the drain seam supplies the pointer to read
+// it on.
+//
+// One host and three runners is the only shape that leaves a pure unattempted retirement
+// outstanding: the shared selector hands its single host to the first runner and reports
+// exhaustion to the other two, and coordinate consumes one of those retirements before the
+// winner.
+func TestSpeculative_LateUnattemptedRetirementIsDrained(t *testing.T) {
 	baseline := drainGoroutines()
 	harness := newFillHarness(t, 1, nil)
 
@@ -1073,9 +1099,9 @@ func TestSpeculative_LateNoHostReportIsDrained(t *testing.T) {
 	stages := newRunStageRecorder()
 	entered := stages.gate(runEntered)
 	t.Cleanup(releaseStageGate(entered))
-	// The no-host gate is the hold for a report: the checkpoint sits immediately before
-	// the send, so a runner parked there has not published.
-	reported := stages.gate(runNoHost)
+	// The retirement gate is the hold for a report: the checkpoint sits immediately
+	// before the send, so a runner parked there has not published.
+	reported := stages.gate(runRetired)
 	t.Cleanup(releaseStageGate(reported))
 	holds := newPublicationHolds(1)
 	t.Cleanup(holds.releaseAll)
@@ -1086,35 +1112,139 @@ func TestSpeculative_LateNoHostReportIsDrained(t *testing.T) {
 	result := execAsync(qry)
 
 	// The first runner takes the only host and holds its result; the other two find the
-	// shared enumeration spent and hold their no-host reports.
+	// shared enumeration spent and hold their retirements.
 	stages.await(t, runEntered, "the main runner to start")
 	entered <- struct{}{}
 	stages.await(t, runResult, "the main runner to reach publication")
 	for i := range 2 {
 		stages.await(t, runEntered, fmt.Sprintf("speculative runner %d to start", i+1))
 		entered <- struct{}{}
-		stages.await(t, runNoHost, fmt.Sprintf("speculative runner %d to reach its no-host report", i+1))
+		stages.await(t, runRetired, fmt.Sprintf("speculative runner %d to reach its retirement", i+1))
 	}
 
-	// One report is released and counted before the winner, so the history coordinate
-	// leaves behind is a consumed report followed by a consumed result - and one report
-	// still unsent.
+	// One retirement is released and counted before the winner, so the history coordinate
+	// leaves behind is a consumed retirement followed by a consumed result - and one
+	// retirement still unsent.
+	// The consumed one does not end the query: two runners are still launched and
+	// unpublished, which is the sibling protection this shape also pins.
 	reported <- struct{}{}
-	consumes.await(t, 1, "coordinate to consume the first no-host report")
+	consumes.await(t, 1, "coordinate to consume the first retirement")
 
 	holds.releaseAll()
 	require.NoError(t, awaitQuery(t, result), "the main runner's result wins")
 
 	require.Equal(t, 3, stages.count(runEntered), "three runners were launched")
-	require.Equal(t, 2, consumes.count(), "coordinate consumed the first report and the winner")
+	require.Equal(t, 2, consumes.count(), "coordinate consumed the first retirement and the winner")
 
-	// launched 3 - consumed 2 = 1 outstanding, and it is a no-host report.
-	awaitDrainGoroutines(t, baseline+1, "the drain to wait for the held no-host report")
+	// launched 3 - consumed 2 = 1 outstanding, and it is a retirement.
+	awaitDrainGoroutines(t, baseline+1, "the drain to wait for the held retirement")
 
 	reported <- struct{}{}
-	awaitDrainGoroutines(t, baseline, "the drain to consume the late no-host report and finish")
+	awaitDrainGoroutines(t, baseline, "the drain to consume the late retirement and finish")
 
 	awaitRunnersExited(t, stages, 3)
-	require.Equal(t, 0, seam.count(), "a no-host report carries no iterator, so the drain closed nothing")
-	require.Equal(t, 2, consumes.count(), "the drain, not coordinate, took the late report")
+	require.Equal(t, 1, seam.count(), "the drain reached the late retirement's iterator")
+	require.Equal(t, 2, consumes.count(), "the drain, not coordinate, took the late retirement")
+
+	drained := seam.await(t, "the drained retirement iterator")
+	requireSameError(t, ErrNoConnections, drained.err,
+		"a retirement with no attempt behind it carries ErrNoConnections")
+	require.Nil(t, drained.framer, "an unattempted retirement never held a response framer")
+	require.Equal(t, int32(1), atomic.LoadInt32(&drained.closed), "the drain must have closed it")
+}
+
+// retiredSeam observes queryExecutor.testBeforeRetiredClose.
+//
+// It records what a coordinator-side close is about to reclaim - the iterator, its host,
+// its framer and that framer's read buffer capacity - because every one of those is gone
+// once Close has run.
+// Unlike drainSeam it does not park: the closes it watches happen on coordinate's own
+// goroutine, which the caller of the query is waiting on, so parking there would deadlock
+// the test rather than order it.
+type retiredSeam struct {
+	mu sync.Mutex
+	// seen is one record per close, in the order coordinate made them.
+	seen []retiredRecord
+}
+
+// retiredRecord is what the seam captured for one iterator.
+type retiredRecord struct {
+	iter   *Iter
+	host   *HostInfo
+	framer *framer
+	// bufCap is cap(framer.readBuffer) before the close, or 0 without a framer.
+	bufCap int
+}
+
+// newRetiredSeam returns a seam ready to be installed as testBeforeRetiredClose.
+//
+// Returns:
+//   - *retiredSeam: the seam
+func newRetiredSeam() *retiredSeam {
+	return &retiredSeam{}
+}
+
+// hook is the queryExecutor.testBeforeRetiredClose.
+func (s *retiredSeam) hook(iter *Iter) {
+	record := retiredRecord{iter: iter, host: iter.Host(), framer: iter.framer}
+	if record.framer != nil {
+		record.bufCap = cap(record.framer.readBuffer)
+	}
+
+	s.mu.Lock()
+	s.seen = append(s.seen, record)
+	s.mu.Unlock()
+}
+
+// records returns what the seam captured, in order.
+//
+// Returns:
+//   - []retiredRecord: the records
+func (s *retiredSeam) records() []retiredRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]retiredRecord(nil), s.seen...)
+}
+
+// count returns how many iterators coordinate closed.
+//
+// Returns:
+//   - int: the number of closes
+func (s *retiredSeam) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.seen)
+}
+
+// iters returns the iterators the seam saw, and fails when one appears twice.
+//
+// A repeat would mean an iterator was closed by two different paths, which is exactly what
+// the ownership rule forbids.
+//
+// Returns:
+//   - []*Iter: the iterators, in order
+func (s *retiredSeam) iters(t *testing.T) []*Iter {
+	t.Helper()
+
+	records := s.records()
+	iters := make([]*Iter, 0, len(records))
+	seen := make(map[*Iter]bool, len(records))
+	for _, record := range records {
+		require.False(t, seen[record.iter], "an iterator reached the coordinator's close twice")
+		seen[record.iter] = true
+		iters = append(iters, record.iter)
+	}
+	return iters
+}
+
+// requireClosed asserts every iterator the seam saw went through Iter.Close and let go of
+// its framer.
+func (s *retiredSeam) requireClosed(t *testing.T) {
+	t.Helper()
+
+	for i, record := range s.records() {
+		require.Equal(t, int32(1), atomic.LoadInt32(&record.iter.closed),
+			"the coordinator's close must have run on retired iterator %d", i)
+		require.Nil(t, record.iter.framer, "retired iterator %d must have let go of its framer", i)
+	}
 }

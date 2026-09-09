@@ -403,7 +403,7 @@ func TestDo_SupersededItersAreClosed(t *testing.T) {
 		}
 		qry := newScriptedQuery(&retrySameHost{left: 3}, nil, iters)
 
-		result := fixture.executor.do(context.Background(), qry, fixture.selector(fixture.pinned()))
+		result, _ := fixture.executor.do(context.Background(), qry, fixture.selector(fixture.pinned()))
 
 		require.Equal(t, len(iters), qry.served, "three retries must have driven four attempts")
 		require.Same(t, iters[len(iters)-1].iter, result, "the last attempt is the one the caller receives")
@@ -423,7 +423,7 @@ func TestDo_SupersededItersAreClosed(t *testing.T) {
 		held := newHeldIter(errScriptedAttempt)
 		qry := newScriptedQuery(unknownRetryTypePolicy{}, nil, []*heldIter{held})
 
-		result := fixture.executor.do(context.Background(), qry, fixture.selector(fixture.pinned()))
+		result, _ := fixture.executor.do(context.Background(), qry, fixture.selector(fixture.pinned()))
 
 		require.ErrorIs(t, result.err, ErrUnknownRetryType, "the caller gets a fresh error iter")
 		require.NotSame(t, held.iter, result, "the replaced iter is not the one returned")
@@ -604,7 +604,7 @@ func TestDo_StoppingRetryTypesHandOverTheAttemptIter(t *testing.T) {
 				var draws atomic.Int32
 				sel := &hostSelector{iter: scriptedIterator([]*HostInfo{fixture.host}, &draws)}
 
-				result := fixture.executor.do(context.Background(), req, sel)
+				result, _ := fixture.executor.do(context.Background(), req, sel)
 
 				require.Equal(t, 1, rt.consulted, "the retry policy must have decided this hand-over")
 				require.Equal(t, 1, req.Attempts(), "the answer must have stopped do after one attempt")
@@ -631,4 +631,164 @@ func TestDo_StoppingRetryTypesHandOverTheAttemptIter(t *testing.T) {
 			})
 		}
 	}
+}
+
+// hostWithoutConn adds a second up, pooled host whose pool holds no connection and can
+// never acquire one, and returns it as a selection.
+//
+// The pool's size is 0, so Pick schedules no fill of its own
+// (connectionpool.go: a fill is only due while len(conns) < size)
+// and pickOrState reports a state that is not pending:
+// do therefore records no fill candidate and moves straight on to the next host.
+//
+// Returns:
+//   - SelectedHost: the host that yields no connection
+func (f *doFixture) hostWithoutConn() SelectedHost {
+	host := (&HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 2),
+		port:           9042,
+	}).withIdentity("ownership-no-conn", "", "").setState(NodeUp)
+	f.executor.pool.hostConnPools[host.HostID()] = &hostConnPool{host: host, size: 0}
+	return (*selectedHost)(host)
+}
+
+// pendingFillHost adds a second up, pooled host whose empty pool reports a fill in
+// flight, and returns it as a selection.
+//
+// fillsPending is set directly rather than by starting a fill: the claim is all
+// pickOrState reads to report poolEmptyPending, and a real fill would dial, which this
+// fixture has nothing to dial against.
+// It is what makes the host a fill candidate without disturbing the fixture's quiescence.
+//
+// Returns:
+//   - SelectedHost: the host whose pool is empty with a fill claimed
+func (f *doFixture) pendingFillHost() SelectedHost {
+	host := (&HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 3),
+		port:           9042,
+	}).withIdentity("ownership-pending-fill", "", "").setState(NodeUp)
+	f.executor.pool.hostConnPools[host.HostID()] = &hostConnPool{host: host, size: 1, fillsPending: 1}
+	return (*selectedHost)(host)
+}
+
+// dropConn takes the connection away from the fixture's own host, so a later pick on it
+// yields nothing.
+//
+// It is called between attempts, on the test's own goroutine, which is the only
+// goroutine this fixture ever runs.
+func (f *doFixture) dropConn() {
+	pool := f.executor.pool.hostConnPools[f.host.HostID()]
+	pool.size = 0
+	pool.conns = nil
+}
+
+// panicOnDraw is a NextHost that hands out hosts until its nth raw call, which panics.
+//
+// It puts the panic exactly where do is holding an attempt's iterator across a draw,
+// which is the window the retirement design widened.
+type panicOnDraw struct {
+	hosts []SelectedHost
+	// after is the 1-based call that panics.
+	after int
+	value any
+
+	calls int
+}
+
+// next returns the iterator to install on a hostSelector.
+//
+// Returns:
+//   - NextHost: the iterator
+func (p *panicOnDraw) next() NextHost {
+	return func() SelectedHost {
+		p.calls++
+		if p.calls == p.after {
+			panic(p.value)
+		}
+		if p.calls > len(p.hosts) {
+			return nil
+		}
+		return p.hosts[p.calls-1]
+	}
+}
+
+// panicOnInfo is a SelectedHost whose Info panics, the way a HostSelectionPolicy's own
+// selection could.
+//
+// Info is the first thing pickForHost asks a fresh selection, so this panics while do
+// still holds the previous attempt's iterator.
+type panicOnInfo struct {
+	value any
+}
+
+var _ SelectedHost = panicOnInfo{}
+
+// Info panics.
+//
+// Returns:
+//   - *HostInfo: never returns
+func (h panicOnInfo) Info() *HostInfo { panic(h.value) }
+
+// Mark is never reached.
+func (h panicOnInfo) Mark(error) {}
+
+// retryAnswer is one scripted round of a scriptedRetryPolicy.
+type retryAnswer struct {
+	// attempt is what Attempt reports for this round.
+	attempt bool
+	// retryType is what GetRetryType reports for this round.
+	retryType RetryType
+	// panicInAttempt makes Attempt panic instead of answering.
+	panicInAttempt any
+	// panicInGetRetryType makes GetRetryType panic instead of answering.
+	panicInGetRetryType any
+}
+
+// scriptedRetryPolicy answers the nth round of retry questions from a script.
+//
+// A round is one Attempt followed by one GetRetryType, which is the order do asks them
+// in; past the end of the script every round refuses a further attempt and rethrows, so
+// a test that under-specifies its script stops rather than looping.
+type scriptedRetryPolicy struct {
+	answers []retryAnswer
+
+	attempts   atomic.Int32
+	retryTypes atomic.Int32
+}
+
+var _ RetryPolicy = (*scriptedRetryPolicy)(nil)
+
+// answerFor returns the round n answer, counting from zero.
+//
+// Returns:
+//   - retryAnswer: the scripted answer, or the terminal default
+func (p *scriptedRetryPolicy) answerFor(n int) retryAnswer {
+	if n >= len(p.answers) {
+		return retryAnswer{attempt: false, retryType: Rethrow}
+	}
+	return p.answers[n]
+}
+
+// Attempt answers this round, panicking when the script says to.
+//
+// Returns:
+//   - bool: whether a further attempt is permitted
+func (p *scriptedRetryPolicy) Attempt(RetryableQuery) bool {
+	answer := p.answerFor(int(p.attempts.Add(1)) - 1)
+	if answer.panicInAttempt != nil {
+		panic(answer.panicInAttempt)
+	}
+	return answer.attempt
+}
+
+// GetRetryType answers this round, panicking when the script says to.
+//
+// Returns:
+//   - RetryType: how this round wants the error handled
+func (p *scriptedRetryPolicy) GetRetryType(error) RetryType {
+	answer := p.answerFor(int(p.retryTypes.Add(1)) - 1)
+	if answer.panicInGetRetryType != nil {
+		panic(answer.panicInGetRetryType)
+	}
+	return answer.retryType
 }
