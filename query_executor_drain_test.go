@@ -1165,6 +1165,8 @@ type retiredSeam struct {
 	mu sync.Mutex
 	// seen is one record per close, in the order coordinate made them.
 	seen []retiredRecord
+	// panicAt is the 1-based close the seam panics on; 0 never panics.
+	panicAt int
 }
 
 // retiredRecord is what the seam captured for one iterator.
@@ -1193,6 +1195,20 @@ func (s *retiredSeam) hook(iter *Iter) {
 
 	s.mu.Lock()
 	s.seen = append(s.seen, record)
+	n, panicAt := len(s.seen), s.panicAt
+	s.mu.Unlock()
+
+	if panicAt != 0 && n == panicAt {
+		panic(callbackPanic{where: "retired close seam"})
+	}
+}
+
+// panicOn makes the nth close panic out of the seam, counting from one.
+//
+// The record is kept first, so the panicking close is still identified.
+func (s *retiredSeam) panicOn(n int) {
+	s.mu.Lock()
+	s.panicAt = n
 	s.mu.Unlock()
 }
 

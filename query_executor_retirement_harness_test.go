@@ -23,6 +23,7 @@ package gocql
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -37,6 +38,20 @@ const retirementStmt = "void"
 
 // retirementErrCode is the CQL error code the failing servers answer with.
 const retirementErrCode = 0x1001
+
+// retirementErrMsg is the message the failing server at index answers with.
+//
+// Each failing host carries its own message, so the error a query ends on can be
+// attributed to the host that produced it rather than merely being non-nil.
+//
+// Parameters:
+//   - host: the index into the harness's hosts
+//
+// Returns:
+//   - string: the message that host's error response carries
+func retirementErrMsg(host int) string {
+	return fmt.Sprintf("retirement at host %d", host)
+}
 
 // notReturnedWindow is how long a "the query has not ended" assertion waits.
 //
@@ -53,11 +68,8 @@ const notReturnedWindow = 50 * time.Millisecond
 type retirementFixture struct {
 	harness *fillHarness
 	// gate holds each host's requests until the test releases them.
-	gate *requestGate
-	// failing is the set of servers answering with an error; set after the harness
-	// exists, because the addresses are only known then.
-	failing *hostSet
-	stages  *runStageRecorder
+	gate   *requestGate
+	stages *runStageRecorder
 	// entered releases one runner from runEntered per token.
 	entered chan struct{}
 	// holds parks the publications the test named.
@@ -72,6 +84,23 @@ type retirementFixture struct {
 	attempts *attemptRecorder
 	// baseline is the drain goroutine count before the fixture ran.
 	baseline int
+	// warnings is the warning list each failing host's error carries, by host index.
+	warnings map[int][]string
+}
+
+// retirementFailure describes one server's error response.
+//
+// The warnings are per host on purpose: an assertion that the returned iterator carries
+// "the warnings of host C" only discriminates when the other failing hosts carry
+// different ones.
+type retirementFailure struct {
+	// host is the index into the harness's hosts.
+	host int
+	// warnings is the warning list this host's error carries.
+	warnings []string
+	// oversized makes this host's error carry a custom payload larger than any pooled
+	// buffer, so a release is observable on the framer it arrives in.
+	oversized bool
 }
 
 // retirementOpts tunes newRetirementFixture.
@@ -82,11 +111,11 @@ type retirementOpts struct {
 	holdsAt runStage
 	// park is the 1-based arrival numbers to hold at that stage.
 	park []int
-	// warnings is the warning list the failing servers' error carries.
-	warnings []string
-	// oversized makes the failing servers' error carry a payload larger than any
-	// pooled buffer, so a release is observable on it.
-	oversized bool
+	// failures are the servers that answer with an error.
+	failures []retirementFailure
+	// parkDrain keeps the drain seam parked on every arrival, so a test can read a
+	// drained iterator before its Close or inject a panic into the drain loop.
+	parkDrain bool
 }
 
 // newRetirementFixture starts a harness wired for arrival-ordered retirement tests.
@@ -108,21 +137,36 @@ func newRetirementFixture(t *testing.T, opts retirementOpts) *retirementFixture 
 	baseline := drainGoroutines()
 	gate := newRequestGate()
 	t.Cleanup(gate.releaseAll)
-	failing := newHostSet()
 
-	var payload map[string][]byte
-	if opts.oversized {
-		payload = oversizedPayload()
+	// One hook per failing host, so each carries its own metadata; the sets are filled
+	// once the harness exists, because only then are the addresses known.
+	sets := make([]*hostSet, 0, len(opts.failures))
+	hooks := make([]respHookFunc, 0, len(opts.failures))
+	warnings := make(map[int][]string, len(opts.failures))
+	for _, failure := range opts.failures {
+		set := newHostSet()
+		sets = append(sets, set)
+		var payload map[string][]byte
+		if failure.oversized {
+			payload = oversizedPayload()
+		}
+		hooks = append(hooks, errorRespHook(set, retirementErrCode,
+			retirementErrMsg(failure.host), failure.warnings, payload))
+		warnings[failure.host] = failure.warnings
 	}
+
 	harness := newFillHarnessOpts(t, opts.hosts, fillHarnessOpts{
 		proto:    protoVersion4,
 		recvHook: gate.hook,
-		respHook: errorRespHook(failing, retirementErrCode, "retirement", opts.warnings, payload),
+		respHook: chainRespHooks(hooks...),
 		tune: func(cluster *ClusterConfig) {
 			noHeartbeat(cluster)
 			cluster.heartbeatPhase = func(time.Duration) time.Duration { return time.Hour }
 		},
 	})
+	for i, failure := range opts.failures {
+		sets[i].set(hostIP(harness.hosts[failure.host]))
+	}
 
 	stages := newRunStageRecorder()
 	entered := stages.gate(runEntered)
@@ -136,13 +180,15 @@ func newRetirementFixture(t *testing.T, opts retirementOpts) *retirementFixture 
 	retired := newRetiredSeam()
 	harness.session.executor.testBeforeRetiredClose = retired.hook
 	drain := newDrainSeam()
-	drain.releaseAll()
+	t.Cleanup(drain.releaseAll)
+	if !opts.parkDrain {
+		drain.releaseAll()
+	}
 	harness.session.executor.testBeforeDrainClose = drain.hook
 
 	return &retirementFixture{
 		harness:  harness,
 		gate:     gate,
-		failing:  failing,
 		stages:   stages,
 		entered:  entered,
 		holds:    holds,
@@ -151,7 +197,16 @@ func newRetirementFixture(t *testing.T, opts retirementOpts) *retirementFixture 
 		drain:    drain,
 		attempts: newAttemptRecorder(),
 		baseline: baseline,
+		warnings: warnings,
 	}
+}
+
+// warningsAt returns the warning list the host at index carries.
+//
+// Returns:
+//   - []string: the warnings
+func (f *retirementFixture) warningsAt(index int) []string {
+	return f.warnings[index]
 }
 
 // pinHosts makes the shared selector enumerate hosts in exactly this order.
@@ -164,15 +219,6 @@ func (f *retirementFixture) pinHosts(hosts ...*HostInfo) {
 		HostSelectionPolicy: f.harness.session.executor.policy,
 		script:              [][]*HostInfo{hosts},
 	}
-}
-
-// fail makes the servers at hosts answer with the fixture's error response.
-func (f *retirementFixture) fail(hosts ...*HostInfo) {
-	ips := make([]string, 0, len(hosts))
-	for _, host := range hosts {
-		ips = append(ips, hostIP(host))
-	}
-	f.failing.set(ips...)
 }
 
 // armAll holds the requests of every host in the harness.
@@ -194,18 +240,39 @@ func (f *retirementFixture) armAll() {
 func (f *retirementFixture) query(t *testing.T, rt RetryPolicy, attempts int) *Query {
 	t.Helper()
 
-	qry := f.harness.session.Query(retirementStmt).WithContext(t.Context()).
+	return f.queryCtx(t.Context(), rt, attempts, speculativeTick)
+}
+
+// queryCtx is query under a context and speculative delay the test chooses.
+//
+// Parameters:
+//   - ctx: the caller context
+//   - rt: the retry policy
+//   - attempts: how many speculative runners to add to the main one
+//   - delay: the speculative delay; an hour keeps the launch count at one
+//
+// Returns:
+//   - *Query: the query
+func (f *retirementFixture) queryCtx(ctx context.Context, rt RetryPolicy, attempts int,
+	delay time.Duration,
+) *Query {
+	qry := f.harness.session.Query(retirementStmt).WithContext(ctx).
 		RetryPolicy(rt).Observer(f.attempts)
-	speculative(attempts, speculativeTick)(qry)
+	speculative(attempts, delay)(qry)
 	return qry
 }
 
-// startAt lets the next runner out of runEntered and waits until its request is in flight
-// at host.
+// startAt lets the next runner out of runEntered
+// and waits until its request is in flight at host.
 //
-// This is the ordering primitive the whole file rests on: only one runner is running at a
-// time, so the host it draws and the ordinal its publication claims are both the test's
-// own choice.
+// This is the ordering primitive the whole file rests on:
+// only one runner is running at a time,
+// so the host it draws and the ordinal its publication claims are both the test's own choice.
+//
+// Parameters:
+//   - t: the test
+//   - host: the host this runner must draw and send its request to
+//   - what: what the runner is called in a timeout message
 func (f *retirementFixture) startAt(t *testing.T, host *HostInfo, what string) {
 	t.Helper()
 
@@ -274,15 +341,13 @@ func requireReleased(t *testing.T, record retiredRecord) {
 // healthy.
 func TestSpeculative_RetiredSiblingDoesNotEndTheQuery(t *testing.T) {
 	fixture := newRetirementFixture(t, retirementOpts{
-		hosts:     2,
-		holdsAt:   runRetired,
-		park:      []int{1},
-		warnings:  []string{"w-b"},
-		oversized: true,
+		hosts:    2,
+		holdsAt:  runRetired,
+		park:     []int{1},
+		failures: []retirementFailure{{host: 1, warnings: []string{"w-sibling"}, oversized: true}},
 	})
 	main, sibling := fixture.harness.hosts[0], fixture.harness.hosts[1]
 	fixture.pinHosts(main, sibling)
-	fixture.fail(sibling)
 	fixture.armAll()
 
 	qry := fixture.query(t, &SimpleRetryPolicy{NumRetries: 5}, 1)
@@ -331,14 +396,18 @@ func TestSpeculative_RetiredSiblingDoesNotEndTheQuery(t *testing.T) {
 func TestSpeculative_AllRetiredReturnsLastAttemptedErrorWithHost(t *testing.T) {
 	t.Run("query", func(t *testing.T) {
 		fixture := newRetirementFixture(t, retirementOpts{
-			hosts:    2,
-			holdsAt:  runRetired,
-			park:     []int{1, 2},
-			warnings: []string{"w-retired"},
+			hosts:   2,
+			holdsAt: runRetired,
+			park:    []int{1, 2},
+			// Distinct warnings: the returned iterator has to be told apart from the
+			// one the coordinator displaced by its own response, not only by its host.
+			failures: []retirementFailure{
+				{host: 0, warnings: []string{"w-first"}},
+				{host: 1, warnings: []string{"w-last"}},
+			},
 		})
 		first, last := fixture.harness.hosts[0], fixture.harness.hosts[1]
 		fixture.pinHosts(first, last)
-		fixture.fail(first, last)
 		fixture.armAll()
 
 		qry := fixture.query(t, &SimpleRetryPolicy{NumRetries: 5}, 1)
@@ -355,19 +424,23 @@ func TestSpeculative_AllRetiredReturnsLastAttemptedErrorWithHost(t *testing.T) {
 		fixture.retireAt(t, 2, 2, "the speculative runner's retirement")
 
 		got := awaitIter(t, result, "the last retirement to be returned")
-		requireRetirementReturned(t, fixture, got, first, last)
+		requireRetirementReturned(t, fixture, got, first, last, 1)
 	})
 
 	t.Run("batch", func(t *testing.T) {
 		fixture := newRetirementFixture(t, retirementOpts{
-			hosts:    2,
-			holdsAt:  runRetired,
-			park:     []int{1, 2},
-			warnings: []string{"w-retired"},
+			hosts:   2,
+			holdsAt: runRetired,
+			park:    []int{1, 2},
+			// Distinct warnings: the returned iterator has to be told apart from the
+			// one the coordinator displaced by its own response, not only by its host.
+			failures: []retirementFailure{
+				{host: 0, warnings: []string{"w-first"}},
+				{host: 1, warnings: []string{"w-last"}},
+			},
 		})
 		first, last := fixture.harness.hosts[0], fixture.harness.hosts[1]
 		fixture.pinHosts(first, last)
-		fixture.fail(first, last)
 		fixture.armAll()
 
 		batch := fixture.harness.session.Batch(LoggedBatch).WithContext(t.Context()).
@@ -387,7 +460,7 @@ func TestSpeculative_AllRetiredReturnsLastAttemptedErrorWithHost(t *testing.T) {
 		fixture.retireAt(t, 2, 2, "the speculative runner's retirement")
 
 		got := awaitIter(t, result, "the last retirement to be returned")
-		requireRetirementReturned(t, fixture, got, first, last)
+		requireRetirementReturned(t, fixture, got, first, last, 1)
 	})
 }
 
@@ -410,15 +483,22 @@ func batchIterAsync(batch *Batch) <-chan *Iter {
 //   - got: the iterator the caller received
 //   - displaced: the host whose retirement was replaced
 //   - kept: the host whose retirement was returned
-func requireRetirementReturned(t *testing.T, fixture *retirementFixture, got *Iter, displaced, kept *HostInfo) {
+//   - keptIndex: the index of the kept host, whose warnings and error message it carries
+func requireRetirementReturned(t *testing.T, fixture *retirementFixture, got *Iter, displaced, kept *HostInfo,
+	keptIndex int,
+) {
 	t.Helper()
 
 	// Read the response metadata before Close: the framer it lives on is what Close
 	// gives back.
 	require.Same(t, kept, got.Host(), "the retirement consumed last is the one returned")
-	require.Equal(t, []string{"w-retired"}, got.Warnings(),
-		"the returned retirement carries its response's warnings")
-	require.Error(t, got.err, "every execution failed, so the query fails")
+	require.Equal(t, fixture.warningsAt(keptIndex), got.Warnings(),
+		"the returned retirement carries its own response's warnings, not the displaced one's")
+	// Each failing host answers with its own message,
+	// so this pins which host's error the caller was given,
+	// not merely that some execution failed.
+	require.EqualError(t, got.err, retirementErrMsg(keptIndex),
+		"the returned retirement reports the kept host's own error")
 	require.Equal(t, got.err, got.Close(), "Close reports the same error")
 
 	require.Equal(t, 1, fixture.retired.count(), "the displaced retirement is the only one closed")
@@ -443,11 +523,10 @@ func TestSpeculative_AttemptedRetirementBeatsUnattempted(t *testing.T) {
 			hosts:    1,
 			holdsAt:  runRetired,
 			park:     []int{1, 2},
-			warnings: []string{"w-only"},
+			failures: []retirementFailure{{host: 0, warnings: []string{"w-only"}}},
 		})
 		only := fixture.harness.hosts[0]
 		fixture.pinHosts(only)
-		fixture.fail(only)
 		fixture.armAll()
 
 		qry := fixture.query(t, &SimpleRetryPolicy{NumRetries: 5}, 1)
@@ -471,11 +550,10 @@ func TestSpeculative_AttemptedRetirementBeatsUnattempted(t *testing.T) {
 			hosts:    1,
 			holdsAt:  runRetired,
 			park:     []int{1, 2},
-			warnings: []string{"w-only"},
+			failures: []retirementFailure{{host: 0, warnings: []string{"w-only"}}},
 		})
 		only := fixture.harness.hosts[0]
 		fixture.pinHosts(only)
-		fixture.fail(only)
 		fixture.armAll()
 
 		qry := fixture.query(t, &SimpleRetryPolicy{NumRetries: 5}, 1)
@@ -511,7 +589,11 @@ func requireAttemptedWon(t *testing.T, fixture *retirementFixture, got *Iter, ho
 
 	require.Same(t, host, got.Host(), "the attempted retirement is the one returned")
 	require.Equal(t, []string{"w-only"}, got.Warnings(), "the returned retirement carries its response's warnings")
-	require.Error(t, got.err, "every execution failed, so the query fails")
+	// The one failing host is the fixture's host 0,
+	// so its message is what tells the attempted retirement's error apart
+	// from the synthetic ErrNoConnections the unattempted one carries.
+	require.EqualError(t, got.err, retirementErrMsg(0),
+		"the returned retirement reports the attempted host's own error")
 	require.Equal(t, got.err, got.Close(), "Close reports the same error")
 
 	require.Equal(t, 1, fixture.retired.count(), "the unattempted retirement is the only one closed")
@@ -534,15 +616,13 @@ func requireAttemptedWon(t *testing.T, fixture *retirementFixture, got *Iter, ho
 // a failure has already spent it, and before this change its iterator ended the query.
 func TestSpeculative_AttemptBudgetRetirementDoesNotEndTheQuery(t *testing.T) {
 	fixture := newRetirementFixture(t, retirementOpts{
-		hosts:     2,
-		holdsAt:   runRetired,
-		park:      []int{1},
-		warnings:  []string{"w-b"},
-		oversized: true,
+		hosts:    2,
+		holdsAt:  runRetired,
+		park:     []int{1},
+		failures: []retirementFailure{{host: 1, warnings: []string{"w-sibling"}, oversized: true}},
 	})
 	main, sibling := fixture.harness.hosts[0], fixture.harness.hosts[1]
 	fixture.pinHosts(main, sibling)
-	fixture.fail(sibling)
 	fixture.armAll()
 
 	qry := fixture.query(t, &SimpleRetryPolicy{NumRetries: 0}, 1)
@@ -586,11 +666,10 @@ func TestSpeculative_RethrowStillEndsTheQuery(t *testing.T) {
 	fixture := newRetirementFixture(t, retirementOpts{
 		hosts:    2,
 		holdsAt:  runResult,
-		warnings: []string{"w-b"},
+		failures: []retirementFailure{{host: 1, warnings: []string{"w-sibling"}}},
 	})
 	main, sibling := fixture.harness.hosts[0], fixture.harness.hosts[1]
 	fixture.pinHosts(main, sibling)
-	fixture.fail(sibling)
 	fixture.armAll()
 
 	policy := &scriptedRetryPolicy{answers: []retryAnswer{{attempt: true, retryType: Rethrow}}}
@@ -634,10 +713,13 @@ func TestSpeculative_RunnerContextIsVisibleToThePolicy(t *testing.T) {
 	run := func(t *testing.T, batch bool) {
 		t.Helper()
 
-		fixture := newRetirementFixture(t, retirementOpts{hosts: 2, holdsAt: runResult})
+		fixture := newRetirementFixture(t, retirementOpts{
+			hosts:    2,
+			holdsAt:  runResult,
+			failures: []retirementFailure{{host: 1}},
+		})
 		main, sibling := fixture.harness.hosts[0], fixture.harness.hosts[1]
 		fixture.pinHosts(main, sibling)
-		fixture.fail(sibling)
 		fixture.armAll()
 
 		// An hour of backoff: only the runner context can end this nap inside the

@@ -540,7 +540,7 @@ func (r *poolEventRecorder) awaitErr(ev poolEvent, what string) (*HostInfo, erro
 //   - ev: the checkpoint to collect
 //   - hosts: the hosts whose checkpoint must be observed, matched by pointer
 //   - what: what the caller is waiting for, used in the failure message
-func (r *poolEventRecorder) awaitEachHost(t *testing.T, ev poolEvent, hosts []*HostInfo, what string) {
+func (r *poolEventRecorder) awaitEachHost(t testing.TB, ev poolEvent, hosts []*HostInfo, what string) {
 	t.Helper()
 
 	if err := r.awaitEachHostErr(ev, hosts, what); err != nil {
@@ -637,13 +637,13 @@ type fillHarnessOpts struct {
 // gated dialer and a pool event recorder.
 //
 // Parameters:
-//   - t: the test; servers and the session are registered for cleanup
+//   - t: the test or benchmark; servers and the session are registered for cleanup
 //   - hosts: how many test servers to start (1 to len(fillLoopbackAddrs))
 //   - tune: optional cluster tweaks applied before CreateSession
 //
 // Returns:
 //   - *fillHarness: the connected harness, with every pool filled
-func newFillHarness(t *testing.T, hosts int, tune func(*ClusterConfig)) *fillHarness {
+func newFillHarness(t testing.TB, hosts int, tune func(*ClusterConfig)) *fillHarness {
 	t.Helper()
 	return newFillHarnessOpts(t, hosts, fillHarnessOpts{tune: tune})
 }
@@ -654,13 +654,13 @@ func newFillHarness(t *testing.T, hosts int, tune func(*ClusterConfig)) *fillHar
 // binds distinct loopback aliases and skips the test where they are unavailable.
 //
 // Parameters:
-//   - t: the test; servers and the session are registered for cleanup
+//   - t: the test or benchmark; servers and the session are registered for cleanup
 //   - hosts: how many test servers to start
 //   - opts: the options
 //
 // Returns:
 //   - *fillHarness: the connected harness, with every pool filled
-func newFillHarnessOpts(t *testing.T, hosts int, opts fillHarnessOpts) *fillHarness {
+func newFillHarnessOpts(t testing.TB, hosts int, opts fillHarnessOpts) *fillHarness {
 	t.Helper()
 
 	proto := opts.proto
@@ -766,7 +766,11 @@ func newFillHarnessOpts(t *testing.T, hosts int, opts fillHarnessOpts) *fillHarn
 }
 
 // mustBindLoopbackAddr skips the test when addr cannot be bound.
-func mustBindLoopbackAddr(t *testing.T, addr string) {
+//
+// Parameters:
+//   - t: the test or benchmark to skip
+//   - addr: the loopback address the fixture is about to listen on
+func mustBindLoopbackAddr(t testing.TB, addr string) {
 	t.Helper()
 
 	probe, err := net.Listen("tcp", addr)
@@ -780,7 +784,7 @@ func mustBindLoopbackAddr(t *testing.T, addr string) {
 //
 // Returns:
 //   - *hostConnPool: the host's pool
-func (h *fillHarness) pool(t *testing.T, host *HostInfo) *hostConnPool {
+func (h *fillHarness) pool(t testing.TB, host *HostInfo) *hostConnPool {
 	t.Helper()
 
 	pool, ok := h.session.pool.getPool(host)
@@ -1822,7 +1826,7 @@ func TestAwaitFill_TimeoutExpiresWithoutContext(t *testing.T) {
 // count and is reported as a timeout.
 // It answers "is this pool quiescent yet", not "was this claim released exactly once":
 // a phase that must prove the latter counts poolFillDone events instead.
-func awaitNoPendingFills(t *testing.T, parent *policyConnPool, pool *hostConnPool) {
+func awaitNoPendingFills(t testing.TB, parent *policyConnPool, pool *hostConnPool) {
 	t.Helper()
 
 	deadline := time.After(fillEventBudget)

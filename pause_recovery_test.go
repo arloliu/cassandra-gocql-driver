@@ -258,9 +258,12 @@ func newPauseRecoverySession(t *testing.T, tune func(*ClusterConfig)) (*Session,
 // testServerContext returns a context cancelled when the test finishes,
 // for TestServer instances that must outlive individual assertions.
 //
+// Parameters:
+//   - t: the test or benchmark whose cleanup cancels the context
+//
 // Returns:
 //   - context.Context: cancelled during test cleanup
-func testServerContext(t *testing.T) context.Context {
+func testServerContext(t testing.TB) context.Context {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(t.Context())

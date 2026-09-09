@@ -399,6 +399,10 @@ type scriptedIterPolicy struct {
 	// script holds the host list each successive Pick enumerates.
 	script [][]*HostInfo
 
+	// wrap, when set, decorates every selection the iterator hands out, so a test can
+	// make one host's Mark misbehave without touching the enumeration order.
+	wrap func(SelectedHost) SelectedHost
+
 	// picks counts how many iterators were handed out.
 	picks atomic.Int32
 }
@@ -420,7 +424,121 @@ func (p *scriptedIterPolicy) Pick(_ ExecutableStatement) NextHost {
 		}
 		host := hosts[i]
 		i++
-		return (*selectedHost)(host)
+		var selected SelectedHost = (*selectedHost)(host)
+		if p.wrap != nil {
+			selected = p.wrap(selected)
+		}
+		return selected
+	}
+}
+
+// panicOnMarkFor returns a selection decorator whose Mark panics for one host only.
+//
+// Mark runs after attemptQuery has returned, so do owns the attempt's iterator when it
+// panics: it is the narrowest way to test that ownership window without disturbing any
+// other host's selection.
+//
+// Parameters:
+//   - host: the host whose Mark panics
+//   - value: the panic value raised
+//
+// Returns:
+//   - func(SelectedHost) SelectedHost: the decorator
+func panicOnMarkFor(host *HostInfo, value any) func(SelectedHost) SelectedHost {
+	return func(selected SelectedHost) SelectedHost {
+		if selected.Info() != host {
+			return selected
+		}
+		return markPanicHost{info: host, value: value}
+	}
+}
+
+// capturedAttempt is one attempt an iterCapture recorded.
+type capturedAttempt struct {
+	host *HostInfo
+	iter *Iter
+}
+
+// iterCapture collects the iterators the attempts of one query produced.
+//
+// It is the only way a test can name the iterator an attempt returned: ObservedQuery
+// carries no *Iter, and adding one to the public observer would be a production change
+// for a test's benefit.
+type iterCapture struct {
+	mu   sync.Mutex
+	seen []capturedAttempt
+}
+
+// record keeps one attempt's host and iterator.
+func (c *iterCapture) record(host *HostInfo, iter *Iter) {
+	c.mu.Lock()
+	c.seen = append(c.seen, capturedAttempt{host: host, iter: iter})
+	c.mu.Unlock()
+}
+
+// forHost returns the iterator the attempt on host produced.
+//
+// Returns:
+//   - *Iter: the attempt's iterator
+func (c *iterCapture) forHost(t *testing.T, host *HostInfo) *Iter {
+	t.Helper()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, attempt := range c.seen {
+		if attempt.host == host {
+			return attempt.iter
+		}
+	}
+	t.Fatalf("no attempt was recorded on %v", host)
+	return nil
+}
+
+// count returns how many attempts were recorded.
+//
+// Returns:
+//   - int: the number of attempts
+func (c *iterCapture) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.seen)
+}
+
+// iterCapturingRequest wraps a request so every attempt's iterator is recorded.
+//
+// snapshotForRunner is overridden to keep the wrapper around the runner's copy: the
+// embedded method would return the bare request and the recording would be lost for every
+// runner but the first.
+// The recorder is shared by every copy, so the capture is per query, not per runner.
+type iterCapturingRequest struct {
+	internalRequest
+
+	capture *iterCapture
+}
+
+var _ internalRequest = (*iterCapturingRequest)(nil)
+
+// execute records the iterator the attempt produced before handing it back.
+//
+// Returns:
+//   - *Iter: the attempt's iterator, unchanged
+func (r *iterCapturingRequest) execute(ctx context.Context, conn *Conn) *Iter {
+	iter := r.internalRequest.execute(ctx, conn)
+	r.capture.record(conn.host, iter)
+	return iter
+}
+
+// snapshotForRunner keeps the wrapper on the runner's own copy.
+//
+// Parameters:
+//   - ctx: the runner context the snapshot answers Context() with
+//
+// Returns:
+//   - internalRequest: the wrapped snapshot, sharing this request's recorder
+func (r *iterCapturingRequest) snapshotForRunner(ctx context.Context) internalRequest {
+	return &iterCapturingRequest{
+		internalRequest: r.internalRequest.snapshotForRunner(ctx),
+		capture:         r.capture,
 	}
 }
 
@@ -667,4 +785,30 @@ func (g *prepareGate) count(stmt string) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.counts[stmt]
+}
+
+// respHookFunc is the shape of a fillHarnessOpts.respHook.
+type respHookFunc func(ip string, srv *TestServer, req, resp *framer) bool
+
+// chainRespHooks offers each request to every hook in order and stops at the first one
+// that answers it.
+//
+// A harness takes one response hook, but a fixture often needs several - one per server
+// whose response carries its own metadata - and each of them already declines what is not
+// its own.
+//
+// Parameters:
+//   - hooks: the hooks, in the order they are offered the request
+//
+// Returns:
+//   - respHookFunc: the combined hook
+func chainRespHooks(hooks ...respHookFunc) respHookFunc {
+	return func(ip string, srv *TestServer, req, resp *framer) bool {
+		for _, hook := range hooks {
+			if hook(ip, srv, req, resp) {
+				return true
+			}
+		}
+		return false
+	}
 }
