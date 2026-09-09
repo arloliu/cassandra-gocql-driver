@@ -178,12 +178,77 @@ type ExponentialBackoffRetryPolicy struct {
 	Min, Max   time.Duration
 }
 
+// Attempt naps for the backoff interval and reports whether the query may run again.
+//
+// The nap ends as soon as the query's context does.
+// A query whose caller cancelled it,
+// or whose deadline has passed,
+// gets false instead of a further attempt,
+// and it gets it without waiting out the rest of the backoff —
+// with the default Max of ten seconds,
+// that wait used to outlive the cancellation by up to that long.
+//
+// The retry budget is read first,
+// so a query that has spent its retries never touches the context at all.
+// A RetryableQuery whose Context returns nil,
+// which only a third-party implementation can do,
+// keeps the plain timed nap it always had.
+//
+// The last thing Attempt does before returning true is read the context again,
+// so the answer means "no cancellation had been observed by the time this returned".
+// It does not claim anything about the window after that read.
+//
+// Parameters:
+//   - q: the query whose attempt count and context decide the answer
+//
+// Returns:
+//   - bool: true to attempt the query again; false once the retry budget is spent
+//     or the query's context is done
 func (e *ExponentialBackoffRetryPolicy) Attempt(q RetryableQuery) bool {
 	if q.Attempts() > e.NumRetries {
 		return false
 	}
-	time.Sleep(e.napTime(q.Attempts()))
-	return true
+
+	ctx := q.Context()
+	if ctx == nil {
+		time.Sleep(e.napTime(q.Attempts()))
+		return true
+	}
+
+	if ctx.Err() != nil {
+		return false
+	}
+
+	timer := time.NewTimer(e.napTime(q.Attempts()))
+	defer timer.Stop()
+
+	return napUntil(ctx, timer.C)
+}
+
+// napUntil waits for fire or for ctx to end, whichever comes first.
+//
+// It is the select and the recheck that follows it, and nothing more:
+// the timer belongs to the caller, which is what stops it.
+//
+// The recheck covers the case where the nap and the cancellation become ready
+// together and the select picks the nap.
+// Without it, a query cancelled during its backoff could still be attempted again
+// purely because of which case the runtime happened to choose.
+//
+// Parameters:
+//   - ctx: the query's context
+//   - fire: the channel the nap's timer fires on
+//
+// Returns:
+//   - bool: true when the nap ran out with ctx still live; false whenever ctx ended
+func napUntil(ctx context.Context, fire <-chan time.Time) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-fire:
+	}
+
+	return ctx.Err() == nil
 }
 
 // used to calculate exponentially growing time
