@@ -5,6 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0-otter] - 2026-09-09
+
+Speculative execution no longer fails faster than a plain query, and a cancelled query no
+longer keeps consulting its retry policy. Both are changes to documented behaviour - the
+speculative race rule in the package documentation and the moment a `RetryPolicy` is called -
+so this is a minor release, although no exported symbol is added. Nothing here reaches a
+caller that does not use speculative execution except the cancellation change and the
+`Host()` on an exhausted query's iterator.
+
+### Changed
+
+- **An execution that runs out of attempts waits for its siblings instead of ending the
+  query.** Before, the first speculative runner to finish decided the query, whatever it
+  finished with. A runner that failed with a retryable error and then found the shared host
+  selection exhausted, or was refused a further attempt by the retry policy, published that
+  error as the result and cancelled the sibling that was still in flight on a healthy node -
+  so enabling `SpeculativeExecutionPolicy` could turn a slow success into a fast failure.
+  With two up hosts and `Speculation{1}` it took one node answering with an error while the
+  other was merely slow; with `SimpleRetryPolicy{NumRetries: 0}`, the default-shaped
+  configuration, any sibling error did it.
+
+  Now such a runner *retires*: its outcome is held back while any sibling is still
+  executing, and the first decisive outcome - a successful result, an error the policy
+  answers with `Ignore` or `Rethrow`, an error no retry can follow, or a cancellation - still
+  wins immediately. Only when every execution that was started has retired is one of their
+  errors returned: an error from an execution that reached a host is preferred over
+  `ErrNoConnections` from one that did not, and among errors of the same kind the one the
+  driver processed last wins. Executions not yet started are not waited for; a caller
+  cancellation beats the last retirement. The package documentation's "the first received
+  result will be returned" is replaced by this rule. The retry budget is unchanged and is
+  still query-wide, so a sibling can still consume the primary's last retry; that decides
+  the primary's next step, not the query's result.
+
+  Retirement never invents an error. What the caller sees is the last attempt's own error,
+  which may be a server error, a driver timeout, or a local error such as a binding
+  callback's, or `ErrNoConnections` when no attempt reached a host. Under speculative
+  execution an attempt that itself fails with `ErrNoConnections` (a `Session.Bind` callback
+  can return it) used to be misread as "found no host" and could never end the query; it is
+  now classified by the retry policy's answer like any other error.
+
+- **A cancelled query stops consulting its retry policy.** `RetryPolicy.Attempt` and
+  `GetRetryType` are no longer called once the query's context is observed cancelled - the
+  executor checks before `Attempt`, between the two callbacks, and after `GetRetryType` - and
+  no further attempt is issued. The checkpoints sit after the success, non-idempotent and
+  no-policy exits, so those are untouched. Outside speculative execution the iterator the
+  caller receives in that window is the attempt's own, carrying `context.Canceled` or
+  `context.DeadlineExceeded` in place of the attempt's error, with its host, warnings and
+  custom payload intact; an `Ignore` answer is overridden the same way. Under speculative
+  execution the coordinator may answer the cancellation first with a bare context-error
+  iterator, as it always has, and the runner's iterator is then closed by the drain. Before,
+  an attempt error arriving around the cancellation went through the full policy, including
+  an `ExponentialBackoffRetryPolicy` nap of up to `Max`, and one more attempt. A callback
+  already running is never interrupted.
+
+- **`ExponentialBackoffRetryPolicy.Attempt` returns when the query's context ends.** The nap
+  is a timer selected against `RetryableQuery.Context()`; when the context ends first, or
+  has already ended, `Attempt` returns `false` without sleeping. A `RetryableQuery` whose
+  `Context()` is nil keeps the old timed sleep.
+
+- **Inside a speculative execution, `RetryableQuery.Context()` is the runner's context.** It
+  derives from the caller's (same deadline, same values) and is additionally cancelled when a
+  sibling wins, so a backoff nap or a custom policy waiting on it wakes up instead of
+  sleeping out `Max` after the query has already been answered. Outside speculative
+  execution nothing changes. The next page of a paged query does not inherit it.
+
+### Fixed
+
+- **An idempotent query that exhausted its hosts returned an iterator with no host.** The
+  retry loop rebuilt the final error into a fresh iterator, so `Iter.Host()` was nil and any
+  warnings or custom payload the last coordinator sent were lost. The iterator returned is
+  now the last attempt's own; `Close` it as always. (The retry-budget exit already returned
+  the real iterator.)
+
+### Internal
+
+- `queryExecutor.do` reports how its loop ended alongside the iterator, and the speculative
+  runner and coordinator classify by that report rather than by sniffing the error value.
+  The last attempt's iterator is retained across drawn hosts that yield no connection and
+  is closed only when the next attempt actually starts. The coordinator owns at most one
+  retirement candidate; every close on its side goes through one helper whose test seam and
+  `Close` are isolated separately, and the runner drain does the same on both channels.
+- Allocation counts on the single-attempt and retry paths are unchanged (`BenchmarkDo_*`,
+  4 allocs/op and 136 B/op before and after). A speculative query costs one more allocation
+  and about 60 more bytes than before, once per query, not per attempt
+  (`BenchmarkCoordinate_MainWins`, 46 to 47 allocs/op, 3724 to 3783 B/op): the runners'
+  retirement channel now carries an iterator, so its buffer is no longer zero-sized, and the
+  runner context field moves the internal request into the next size class.
+- Live-cluster validation: `make test-cassandra` at protocol v5 against Cassandra 4.1.6,
+  158 pass / 8 pre-existing skips / 0 fail.
+
 ## [2.6.3-otter] - 2026-09-08
 
 Host metadata reads on the query hot path no longer take a lock. `HostInfo`'s data center,
