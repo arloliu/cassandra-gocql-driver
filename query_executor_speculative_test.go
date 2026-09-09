@@ -96,8 +96,8 @@ func TestSpeculative_RunnersShareOneBudget(t *testing.T) {
 	stages.await(t, runEntered, "the speculative runner to start")
 	entered <- struct{}{}
 
-	// The sibling either attempts the other host (a replacement was drawn) or reports
-	// no host (no replacement); release the held request once it has done either.
+	// The sibling either attempts the other host (a replacement was drawn) or retires
+	// without one (no replacement); release the held request once it has done either.
 	otherAttempted := func() bool { return recorder.hosts()[other] > 0 }
 	deadline := time.After(fillEventBudget)
 	for !otherAttempted() {
@@ -152,7 +152,7 @@ func TestSpeculative_TerminalPassDoesNotReopenEnumeration(t *testing.T) {
 	// The sibling now finds nothing to draw.
 	stages.await(t, runEntered, "the speculative runner to start")
 	entered <- struct{}{}
-	stages.await(t, runRetired, "the speculative runner to report no host")
+	stages.await(t, runRetired, "the speculative runner to retire")
 
 	// The query ends only once every launched runner has retired, so both holds go;
 	// the order between them does not affect the selection accounting asserted below.
@@ -237,7 +237,7 @@ func TestSpeculative_EnumeratingRunnersUnchanged(t *testing.T) {
 }
 
 // TestSpeculative_NoHostExitStillPrompt proves the query still ends on the main runner's
-// no-host report rather than waiting for the scheduled launch.
+// retirement rather than waiting for the scheduled launch.
 func TestSpeculative_NoHostExitStillPrompt(t *testing.T) {
 	harness := newFillHarness(t, 2, nil)
 	for _, host := range harness.hosts {
@@ -261,7 +261,7 @@ func TestSpeculative_NoHostExitStillPrompt(t *testing.T) {
 }
 
 // TestSpeculative_WaitingRunnerSurvivesSiblingAfterReplacement proves a runner waiting
-// for a fill is not ended by a sibling's no-host report, with a replacement in play: the
+// for a fill is not ended by a sibling's retirement, with a replacement in play: the
 // main runner spent the budget on a replacement before waiting, so the sibling finds the
 // selector exhausted.
 func TestSpeculative_WaitingRunnerSurvivesSiblingAfterReplacement(t *testing.T) {
@@ -295,7 +295,7 @@ func TestSpeculative_WaitingRunnerSurvivesSiblingAfterReplacement(t *testing.T) 
 	})
 
 	awaitSignal(t, waiting, "the main runner to wait for the fill")
-	stages.await(t, runRetired, "the speculative runner to report no host")
+	stages.await(t, runRetired, "the speculative runner to retire")
 	harness.dialer.releaseAll()
 
 	require.NoError(t, awaitQuery(t, result), "the waiting runner must still win")

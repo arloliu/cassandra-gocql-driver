@@ -767,8 +767,12 @@
 // even before the driver receives an error or timeout from the server.
 // When a query is speculatively executed, the original execution is still executing.
 // The executions race: the first decisive outcome is returned
-// — a successful result, an error the RetryPolicy answers with Ignore or Rethrow,
+// — a successful result,
+// an error the RetryPolicy answers with Ignore, which makes the query succeed with no error,
+// an error the RetryPolicy answers with Rethrow, which is returned as it is,
 // an error no retry can follow (no RetryPolicy, an unknown retry type, a panicking callback),
+// an attempt that ends with ErrNotFound,
+// an execution whose wait for a connection ends with ErrSessionClosed because the session was closed,
 // or a cancellation.
 // An execution that fails with a retryable error but can make no further attempt,
 // because its RetryPolicy refused one or no further host is available,
@@ -777,6 +781,8 @@
 // Only when every execution that was started has ended that way is one of their errors returned:
 // an error from an execution that reached a host is preferred over ErrNoConnections from one that did not,
 // and among errors of the same kind the one the driver processed last wins.
+// If the caller's context ends as the last launched execution retires,
+// the context's error is returned rather than that execution's.
 // Executions not yet started when the last one ends are not waited for.
 //
 // # User-defined types

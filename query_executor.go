@@ -761,8 +761,10 @@ func (q *queryExecutor) pooledUp(host *HostInfo) bool {
 //   - awaitFill fails: no iterator is held
 //   - a callback panics: the deferred cleanup closes held
 //
-// The hosts' Mark and the retry policy's Attempt and GetRetryType are user code that
-// runs while do owns an iterator, so a panic out of them closes it.
+// The hosts' Mark, the retry policy's Attempt and GetRetryType, the host selection
+// policy's NextHost/Pick (reached through the selector's draw and advance), and
+// SelectedHost.Info are user code that runs while do owns an iterator, so a panic out
+// of them closes it.
 // This is a pure cleanup defer: it does not recover, so the synchronous caller in
 // executeQuery still sees the original panic value.
 //

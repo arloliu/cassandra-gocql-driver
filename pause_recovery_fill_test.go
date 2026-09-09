@@ -1619,11 +1619,11 @@ func TestAwaitFill_SpeculativeNoHostCannotWin(t *testing.T) {
 
 	result := harness.query(t.Context(), speculative(1, time.Millisecond))
 	awaitSignal(t, waiting, "the first runner to await the fill")
-	stages.await(t, runRetired, "the speculative runner to report no host")
+	stages.await(t, runRetired, "the speculative runner to retire")
 
 	select {
 	case err := <-result:
-		t.Fatalf("the no-host report ended the query: %v", err)
+		t.Fatalf("the sibling's retirement ended the query: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -1660,18 +1660,18 @@ func TestCoordinate_NoHostBetweenTicks(t *testing.T) {
 	entered <- struct{}{}
 	awaitSignal(t, waiting, "the main runner to await the fill")
 
-	// Each sibling finds no host; its report is released before the next one starts.
+	// Each sibling finds no host; its retirement is released before the next one starts.
 	for sibling := 1; sibling <= 2; sibling++ {
 		stages.await(t, runEntered, "a speculative runner to start")
 		entered <- struct{}{}
-		stages.await(t, runRetired, "a speculative runner to report no host")
+		stages.await(t, runRetired, "a speculative runner to retire")
 		reported <- struct{}{}
 	}
 
 	harness.dialer.releaseAll()
 	require.NoError(t, awaitQuery(t, result), "the waiting runner must still win")
 	require.Equal(t, 3, stages.count(runEntered), "one main runner and two speculative runners must have started")
-	require.Equal(t, 2, stages.count(runRetired), "both speculative runners must have reported no host")
+	require.Equal(t, 2, stages.count(runRetired), "both speculative runners must have retired")
 }
 
 // TestCoordinate_NoHostEndsWithLaunchScheduled proves a query ends as soon as every
@@ -1691,7 +1691,7 @@ func TestCoordinate_NoHostEndsWithLaunchScheduled(t *testing.T) {
 	harness.session.pool.removeHost(harness.hosts[0])
 
 	result := harness.query(t.Context(), speculative(1, time.Hour))
-	stages.await(t, runRetired, "the main runner to report no host")
+	stages.await(t, runRetired, "the main runner to retire")
 
 	start := time.Now()
 	reported <- struct{}{}
@@ -1718,10 +1718,10 @@ func TestCoordinate_NoHostReleasesQueryOnSessionClose(t *testing.T) {
 	harness.session.pool.removeHost(harness.hosts[0])
 
 	result := harness.query(context.Background(), speculative(1, time.Hour))
-	stages.await(t, runRetired, "the main runner to report no host")
+	stages.await(t, runRetired, "the main runner to retire")
 
 	// Close cancels the session context, which the coordinator does not select on,
-	// so only the no-host report itself can end this query.
+	// so only the retirement itself can end this query.
 	harness.session.Close()
 
 	start := time.Now()

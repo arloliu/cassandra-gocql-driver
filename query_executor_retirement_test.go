@@ -316,3 +316,33 @@ func TestDo_SameErrorDifferentOutcome(t *testing.T) {
 		requireSameError(t, ErrNoConnections, result.Close(), "Close reports the attempt's own error")
 	})
 }
+
+// TestExecuteQuery_SingleExecutionHandsOverLiveFramer proves the non-speculative path in
+// executeQuery hands the caller do's exhausted-selection retirement exactly as do returned
+// it: the last attempt's own iterator, framer and all, with the outcome classification
+// discarded rather than consulted.
+//
+// A pinned query is the simplest way to reach that exit: the selector yields the one host
+// once, so a policy that always asks for RetryNextHost exhausts it after a single attempt.
+func TestExecuteQuery_SingleExecutionHandsOverLiveFramer(t *testing.T) {
+	fixture := newDoFixture()
+	fixture.executor.pool.session = &Session{ring: ring{hosts: map[string]*HostInfo{fixture.host.HostID(): fixture.host}}}
+
+	held := newRetirementIter(errScriptedAttempt)
+	pub := &Query{stmt: "SELECT ownership FROM t", rt: alwaysNextHostPolicy{}, idempotent: true}
+	pub.SetHostID(fixture.host.HostID())
+	qry := &scriptedQuery{internalQuery: newInternalQuery(pub, context.Background()), iters: []*heldIter{held}}
+
+	iter, err := fixture.executor.executeQuery(qry)
+
+	require.NoError(t, err, "a pinned query naming a host the ring holds is never refused")
+	require.Same(t, held.iter, iter, "the caller receives do's retirement, not a synthetic error iter")
+	require.NotNil(t, iter.framer, "the framer is still live before Close")
+	require.False(t, held.released(), "Close has not run yet, so the framer has not been released")
+
+	gotErr := iter.Close()
+
+	requireSameError(t, errScriptedAttempt, gotErr, "Close reports the attempt's own error")
+	require.Nil(t, iter.framer, "Close cleared the iterator's reference to the framer")
+	require.True(t, held.released(), "Close released the framer back to the pool")
+}
