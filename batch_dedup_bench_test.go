@@ -1,3 +1,6 @@
+//go:build all || unit
+// +build all unit
+
 /*
  * Benchmark: Batch Prepare Deduplication
  *
