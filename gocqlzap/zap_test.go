@@ -26,6 +26,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -51,6 +52,12 @@ func TestGocqlZapLog(t *testing.T) {
 	clusterCfg := gocql.NewCluster("0.0.0.1")
 	clusterCfg.Logger = NewZapLogger(logger)
 	clusterCfg.ProtoVersion = 4
+	// 0.0.0.1 never answers, so the dial has to fail before the log line this
+	// test reads can exist. The default ConnectTimeout is 11 seconds and the
+	// dial is what spends it; a strictly positive millisecond keeps the same
+	// failure and the same log line without the wait. It must stay positive:
+	// zero means "no deadline" to net.Dialer, not "give up at once".
+	clusterCfg.ConnectTimeout = time.Millisecond
 	session, err := clusterCfg.CreateSession()
 	if err == nil {
 		session.Close()
