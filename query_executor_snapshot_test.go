@@ -1277,6 +1277,15 @@ func TestSpeculative_BatchRunnersGetOwnSnapshot(t *testing.T) {
 	require.Equal(t, []Consistency{Quorum, Quorum}, seen[:2],
 		"the sibling's downgrade must not reach the frames the other runner sends")
 
+	// The invariant is now pinned, so the sibling's held retry has nothing left
+	// to hold: releasing it lets both runners exhaust their retry budget and
+	// retire, and the coordinator returns a RequestErrReadTimeout. Without this
+	// the batch can only end when the bounded context expires, which turns the
+	// select below into a mandatory ten-second wait instead of the failure bound
+	// it is meant to be, and makes Close() return context.DeadlineExceeded
+	// rather than the read timeout the assertion below names.
+	script.release(hostIP(loser))
+
 	select {
 	case iter := <-result:
 		require.Error(t, iter.Close(), "the fixture answers every batch with a read timeout")
