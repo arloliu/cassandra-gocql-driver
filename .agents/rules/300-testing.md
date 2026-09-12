@@ -4,6 +4,50 @@
 - **Unit:** Co-located in `*_test.go` with `-tags unit`. Same package or `_test` suffix.
 - **Integration:** Also in `*_test.go` but without the `unit` tag. Require a running Cassandra cluster via CCM.
 
+## Build Tags
+
+Five tags select the lanes. `TEST_INTEGRATION_TAGS` (`Makefile`, default `integration`)
+is forwarded verbatim to `go test`, so `test-integration` is a *parameterised*
+target, not a fixed-tag one. CI drives it with a matrix of
+`["cassandra", "integration", "ccm"]`.
+
+| Tag | Needs a cluster | Status |
+|---|---|---|
+| `unit` | no | where every new unit test goes |
+| `integration` | yes | where every new cluster test goes |
+| `cassandra` | yes | **frozen legacy set — add no new files** |
+| `ccm` | yes, and it stops and starts nodes | in the CI matrix |
+| `ccmtopology` | yes, rebuildable | destructive; **not in CI at all yet** — see below |
+
+- **New tests go on `unit` or `integration`.** Never add a file to `cassandra`.
+  The `integration`/`cassandra` split is historical, not semantic: only 2 of the 17
+  `cassandra` files carry version or feature gates, and `integration`-tagged files
+  such as `tuple_test.go` need a real cluster just the same. Keeping the two lanes
+  separate keeps them short; merging them would make one longer lane.
+- **`example*_test.go` files are deliberately untagged.** An untagged test file
+  compiles in *every* lane, which makes those files the driver's API compile check
+  across all of them — and for shapes such as `Example_vector`'s SAI/ANN calls it is
+  the only coverage that exists. They contain no `// Output:` block, so they cost
+  compile time only (2,112 of 60,893 test LOC) and no run time. Do not tag them.
+- **`ccmtopology` runs nowhere automatically.** It is outside the CI matrix and has
+  no job of its own; giving it one dedicated job is planned but not delivered, because
+  it is unknown whether the workflow's 15-minute job timeout fits a
+  restart-under-a-new-address run. Until then it only runs when someone runs it.
+- **`ccmtopology` is destructive to a local cluster.** It restarts a node under a
+  new address, and an interrupted run leaves the node moved. Confirm the cluster can
+  be rebuilt first, then:
+  ```bash
+  make test-ccmtopology
+  # equivalently
+  make test-integration TEST_INTEGRATION_TAGS="ccm ccmtopology" \
+      TEST_OPTS="-run TestRejoinWithNewAddress"
+  ```
+- **Changing a file's tags requires a compile-coverage check.** Prove every test file
+  is still compiled by at least one lane: run `go vet -tags <tag> ./...` for each of
+  `unit`, `integration`, `cassandra`, `ccm`, `"ccm ccmtopology"`, and with no tags.
+  (`go build` does not compile `_test.go` files, and `go vet -tags all ./...` fails
+  pre-existing in this repo.)
+
 ## Rules
 - **No Emojis:** Do not use emojis in test log messages.
 - **Context:** Use `t.Context()`.
@@ -37,6 +81,14 @@ func TestOneThing(t *testing.T) {
 ## Running Tests
 ```bash
 make test-unit         # Unit tests with race detector (-tags unit)
+make test-unit-fast    # Same selection without -race, for the inner loop
 make test-integration  # Integration tests (requires Cassandra via CCM)
+make test-cassandra    # The frozen cassandra-tagged set
+make test-ccm          # ccm-tagged tests (stop/start/pause real nodes)
+make test-ccmtopology  # Destructive rejoin-under-a-new-address test
 make cassandra-start   # Start local Cassandra cluster before integration tests
 ```
+
+`make test-integration` runs `./...`, so the root ccm tests and
+`internal/ccm.TestCCM` drive the *same* cluster, and both stop and start `node1`.
+Run them in one lane only with a serialisation policy in place.

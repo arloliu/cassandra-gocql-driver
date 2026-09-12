@@ -124,10 +124,36 @@ test-cassandra: .prepare-cassandra-cluster
 	@echo "Run cassandra-tagged tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
 	go test -v ${TEST_OPTS} -tags "cassandra gocql_debug" -timeout=${TEST_TIMEOUT} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
 
+# test-ccm and test-ccmtopology are aliases over the parameterised
+# test-integration target: TEST_INTEGRATION_TAGS is what selects a lane, and the
+# ccm-tagged tests already run in CI through that variable. The aliases exist so
+# a local run does not have to remember the tag spelling.
+test-ccm:
+	@$(MAKE) test-integration TEST_INTEGRATION_TAGS="ccm"
+
+# ccmtopology restarts a node under a new address. It is destructive to the
+# shared local cluster and an interrupted run leaves the node moved, so confirm
+# the cluster can be rebuilt before running it. See the invocation notes in
+# rejoin_new_ip_ccm_test.go.
+#
+# TEST_OPTS replaces the default -run filter rather than adding to it, so pass
+# the filter back yourself if you override it:
+#   make test-ccmtopology TEST_OPTS="-run TestRejoinWithNewAddress -count=2"
+test-ccmtopology:
+	@$(MAKE) test-integration TEST_INTEGRATION_TAGS="ccm ccmtopology" \
+		TEST_OPTS="$(or ${TEST_OPTS},-run TestRejoinWithNewAddress)"
+
 test-unit:
 	@echo "Run unit tests"
 	@go clean -testcache
 	go test -v -tags unit -timeout=5m -race ./...
+
+# test-unit-fast is the inner-loop lane: same selection as test-unit without the
+# race detector. CI keeps running test-unit, so -race coverage is not lost.
+test-unit-fast:
+	@echo "Run unit tests without the race detector"
+	@go clean -testcache
+	go test -v -tags unit -timeout=5m ./...
 
 check: .prepare-golangci
 	@echo "Build"
