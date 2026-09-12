@@ -206,6 +206,9 @@ type pagingRequest struct {
 	pagingState []byte
 	// page is the 1-based page the request asked for.
 	page int
+	// seq is this request's position among everything the fixture answered,
+	// prepares included.
+	seq int64
 }
 
 // pagingScript is a test server response hook that serves one statement as a
@@ -227,11 +230,23 @@ type pagingScript struct {
 	// errors counts the errors already answered.
 	errors atomic.Int32
 
+	// forgotten makes every EXECUTE answer ErrCodeUnprepared until a PREPARE
+	// arrives, the way a node that lost its prepared-statement cache behaves.
+	// It is atomic: the servers read it on their own goroutines.
+	forgotten atomic.Bool
+
+	// seq numbers every recorded request, statement and page alike, so the two
+	// logs can be ordered against each other. Prepares are kept out of
+	// requests because holdFrom ordinals and seenPages are keyed on it.
+	seq atomic.Int64
+
 	// holds parks selected requests, per server.
 	*requestHolds
 
 	mu       sync.Mutex
 	requests []pagingRequest
+	// prepares holds the sequence number of every PREPARE answered.
+	prepares []int64
 	// failIPs answers every request reaching one of these servers with a server
 	// error, so a test can decide which runner loses.
 	failIPs map[string]bool
@@ -252,6 +267,15 @@ func newPagingScript(pages, rows int) *pagingScript {
 		failIPs:      map[string]bool{},
 		updated:      make(chan struct{}, 64),
 	}
+}
+
+// forgetPrepared makes every server answer the next EXECUTE with
+// ErrCodeUnprepared, until a PREPARE teaches the statement again.
+//
+// This is what a node looks like after it restarted: the statement text is still
+// valid, the id the driver holds is not.
+func (s *pagingScript) forgetPrepared() {
+	s.forgotten.Store(true)
 }
 
 // failHost answers every request reaching the server at ip with a server error.
@@ -282,6 +306,10 @@ func (s *pagingScript) hook(ip string, srv *TestServer, req, resp *framer) bool 
 		if err != nil || stmt != pagingStmt {
 			return false
 		}
+		// A PREPARE is how a server that had forgotten the statement learns it
+		// again, so it is what clears the forgotten flag.
+		s.forgotten.Store(false)
+		s.recordPrepare(ip)
 		s.writePrepared(resp, head)
 		return true
 	case opQuery:
@@ -317,6 +345,14 @@ func (s *pagingScript) hook(ip string, srv *TestServer, req, resp *framer) bool 
 
 	s.record(pagingRequest{ip: ip, op: head.op, consistency: cons, pagingState: state, page: page})
 	s.enter(ip)
+
+	// A server that has forgotten the statement rejects the id rather than the
+	// request, which is what makes the driver evict its cache entry and prepare
+	// again instead of retrying the same id elsewhere.
+	if head.op == opExecute && s.forgotten.Load() {
+		writeUnpreparedError(resp, head, pagingPreparedID)
+		return true
+	}
 
 	if failBefore := s.errorsBefore.Load(); fail || (s.errors.Load() < failBefore && s.errors.Add(1) <= failBefore) {
 		writeReadTimeoutError(resp, head)
@@ -443,6 +479,17 @@ func (s *pagingScript) writeRows(resp *framer, head *frameHeader, page int) {
 	}
 }
 
+// writeUnpreparedError answers with ErrCodeUnprepared for one statement id.
+//
+// The driver answers it by evicting that id from the per-host prepared cache and
+// executing the same request again, which sends a fresh PREPARE first.
+func writeUnpreparedError(resp *framer, head *frameHeader, id uint64) {
+	resp.writeHeader(0, opError, head.stream)
+	resp.writeInt(ErrCodeUnprepared)
+	resp.writeString("snapshot fixture forgot the prepared statement")
+	resp.writeShortBytes(binary.BigEndian.AppendUint64(nil, id))
+}
+
 // writeReadTimeoutError answers with a read timeout.
 //
 // DowngradingConsistencyRetryPolicy classifies it as Retry, so the runner that
@@ -460,6 +507,8 @@ func writeReadTimeoutError(resp *framer, head *frameHeader) {
 
 // record appends req and signals the waiters.
 func (s *pagingScript) record(req pagingRequest) {
+	req.seq = s.seq.Add(1)
+
 	s.mu.Lock()
 	s.requests = append(s.requests, req)
 	s.mu.Unlock()
@@ -468,6 +517,33 @@ func (s *pagingScript) record(req pagingRequest) {
 	case s.updated <- struct{}{}:
 	default:
 	}
+}
+
+// recordPrepare notes one PREPARE and signals the waiters.
+//
+// Prepares are kept in their own log: holdFrom ordinals and seenPages are keyed
+// on the request log, so adding to it would shift both.
+func (s *pagingScript) recordPrepare(_ string) {
+	seq := s.seq.Add(1)
+
+	s.mu.Lock()
+	s.prepares = append(s.prepares, seq)
+	s.mu.Unlock()
+
+	select {
+	case s.updated <- struct{}{}:
+	default:
+	}
+}
+
+// seenPrepares returns the sequence number of every PREPARE answered so far.
+//
+// Returns:
+//   - []int64: the sequence numbers, in arrival order
+func (s *pagingScript) seenPrepares() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.prepares...)
 }
 
 // seen returns every request answered so far.
