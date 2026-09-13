@@ -59,6 +59,29 @@ const (
 type pauseHostStateListener struct {
 	up   chan *HostInfo
 	down chan *HostInfo
+
+	// mu makes publishing an event and resetting the listener two operations
+	// that cannot interleave.
+	//
+	// It is held across the ledger write AND the channel send, and across the
+	// clear AND the drain, because the interesting failure is a callback that
+	// is preempted between the two halves: it would record itself, be erased by
+	// a reset, then resume and put a stale event on a channel the reset had
+	// already emptied. A reader waiting for the next transition would take that
+	// as the answer.
+	//
+	// Holding a mutex across the sends is safe because they are non-blocking.
+	// The driver calls the listener after it has released its own locks
+	// (events.go, markHostDown), and nothing here calls back into the driver.
+	mu sync.Mutex
+
+	// downSeen records every host reported down since the last reset, keyed by
+	// host id, because the channels above drop events once they are full and
+	// nothing re-sends them. A test asking "did any host other than this one go
+	// down?" must not take its answer from a lossy buffer: markHostDown does
+	// not suppress a repeat notification for an already-down host (events.go),
+	// so a burst about one host can evict the single event that mattered.
+	downSeen map[string]string
 }
 
 // newPauseHostStateListener returns a listener ready to be installed as
@@ -68,12 +91,16 @@ type pauseHostStateListener struct {
 //   - *pauseHostStateListener: listener with empty event channels
 func newPauseHostStateListener() *pauseHostStateListener {
 	return &pauseHostStateListener{
-		up:   make(chan *HostInfo, 64),
-		down: make(chan *HostInfo, 64),
+		up:       make(chan *HostInfo, 64),
+		down:     make(chan *HostInfo, 64),
+		downSeen: make(map[string]string),
 	}
 }
 
 func (l *pauseHostStateListener) OnHostUp(event HostUpEvent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	select {
 	case l.up <- event.Host:
 	default:
@@ -81,10 +108,59 @@ func (l *pauseHostStateListener) OnHostUp(event HostUpEvent) {
 }
 
 func (l *pauseHostStateListener) OnHostDown(event HostDownEvent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.downSeen[event.Host.HostID()] = event.Host.ConnectAddress().String()
+
 	select {
 	case l.down <- event.Host:
 	default:
 	}
+}
+
+// resetDownSeen forgets every host reported down so far, and drains both event
+// channels.
+//
+// It draws an explicit observation boundary. Without one, a host that failed a
+// pool fill during session setup - connectionpool.go reports that as a host
+// down - is still queued when the test starts watching, and would be read as
+// damage the test caused.
+func (l *pauseHostStateListener) resetDownSeen() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	clear(l.downSeen)
+
+	for {
+		select {
+		case <-l.down:
+		case <-l.up:
+		default:
+			return
+		}
+	}
+}
+
+// downSeenExcept reports which hosts other than excludeID have been reported
+// down since the last resetDownSeen.
+//
+// Parameters:
+//   - excludeID: the host whose own transitions the caller expects
+//
+// Returns:
+//   - []string: connect addresses of any other host reported down, empty if none
+func (l *pauseHostStateListener) downSeenExcept(excludeID string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var others []string
+	for hostID, addr := range l.downSeen {
+		if hostID != excludeID {
+			others = append(others, addr)
+		}
+	}
+	return others
 }
 
 // awaitHostEvent blocks until ch reports hostID, discarding other hosts.
