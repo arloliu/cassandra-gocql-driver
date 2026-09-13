@@ -36,6 +36,30 @@ func TestCCM(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The test stops node1 halfway through. Registering the restore before the
+	// first failure point means an assertion that fails in between still leaves
+	// the shared cluster as it was found, rather than one node down for whatever
+	// runs next.
+	//
+	// It has to be conditional: ccm refuses to start a node that is already
+	// running, so an unconditional restore would fail the very runs that got all
+	// the way to the end and started node1 themselves.
+	t.Cleanup(func() {
+		status, err := Status()
+		if err != nil {
+			t.Errorf("reading the cluster status to restore node1: %v", err)
+			return
+		}
+
+		if host, ok := status["node1"]; ok && host.State.IsUp() {
+			return
+		}
+
+		if err := NodeUp("node1"); err != nil {
+			t.Errorf("restoring node1 after the test: %v", err)
+		}
+	})
+
 	status, err := Status()
 	if err != nil {
 		t.Fatal(err)
