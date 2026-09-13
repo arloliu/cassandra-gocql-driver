@@ -11,6 +11,11 @@ is forwarded verbatim to `go test`, so `test-integration` is a *parameterised*
 target, not a fixed-tag one. CI drives it with a matrix of
 `["cassandra", "integration", "ccm"]`.
 
+`TEST_OPTS` may carry only flags `go test` itself recognises — `-run`, `-count`,
+`-v`, `-timeout`. It must **not** carry `-tags`, or anything else that changes
+which packages or files are selected: it lands after each recipe's own `-tags`
+and would override it.
+
 | Tag | Needs a cluster | Status |
 |---|---|---|
 | `unit` | no | where every new unit test goes |
@@ -20,15 +25,15 @@ target, not a fixed-tag one. CI drives it with a matrix of
 | `ccmtopology` | yes, rebuildable | destructive; **not in CI at all yet** — see below |
 
 - **New tests go on `unit` or `integration`.** Never add a file to `cassandra`.
-  The `integration`/`cassandra` split is historical, not semantic: only 2 of the 17
-  `cassandra` files carry version or feature gates, and `integration`-tagged files
-  such as `tuple_test.go` need a real cluster just the same. Keeping the two lanes
+  The `integration`/`cassandra` split is historical, not semantic: version and
+  feature gates appear on both sides of it, and `integration`-tagged files such as
+  `tuple_test.go` need a real cluster just the same. Keeping the two lanes
   separate keeps them short; merging them would make one longer lane.
 - **`example*_test.go` files are deliberately untagged.** An untagged test file
   compiles in *every* lane, which makes those files the driver's API compile check
   across all of them — and for shapes such as `Example_vector`'s SAI/ANN calls it is
   the only coverage that exists. They contain no `// Output:` block, so they cost
-  compile time only (2,112 of 60,893 test LOC) and no run time. Do not tag them.
+  compile time only (2,112 of 61,324 test LOC) and no run time. Do not tag them.
 - **`ccmtopology` runs nowhere automatically.** It is outside the CI matrix and has
   no job of its own; giving it one dedicated job is planned but not delivered, because
   it is unknown whether the workflow's 15-minute job timeout fits a
@@ -89,6 +94,24 @@ make test-ccmtopology  # Destructive rejoin-under-a-new-address test
 make cassandra-start   # Start local Cassandra cluster before integration tests
 ```
 
-`make test-integration` runs `./...`, so the root ccm tests and
-`internal/ccm.TestCCM` drive the *same* cluster, and both stop and start `node1`.
-Run them in one lane only with a serialisation policy in place.
+### What the integration targets actually select
+
+`make test-integration`, `test-cassandra` and `test-integration-auth` select the
+**root package only** (`.`). They name the package *before* the custom
+test-binary flags, and both facts matter.
+
+`go test`'s grammar is `[flags] [packages] [flags & test-binary flags]`: once an
+unrecognised flag such as `-proto` appears, everything after it goes to the test
+binary. A package pattern written after those flags is therefore swallowed in
+silence — which is what these recipes used to do. The trailing `./...` selected
+nothing, only the current directory was compiled, and a mistyped path was
+accepted without error.
+
+`.` rather than `./...` is deliberate: `internal/ccm` does not register the root
+binary's custom flags, so a working `./...` would fail with
+`flag provided but not defined: -proto` before running any test in
+`internal/ccm`.
+
+**Consequence:** an integration test added in a subpackage would compile but
+never run. `internal/ccm.TestCCM` is the one known package no target runs; run it
+by hand with `go test -tags ccm ./internal/ccm/`.

@@ -11,6 +11,14 @@ TEST_INTEGRATION_TAGS ?= integration
 # default. Override for a longer sweep.
 TEST_TIMEOUT ?= 10m
 
+# TEST_OPTS is forwarded verbatim to `go test`, after the package pattern. It may
+# carry only flags `go test` itself recognises - -run, -count, -v, -timeout.
+#
+# It must NOT carry -tags, or any other option that changes which packages or
+# files are selected. -tags is a flag `go test` recognises, so "only go's own
+# flags" does not exclude it on its own: TEST_OPTS lands after each recipe's own
+# -tags and would override it.
+
 CCM_VERSION ?= 39b8222b31a6c7afe8fe845d16981088a5a735ad
 GOLANGCI_VERSION = v2.1.6
 JVM_EXTRA_OPTS ?= -Dcassandra.test.fail_writes_ks=test -Dcassandra.custom_query_handler_class=org.apache.cassandra.cql3.CustomPayloadMirroringQueryHandler
@@ -112,17 +120,31 @@ cassandra-remove: .prepare-ccm
 	@ccm remove gocql_integration_test 2>/dev/null 1>&2 || true
 	@rm -rf ${CCM_CONFIG_DIR}/gocql_integration_test || true
 
+# The integration recipes name the package "." before any custom test-binary
+# flag, and both positions matter.
+#
+# `go test`'s grammar is [flags] [packages] [flags & test-binary flags]: once an
+# unknown flag such as -proto appears, everything after it is handed to the test
+# binary, so a package pattern written after those flags is silently treated as a
+# test-binary argument and ignored. That is what these recipes used to do - the
+# trailing ./... never selected anything, a mistyped path was accepted in
+# silence, and only the current directory was ever compiled.
+#
+# "." rather than "./..." keeps that de facto behaviour, deliberately:
+# internal/ccm does not register this binary's custom flags, so a working ./...
+# would fail with "flag provided but not defined: -proto" before running any of
+# that package's tests.
 test-integration: .prepare-cassandra-cluster
 	@echo "Run integration tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
-	go test -v ${TEST_OPTS} -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=${TEST_TIMEOUT} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
+	go test -v -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=${TEST_TIMEOUT} . ${TEST_OPTS} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset)
 
 test-integration-auth: .prepare-cassandra-cluster
 	@echo "Run auth integration tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
-	go test -v -run=TestAuthentication -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=${TEST_TIMEOUT} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -runauth -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
+	go test -v -run=TestAuthentication -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=${TEST_TIMEOUT} . -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -runauth -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset)
 
 test-cassandra: .prepare-cassandra-cluster
 	@echo "Run cassandra-tagged tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
-	go test -v ${TEST_OPTS} -tags "cassandra gocql_debug" -timeout=${TEST_TIMEOUT} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset) ./...
+	go test -v -tags "cassandra gocql_debug" -timeout=${TEST_TIMEOUT} . ${TEST_OPTS} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset)
 
 # test-ccm and test-ccmtopology are aliases over the parameterised
 # test-integration target: TEST_INTEGRATION_TAGS is what selects a lane, and the
