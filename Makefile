@@ -11,13 +11,15 @@ TEST_INTEGRATION_TAGS ?= integration
 # default. Override for a longer sweep.
 TEST_TIMEOUT ?= 10m
 
-# TEST_OPTS is forwarded verbatim to `go test`, after the package pattern. It may
-# carry only flags `go test` itself recognises - -run, -count, -v, -timeout.
+# TEST_OPTS is forwarded verbatim to `go test`, ahead of the custom test-binary
+# flags. It may carry only flags `go test` itself recognises - -run, -count, -v,
+# -timeout and the like.
 #
 # It must NOT carry -tags, or any other option that changes which packages or
 # files are selected. -tags is a flag `go test` recognises, so "only go's own
-# flags" does not exclude it on its own: TEST_OPTS lands after each recipe's own
-# -tags and would override it.
+# flags" does not exclude it on its own: TEST_OPTS lands after each recipe's
+# own -tags, would override it, and check-test-selection would then be auditing
+# a different set of tags from the one actually run.
 
 CCM_VERSION ?= 39b8222b31a6c7afe8fe845d16981088a5a735ad
 GOLANGCI_VERSION = v2.1.6
@@ -85,7 +87,25 @@ endif
 
 export JVM_EXTRA_OPTS
 
+# CHECK_INTEGRATION_TAGS rejects a TEST_INTEGRATION_TAGS value outside the sets
+# check_test_selection.sh audits: an unaudited combination could select a file or
+# package no lane covers, which is the failure that check exists to prevent.
+#
+# It is inlined as the first line of every recipe that can act on the value
+# rather than made a prerequisite, because `make -j` runs prerequisites in
+# parallel - a prerequisite would let cluster preparation start alongside it.
+CHECK_INTEGRATION_TAGS = shopt -u nocasematch; \
+	case "$(strip ${TEST_INTEGRATION_TAGS})" in \
+		"integration"|"cassandra"|"ccm"|"ccm ccmtopology") ;; \
+		*) \
+			echo "TEST_INTEGRATION_TAGS=\"${TEST_INTEGRATION_TAGS}\" is not one of the audited tag sets." >&2; \
+			echo "Supported: integration | cassandra | ccm | \"ccm ccmtopology\"" >&2; \
+			echo "To add one, extend LANES in check_test_selection.sh and this list together." >&2; \
+			exit 1 ;; \
+	esac
+
 .prepare-cassandra-cluster: .prepare-ccm .prepare-java
+	@$(CHECK_INTEGRATION_TAGS)
 	@if [ -d ${CCM_CONFIG_DIR}/gocql_integration_test ] && ccm switch gocql_integration_test 2>/dev/null 1>&2 && ccm status | grep UP 2>/dev/null 1>&2; then \
 		echo "Cassandra cluster is already started"; \
   	else \
@@ -133,12 +153,15 @@ cassandra-remove: .prepare-ccm
 # "." rather than "./..." keeps that de facto behaviour, deliberately:
 # internal/ccm does not register this binary's custom flags, so a working ./...
 # would fail with "flag provided but not defined: -proto" before running any of
-# that package's tests.
+# that package's tests. check-test-selection guards the assumption that nothing
+# else needs selecting.
 test-integration: .prepare-cassandra-cluster
+	@$(CHECK_INTEGRATION_TAGS)
 	@echo "Run integration tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
 	go test -v -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=${TEST_TIMEOUT} . ${TEST_OPTS} -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset)
 
 test-integration-auth: .prepare-cassandra-cluster
+	@$(CHECK_INTEGRATION_TAGS)
 	@echo "Run auth integration tests for proto ${TEST_CQL_PROTOCOL} on cassandra ${CASSANDRA_VERSION}"
 	go test -v -run=TestAuthentication -tags "${TEST_INTEGRATION_TAGS} gocql_debug" -timeout=${TEST_TIMEOUT} . -proto=${TEST_CQL_PROTOCOL} -gocql.timeout=60s -runssl -runauth -rf=3 -clusterSize=3 -autowait=2000ms -compressor=${TEST_COMPRESSOR} -gocql.cversion=${CASSANDRA_VERSION} -cluster=$$(ccm liveset)
 
@@ -177,7 +200,27 @@ test-unit-fast:
 	@go clean -testcache
 	go test -v -tags unit -timeout=5m ./...
 
-check: .prepare-golangci
+# check-test-selection proves two things about test *selection*, and nothing
+# about whether the selected tests assert the right things:
+#
+#   A. every *_test.go in this module is selected by at least one lane, so a
+#      misspelt or wrong build tag cannot hide a file from every lane at once;
+#   B. internal/ccm is still the only non-root package holding integration-tagged
+#      tests, so nothing new compiles into a lane that would never run it.
+#
+# `go vet -tags <tag> ./...` cannot stand in for A: vet only checks the files a
+# lane already selected, so a file no tag selects is invisible to all of them.
+check-test-selection:
+	@./check_test_selection.sh
+
+# check-test-selection-cases pins the escapes earlier versions of that check let
+# through. It creates fixtures in the working tree and removes them again, so it
+# is deliberately not part of `check`, which must not mutate anything. Run it on
+# a clean tree after changing check_test_selection.sh.
+check-test-selection-cases:
+	@./check_test_selection_cases.sh
+
+check: .prepare-golangci check-test-selection
 	@echo "Build"
 	@go build -tags all .
 	@echo "Check linting"
@@ -245,3 +288,10 @@ install-ccm:
 		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_VERSION}; \
   	fi
 
+# Every target here is a command, not a file. Without this a file named e.g.
+# `check-test-selection` in the working tree would make `make check` consider the
+# check up to date and skip it silently.
+.PHONY: check check-test-selection check-test-selection-cases fix test-unit test-unit-fast test-integration \
+	test-integration-auth test-cassandra test-ccm test-ccmtopology \
+	cassandra-start cassandra-stop cassandra-remove install-java install-ccm \
+	.prepare-ccm .prepare-java .prepare-cassandra-cluster .prepare-golangci

@@ -14,7 +14,17 @@ target, not a fixed-tag one. CI drives it with a matrix of
 `TEST_OPTS` may carry only flags `go test` itself recognises — `-run`, `-count`,
 `-v`, `-timeout`. It must **not** carry `-tags`, or anything else that changes
 which packages or files are selected: it lands after each recipe's own `-tags`
-and would override it.
+and would override it, leaving `check-test-selection` auditing a different tag
+set from the one actually run.
+
+`TEST_INTEGRATION_TAGS` is validated against the audited list — `integration`,
+`cassandra`, `ccm`, `"ccm ccmtopology"` — and anything else is rejected before
+the cluster starts. The check is inlined as the first line of every recipe that
+acts on the value, not made a prerequisite, because `make -j` runs prerequisites
+in parallel and cluster preparation would start alongside it. An unaudited combination could select a file or package no
+lane covers, which is exactly what `check-test-selection` exists to prevent. To
+add a combination, extend `LANES` in `check_test_selection.sh` and that list
+together.
 
 | Tag | Needs a cluster | Status |
 |---|---|---|
@@ -47,9 +57,20 @@ and would override it.
   make test-integration TEST_INTEGRATION_TAGS="ccm ccmtopology" \
       TEST_OPTS="-run TestRejoinWithNewAddress"
   ```
-- **Changing a file's tags requires a compile-coverage check.** Prove every test file
-  is still compiled by at least one lane: run `go vet -tags <tag> ./...` for each of
-  `unit`, `integration`, `cassandra`, `ccm`, `"ccm ccmtopology"`, and with no tags.
+- **Changing a file's tags requires two different checks, and neither substitutes
+  for the other.**
+  - `make check-test-selection` proves every test file is selected by *some* lane.
+    **`go vet` cannot prove this.** Vet only checks the files a lane already
+    selected, so a file no tag selects at all is invisible to every vet
+    invocation: a root test file tagged `integraton` passes all six vet lanes
+    while containing syntactically invalid Go.
+  - `go vet -tags <tag> ./...` proves the narrower thing it can prove: that the
+    files a given lane *does* select still compile and pass vet. Use the tag sets
+    that are really run, `gocql_debug` included — `unit`, `unit` with `-race`,
+    `"integration gocql_debug"`, `"cassandra gocql_debug"`, `"ccm gocql_debug"`,
+    `"ccm ccmtopology gocql_debug"`. Vetting bare `integration` misses a file
+    that only the real, debug-tagged lane compiles.
+  - Neither proves the test binary links, nor that a selected test executes.
   (`go build` does not compile `_test.go` files, and `go vet -tags all ./...` fails
   pre-existing in this repo.)
 
@@ -92,6 +113,8 @@ make test-cassandra    # The frozen cassandra-tagged set
 make test-ccm          # ccm-tagged tests (stop/start/pause real nodes)
 make test-ccmtopology  # Destructive rejoin-under-a-new-address test
 make cassandra-start   # Start local Cassandra cluster before integration tests
+make check-test-selection  # Prove no test file is stranded and no package is compiled-but-never-run
+make check-test-selection-cases  # Regression cases for that check (mutates the tree, then cleans up)
 ```
 
 ### What the integration targets actually select
@@ -113,5 +136,60 @@ binary's custom flags, so a working `./...` would fail with
 `internal/ccm`.
 
 **Consequence:** an integration test added in a subpackage would compile but
-never run. `internal/ccm.TestCCM` is the one known package no target runs; run it
-by hand with `go test -tags ccm ./internal/ccm/`.
+never run. `make check-test-selection` is the guard against that — see below.
+`internal/ccm.TestCCM` is the one known package no target runs; run it by hand
+with `go test -tags ccm ./internal/ccm/`.
+
+### `make check-test-selection`
+
+Run by `make check`, so it gates every commit. It asserts two things about
+**selection**, and nothing about whether the selected tests assert the right
+things:
+
+- **A. Compile coverage.** Every `*_test.go` in this module is selected by at
+  least one lane. Catches a build tag that is misspelt, wrong, or a combination
+  no lane covers.
+- **B. Execution routing.** Under the four integration tag sets, `internal/ccm`
+  is the only non-root package holding test files. Catches a new subpackage whose
+  tests would compile but never run.
+
+**The lanes it audits are the tag sets actually invoked, `gocql_debug`
+included, and the unit lane both with and without `-race`** (`test-unit` runs
+`-race`, which sets the `race` build tag; `test-unit-fast` does not) —
+`unit`, `unit`+`-race`, `integration gocql_debug`, `cassandra gocql_debug`,
+`ccm gocql_debug`, `ccm ccmtopology gocql_debug`. Auditing bare `integration`
+would pass a file tagged `integration && !gocql_debug`, which no lane can run;
+auditing an extra untagged lane would pass a file whose constraint holds only
+when no tag is set. Keep the list equal to what the recipes really run.
+
+Its inventory walks the **working tree**, not `go list` and not git:
+
+- `go list ./...` omits a directory whose files are all excluded by build
+  constraints **silently**, with no error and exit 0, so a `go list` inventory
+  cannot see the files the check exists to find.
+- `git ls-files --exclude-standard` honours `.gitignore` and
+  `.git/info/exclude`, so an ignore rule could hide a stranded file, and it does
+  not descend into gitlinks.
+
+Pruned, because the audited wildcard routes (`./...`) do not reach them: nested
+modules (their own `go.mod`, matched as literal path prefixes so a directory name
+containing glob characters cannot prune its siblings), `.git`, `testdata/`, and
+`_`/`.`-prefixed directories. A package under one of those can still be built by
+naming it explicitly; the check does not claim otherwise. Symlinks named `*_test.go` are **included** — Go
+compiles what the link points at, so skipping them would let a link into a
+pruned directory smuggle in a stranded test. A path containing a newline is
+rejected outright rather than mis-audited.
+
+`make check-test-selection-cases` pins the escapes that earlier versions of the
+check let through. It creates fixtures in the working tree and removes them
+again, so run it on a clean tree.
+Platform-constrained (`GOOS`/`GOARCH`), `//go:build ignore`, and
+toolchain-conditional files are **deliberately not exempted** — exempting them by
+pattern would also hide a misspelt tag sitting beside a legitimate constraint. If
+one is ever added on purpose, give it a lane or record it explicitly.
+
+**What neither assertion proves:** that a selected test actually executes. A
+`-run` filter, `t.Skip`, a `TestMain` that returns early, a benchmark, or an
+example without an `// Output:` block all stop execution after selection. It also
+says nothing about whether a test asserts the right thing, and vet success does
+not prove the test binary links.
