@@ -45,9 +45,24 @@ together.
   the only coverage that exists. They contain no `// Output:` block, so they cost
   compile time only (2,112 of 61,324 test LOC) and no run time. Do not tag them.
 - **`ccmtopology` runs nowhere automatically.** It is outside the CI matrix and has
-  no job of its own; giving it one dedicated job is planned but not delivered, because
-  it is unknown whether the workflow's 15-minute job timeout fits a
-  restart-under-a-new-address run. Until then it only runs when someone runs it.
+  no job of its own, and it only runs when someone runs it.
+
+  A dedicated job is **deferred, and not on cost.** What was measured on
+  2026-09-13 is the local run: both subtests on one cluster take 148s. A whole
+  job is that plus job setup, the cluster build with the workflow's own 30s wait,
+  and cleanup; scaling the local segments by the runner-to-local ratio for this
+  repo's `Start cassandra nodes` step (median 3.5x, from 80 jobs of one upstream
+  run) **projects** a median near 13 minutes. That is a projection, not a
+  measured job: it is inside the 15-minute timeout, but not by much, and the
+  runner's cluster-build time varies sevenfold within a single run, so it is not
+  evidence the timeout holds.
+
+  What defers it is that **the job would never run here.** `main.yml` triggers on
+  `push` to `trunk` and on `pull_request` - the latter for any branch - and work
+  here lands as direct pushes to a maintained branch that is not `trunk`, with no
+  pull request opened. A job added now could not be executed, and so could not be
+  verified. Revisit if CI starts running on this branch, or if the maintenance
+  process starts using pull requests.
 - **`ccmtopology` is destructive to a local cluster.** It restarts a node under a
   new address, and an interrupted run leaves the node moved. Confirm the cluster can
   be rebuilt first, then:
@@ -57,6 +72,12 @@ together.
   make test-integration TEST_INTEGRATION_TAGS="ccm ccmtopology" \
       TEST_OPTS="-run TestRejoinWithNewAddress"
   ```
+  **Rebuild the cluster between runs**, not just when something breaks. A node
+  that moves to an alias and moves back still leaves that endpoint in the
+  surviving nodes' gossip, so a second process reusing the same cluster picks
+  the same free-looking alias and waits 120s for an "is now UP" that never
+  comes. `rejoinAddressFor` only avoids repeats *within* one process; a fresh
+  cluster is what separates one process from the next.
 - **Changing a file's tags requires two different checks, and neither substitutes
   for the other.**
   - `make check-test-selection` proves every test file is selected by *some* lane.
