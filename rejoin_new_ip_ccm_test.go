@@ -41,7 +41,23 @@ import (
 // parked up here.
 const rejoinAddressBase = 200
 
-// rejoinAddressFor picks a loopback alias no ring host currently holds.
+// rejoinUsedAliases records every alias this process has already parked a node
+// on, because a restored node does not release the endpoint as far as the rest
+// of the cluster is concerned.
+//
+// The surviving nodes' gossip keeps an entry for an address a node once
+// announced itself at. Offering that same address to a later move leaves the
+// node waiting for an "is now UP" that never arrives, and ccm gives up after
+// 120s. Scanning ring hosts alone cannot see this: the first move's cleanup
+// puts the node back at its real address, so the alias looks free again.
+//
+// Process-scoped is the right scope. Gossip lives in the cluster, and a fresh
+// cluster is what separates one process from the next: `make cassandra-start`
+// is an unconditional rebuild.
+var rejoinUsedAliases = map[string]bool{}
+
+// rejoinAddressFor picks a loopback alias no ring host holds and this process
+// has not already used.
 //
 // 127.0.0.0/8 is entirely local on Linux, so no interface setup is needed. The
 // address is chosen rather than fixed because a run killed before its cleanup -
@@ -57,10 +73,14 @@ func rejoinAddressFor(t *testing.T, hosts []*HostInfo) string {
 	for _, host := range hosts {
 		taken[host.ConnectAddress().String()] = true
 	}
+	for addr := range rejoinUsedAliases {
+		taken[addr] = true
+	}
 
 	for i := rejoinAddressBase; i < 255; i++ {
 		candidate := fmt.Sprintf("127.0.0.%d", i)
 		if !taken[candidate] {
+			rejoinUsedAliases[candidate] = true
 			return candidate
 		}
 	}
