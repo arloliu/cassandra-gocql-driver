@@ -21,6 +21,12 @@ TEST_TIMEOUT ?= 10m
 # own -tags, would override it, and check-test-selection would then be auditing
 # a different set of tags from the one actually run.
 
+# flake_scan.sh knobs. FLAKE_RUN is a -run regex and has no default on purpose:
+# scanning the whole lane at -count=40 runs for over an hour and reports one
+# package-level verdict, which is a number nobody can act on.
+FLAKE_COUNT ?= 20
+FLAKE_RACE ?= norace
+
 CCM_VERSION ?= 39b8222b31a6c7afe8fe845d16981088a5a735ad
 GOLANGCI_VERSION = v2.1.6
 JVM_EXTRA_OPTS ?= -Dcassandra.test.fail_writes_ks=test -Dcassandra.custom_query_handler_class=org.apache.cassandra.cql3.CustomPayloadMirroringQueryHandler
@@ -200,6 +206,27 @@ test-unit-fast:
 	@go clean -testcache
 	go test -v -tags unit -timeout=5m ./...
 
+# test-flake-scan runs part of the unit lane repeatedly and prints a per-test
+# failure rate.
+#
+# A flake is a rate, not an event: the tests this repo has trouble with pass in
+# isolation and fail under load, so one red run proves little and "I re-ran it
+# and it passed" proves less. This gives the denominator.
+#
+#   make test-flake-scan FLAKE_RUN=TestFoo
+#   make test-flake-scan FLAKE_RUN='TestFoo|TestBar' FLAKE_COUNT=40 FLAKE_RACE=race
+#
+# Known flakes and their measured rates are listed in
+# .agents/rules/300-testing.md. Comparing a branch against its base means
+# scanning BOTH the same way; a rate from one side says nothing on its own.
+test-flake-scan:
+	@if [ -z "$(strip ${FLAKE_RUN})" ]; then \
+		echo "FLAKE_RUN is required: make test-flake-scan FLAKE_RUN=TestName" >&2; \
+		echo "Optional: FLAKE_COUNT (default ${FLAKE_COUNT}), FLAKE_RACE=race|norace (default ${FLAKE_RACE})" >&2; \
+		exit 2; \
+	fi
+	@./flake_scan.sh "${FLAKE_RUN}" "${FLAKE_COUNT}" "${FLAKE_RACE}"
+
 # check-test-selection proves two things about test *selection*, and nothing
 # about whether the selected tests assert the right things:
 #
@@ -311,7 +338,7 @@ install-ccm:
 # Every target here is a command, not a file. Without this a file named e.g.
 # `check-test-selection` in the working tree would make `make check` consider the
 # check up to date and skip it silently.
-.PHONY: check check-test-selection check-test-selection-cases check-vet-lanes fix test-unit test-unit-fast test-integration \
+.PHONY: check check-test-selection check-test-selection-cases check-vet-lanes fix test-unit test-unit-fast test-flake-scan test-integration \
 	test-integration-auth test-cassandra test-ccm test-ccmtopology \
 	cassandra-start cassandra-stop cassandra-remove install-java install-ccm \
 	.prepare-ccm .prepare-java .prepare-cassandra-cluster .prepare-golangci

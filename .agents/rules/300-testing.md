@@ -188,6 +188,59 @@ fuzzing only the neighbourhood of garbage.
     2. Collect all state transitions.
     3. Assert on complete history.
 
+## Known flakes
+
+**A flake is a rate, not an event.** These tests pass in isolation and fail
+under load, so one red run says almost nothing and "I re-ran it and it passed"
+says less. Measure with a denominator:
+
+```bash
+make test-flake-scan FLAKE_RUN=TestPolicyConnPoolClose_IsTerminal FLAKE_COUNT=40
+make test-flake-scan FLAKE_RUN='TestFoo|TestBar' FLAKE_COUNT=20 FLAKE_RACE=race
+```
+
+Comparing a branch against its base means scanning **both** the same way. A rate
+from one side alone proves nothing about which side introduced it.
+
+| Test | Rate | Measured | Mechanism |
+|---|---|---|---|
+| `TestPolicyConnPoolClose_IsTerminal` | 2/40 | 2026-09-14 | **undiagnosed.** Fails at the `ErrSessionClosed` assertion (`pause_recovery_fill_test.go:1407`). The obvious reading — a waiter that has not re-snapshotted when `Close` returns — does not hold: `testAfterParentNotify` collects every result before `Close` can finish |
+| `TestFillingStopped_ConvictsByIdentity` | 1/40 | 2026-09-14 | 10s timeout waiting for conviction after a failed fill cycle |
+| `TestReconnectSkipsFilteredHosts` | 1/20 under `-race` | 2026-09-07 | the opening `refreshRing()`'s async fill can land `handleNodeConnected` after the test's `setState(NodeDown)`, so the peer is UP again when the sweep runs |
+| `TestCAS` (integration, `cassandra` lane) | seen once in four runs | 2026-09-08 | CQL timestamps are millisecond-resolution; when the two `TOTIMESTAMP(NOW())` calls land in the same millisecond the LWT applies and the "not applied" assertion trips |
+
+`TestReconnectSkipsFilteredHosts` scanned **0/20 under `-race` on 2026-09-14**.
+That is consistent with the 2026-09-07 rate, not evidence it is fixed: for a 5%
+flake in independent trials, 0 failures in 20 runs happens **35.8%** of the time
+(0.95²⁰). Do not remove it from this table on that basis — a scan large enough
+to distinguish "fixed" from "5%" is the evidence that would.
+
+`TestCAS` is **not idempotent within a process**: `-count=N` fails from the
+second iteration on rows the first left behind, so repeated runs are not a way
+to reproduce it.
+
+**A lone failure here does not establish a regression — and does not rule one
+out either.** A new defect can surface in exactly one listed test. Before
+classifying it: compare the *failure signature* (the assertion, the file:line,
+the message) against the one recorded here, and compare the *rate* against the
+base commit scanned the same way. Re-running the branch until it passes settles
+nothing.
+
+### Fixed, and how it was found
+
+`TestSessionCloseCancelsSchemaAgreementWait` was **3/40 on 2026-09-14** and is
+now **0/60**. The bug was in the mock server, not the driver: its read loop
+returned quietly on `io.EOF` but reported every other read error as a test
+failure. A client that closes a socket with data still unread makes the kernel
+send RST rather than FIN, so the server's next read returns `ECONNRESET` — which
+is exactly what `Session.Close` does to a query still in flight. `isClientGone`
+in `conn_test.go` now covers `io.EOF`, `net.ErrClosed` and `syscall.ECONNRESET`,
+and both read paths use it. `io.ErrUnexpectedEOF` is deliberately still an
+error: a short read mid-frame is a framing bug, not a disconnect.
+
+Any test that closes a session mid-request was exposed to this in proportion to
+how often it lost that race.
+
 ## Test Patterns
 **Table-Driven** — Use ONLY for multiple cases:
 ```go
@@ -214,6 +267,7 @@ make test-ccm          # ccm-tagged tests (stop/start/pause real nodes)
 make test-ccmtopology  # Destructive rejoin-under-a-new-address test
 make cassandra-start   # Start local Cassandra cluster before integration tests
 make check-vet-lanes   # go vet once per lane: the files each lane selects still compile
+make test-flake-scan FLAKE_RUN=TestName  # per-test failure rate over FLAKE_COUNT runs
 make check-test-selection  # Prove no test file is stranded and no package is compiled-but-never-run
 make check-test-selection-cases  # Regression cases for that check (mutates the tree, then cleans up)
 ```

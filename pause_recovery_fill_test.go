@@ -1351,6 +1351,10 @@ func TestAwaitFill_RemoveHostWakeCannotBeMissed(t *testing.T) {
 // TestPolicyConnPoolClose_IsTerminal proves closing the session's pool is terminal:
 // every waiter gives up with ErrSessionClosed, a concurrent addHost registers nothing,
 // and Close itself returns.
+// Known flaky - see "Known flakes" in .agents/rules/300-testing.md for the
+// measured rate and the failure signature. A lone failure neither establishes
+// nor rules out a regression: compare the signature against the recorded one,
+// and the rate against the base commit, with `make test-flake-scan`.
 func TestPolicyConnPoolClose_IsTerminal(t *testing.T) {
 	const waiters = 4
 

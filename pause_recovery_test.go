@@ -520,6 +520,10 @@ func TestHandleNodeConnected_ReplacementAfterOwnershipCheck(t *testing.T) {
 // and fillingStopped convicts the host it holds rather than an address it has to look up.
 // Before the fix this cycle left the host UP behind port mapping or NAT,
 // so application traffic kept refilling it and recovery never became ReconnectInterval's job.
+// Known flaky - see "Known flakes" in .agents/rules/300-testing.md for the
+// measured rate and the failure signature. A lone failure neither establishes
+// nor rules out a regression: compare the signature against the recorded one,
+// and the rate against the base commit, with `make test-flake-scan`.
 func TestFillingStopped_ConvictsByIdentity(t *testing.T) {
 	gate := &gatedDialer{}
 	conviction := &recordingConvictionPolicy{}
