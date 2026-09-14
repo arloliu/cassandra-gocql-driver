@@ -248,7 +248,9 @@ type ClusterConfig struct {
 	// SocketKeepalive is used to set up the default dialer and is ignored if Dialer or HostDialer is provided.
 	SocketKeepalive time.Duration
 
-	// Maximum cache size for prepared statements globally for gocql.
+	// Maximum cache size for prepared statements for each session.
+	// Each entry is one (host, keyspace, statement) combination, since a
+	// statement is prepared separately on every host it runs on.
 	// Default: 1000
 	MaxPreparedStmts int
 
