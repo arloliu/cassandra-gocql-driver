@@ -973,6 +973,11 @@ func TestHostScheduler_LedgerIsDecidedByProducersAcrossARound(t *testing.T) {
 // precisely the immediate retry the base-interval floor exists to prevent. The
 // cap therefore has to be applied by comparison, before the multiplication.
 func TestHostScheduler_HugeIntervalDoesNotOverflowIntoAnImmediateRetry(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	// Comfortably past time.Duration's midpoint, so the naive form wraps.
 	const intv = time.Duration(1) << 62
 

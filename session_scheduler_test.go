@@ -469,6 +469,11 @@ func TestHostScheduler_QuietSessionArmsNoReconnect(t *testing.T) {
 // - but the guard is what stops a missing deadline from reading as "due now",
 // which would request a refresh every round.
 func TestHostScheduler_UnarmedRefreshRequestsNothing(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	const intv = 90 * time.Second
 
 	f := newTickFixture(t, nil)

@@ -79,6 +79,10 @@ func TestNextDebounceDeadlineTakesTheEarlierOfTheTwo(t *testing.T) {
 // describe went unhandled for as long as the churn lasted - on the one path that
 // tells the driver a node appeared or left.
 func TestEventDebouncerFlushesUnderSustainedChurn(t *testing.T) {
+	// Parallel: this test spends its time asleep on a real debouncer interval,
+	// and touches nothing outside its own locals.
+	t.Parallel()
+
 	var (
 		mu        sync.Mutex
 		delivered int
@@ -132,6 +136,10 @@ func TestEventDebouncerFlushesUnderSustainedChurn(t *testing.T) {
 // TestEventDebouncerArmsTheHardDeadline pins that the bound is armed rather than
 // merely reached by chance, by watching the delays a real debouncer arms.
 func TestEventDebouncerArmsTheHardDeadline(t *testing.T) {
+	// Parallel: this test spends its time asleep on a real debouncer interval,
+	// and touches nothing outside its own locals.
+	t.Parallel()
+
 	var (
 		mu     sync.Mutex
 		delays []time.Duration

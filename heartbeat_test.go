@@ -67,6 +67,11 @@ func TestHeartBeat_FirstIntervalIsSteadyState(t *testing.T) {
 // The provider returns 0 to the first caller and 2 s to the second;
 // a loop that overwrote the phase with the 10 s interval would send nothing within 3 s.
 func TestHeartBeat_UsesInjectedFirstPhase(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	const steadyInterval = 10 * time.Second
 
 	arrived := make(chan struct{}, 2)

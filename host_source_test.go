@@ -306,6 +306,10 @@ func TestHostInfo_ConnectAddress(t *testing.T) {
 
 // This test sends debounce requests and waits until the refresh function is called (which should happen when the timer elapses).
 func TestRefreshDebouncer_MultipleEvents(t *testing.T) {
+	// Parallel: this test spends its time asleep on a real debouncer interval,
+	// and touches nothing outside its own locals.
+	t.Parallel()
+
 	const numberOfEvents = 10
 	channel := make(chan int, numberOfEvents) // should never use more than 1 but allow for more to possibly detect bugs
 	fn := func() error {
@@ -351,6 +355,10 @@ func TestRefreshDebouncer_MultipleEvents(t *testing.T) {
 //
 // The end result should be 1 refresh function call when refreshNow() is called.
 func TestRefreshDebouncer_RefreshNow(t *testing.T) {
+	// Parallel: this test spends its time asleep on a real debouncer interval,
+	// and touches nothing outside its own locals.
+	t.Parallel()
+
 	const numberOfEvents = 10
 	channel := make(chan int, numberOfEvents) // should never use more than 1 but allow for more to possibly detect bugs
 	fn := func() error {
@@ -417,10 +425,22 @@ func TestRefreshDebouncer_RefreshNow(t *testing.T) {
 //	1 - When refreshNow() is called (1 second after the test starts)
 //	2 - When the timer elapses after the second "wave" of debounce requests (5 seconds after the test starts)
 func TestRefreshDebouncer_EventsAfterRefreshNow(t *testing.T) {
+	// Parallel: this test spends its time asleep on a real debouncer interval,
+	// and touches nothing outside its own locals.
+	t.Parallel()
+
 	const numberOfEvents = 10
-	channel := make(chan int, numberOfEvents) // should never use more than 2 but allow for more to possibly detect bugs
+	// The callback timestamps ITSELF and sends that, rather than the test
+	// timestamping when it manages to receive.
+	//
+	// The two assertions below measure the gap BETWEEN two flushes, so a late
+	// receive on the first one shortens the measured gap and fails a debouncer
+	// that behaved correctly. Receipt latency is not flush latency, and under
+	// -race with other tests running alongside it is not negligible either. The
+	// timeouts stay on the receive, where a stall genuinely is the failure.
+	channel := make(chan time.Time, numberOfEvents) // should never use more than 2 but allow for more to possibly detect bugs
 	fn := func() error {
-		channel <- 0
+		channel <- time.Now()
 		return nil
 	}
 	beforeEvents := time.Now()
@@ -442,14 +462,21 @@ func TestRefreshDebouncer_EventsAfterRefreshNow(t *testing.T) {
 		d.refreshNow()
 	}()
 
+	// wg.Wait returns just after the last of the second-wave debounce() calls,
+	// which is what arms the 3s timer. The second assertion below is about the
+	// interval the debouncer waited from THERE, so that is the anchor it needs -
+	// not the first flush, which happened a second earlier when refreshNow fired
+	// and would leave the assertion satisfied by a flush 2s after the wave.
 	wg.Wait()
+	afterSecondWave := time.Now()
+
 	timeoutCh := time.After(1500 * time.Millisecond) // extra 500ms to prevent flakiness
+	var afterFunctionCall time.Time
 	select {
-	case <-channel:
+	case afterFunctionCall = <-channel:
 	case <-timeoutCh:
 		t.Fatalf("timeout elapsed without flush function being called after refreshNow()")
 	}
-	afterFunctionCall := time.Now()
 
 	// use 500ms instead of 1s to avoid timer precision issues
 	if afterFunctionCall.Sub(beforeEvents) < 500*time.Millisecond {
@@ -457,16 +484,16 @@ func TestRefreshDebouncer_EventsAfterRefreshNow(t *testing.T) {
 	}
 
 	timeoutCh = time.After(4 * time.Second) // extra 1s to prevent flakiness
+	var afterSecondFunctionCall time.Time
 	select {
-	case <-channel:
+	case afterSecondFunctionCall = <-channel:
 	case <-timeoutCh:
 		t.Fatalf("timeout elapsed without flush function being called after debounce requests")
 	}
-	afterSecondFunctionCall := time.Now()
 
 	// use 2.5s instead of 3s to avoid timer precision issues
-	if afterSecondFunctionCall.Sub(afterFunctionCall) < 2500*time.Millisecond {
-		t.Fatalf("function was called after %v ms instead of ~3 seconds", afterSecondFunctionCall.Sub(afterFunctionCall).Milliseconds())
+	if afterSecondFunctionCall.Sub(afterSecondWave) < 2500*time.Millisecond {
+		t.Fatalf("function was called %v ms after the second wave of debounce requests instead of ~3 seconds", afterSecondFunctionCall.Sub(afterSecondWave).Milliseconds())
 	}
 
 	if len(channel) > 0 {
@@ -476,6 +503,10 @@ func TestRefreshDebouncer_EventsAfterRefreshNow(t *testing.T) {
 
 // https://github.com/apache/cassandra-gocql-driver/issues/1752
 func TestRefreshDebouncer_DeadlockOnStop(t *testing.T) {
+	// Parallel: this test spends its time asleep on a real debouncer interval,
+	// and touches nothing outside its own locals.
+	t.Parallel()
+
 	// there's no way to guarantee this bug manifests because it depends on which `case` is picked from the `select`
 	// with 4 iterations of this test the deadlock would be hit pretty consistently
 	const iterations = 4

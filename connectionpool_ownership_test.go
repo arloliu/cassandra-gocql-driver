@@ -925,6 +925,11 @@ func TestInit_PublicationWinsBeforeRemoval(t *testing.T) {
 // ring still owns when it gets to the policy, so a refresh-driven replacement
 // that raced ahead of it is not undone.
 func TestInit_PublishesOnlyOwnedHosts(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	for _, bulk := range []bool{false, true} {
 		name := "AddHost"
 		if bulk {

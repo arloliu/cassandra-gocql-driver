@@ -666,6 +666,11 @@ func TestSnapshot_FailsWholeOnControlSwitch(t *testing.T) {
 // TestSnapshot_FailsOnClosedControlConn: a retained closed connection fails the
 // refresh without reconciling; the heartbeat then reconnects and a refresh runs.
 func TestSnapshot_FailsOnClosedControlConn(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	f := newSnapshotFixture(t, nil)
 	original := f.session.ring.allHosts()
 	f.script.setPeers([]peerRow{newPeerRow(peerIDOne, "127.0.0.7")})
@@ -687,6 +692,11 @@ func TestSnapshot_FailsOnClosedControlConn(t *testing.T) {
 // TestSnapshot_FailsWhenAcquisitionExhausted: with no published connection and
 // every dial refused, withConnHost gives up with errNoControl and nothing changes.
 func TestSnapshot_FailsWhenAcquisitionExhausted(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	f := newSnapshotFixture(t, nil)
 	original := f.session.ring.allHosts()
 	f.script.setPeers([]peerRow{newPeerRow(peerIDOne, "127.0.0.7")})
@@ -742,6 +752,11 @@ func TestControlReconnect_AfterRefreshWriteFailure(t *testing.T) {
 // its peers write again, so refresh and reconnect cycle - paced by the debounce,
 // with heartbeats passing - until the fault is lifted.
 func TestControlReconnect_RepeatedRefreshFailures(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	f := newSnapshotFixture(t, nil)
 	f.script.setPeers([]peerRow{newPeerRow(peerIDOne, "127.0.0.7")})
 
@@ -788,6 +803,11 @@ func TestControlReconnect_RepeatedRefreshFailures(t *testing.T) {
 // TestClose_DuringContinuingRefreshFailure: with the fault still armed and a
 // refresh in flight, Session.Close returns.
 func TestClose_DuringContinuingRefreshFailure(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	f := newSnapshotFixture(t, nil)
 	f.script.setPeers([]peerRow{newPeerRow(peerIDOne, "127.0.0.7")})
 

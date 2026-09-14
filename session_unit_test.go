@@ -33,6 +33,11 @@ import (
 )
 
 func TestAsyncSessionInit(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	// Build a 3 node cluster to test host metric mapping
 	var addresses = []string{
 		"127.0.0.1",

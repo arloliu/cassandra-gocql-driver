@@ -169,6 +169,11 @@ func mockedErrorCodeHandler(errorCode int) func(*TestServer, *framer, *framer) e
 }
 
 func TestProtocolNegotiation(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	testCases := []struct {
 		name                  string
 		supportedVersions     []protoVersion

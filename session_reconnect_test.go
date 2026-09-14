@@ -242,6 +242,11 @@ func (f *tickFixture) requireNoRefresh(t *testing.T, window time.Duration, what 
 
 // TestReconnectTick_AllUpNoRequest: a tick on a healthy ring requests nothing.
 func TestReconnectTick_AllUpNoRequest(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	f := newTickFixture(t, nil)
 
 	sweepDownedHostsOnce(f.session)
@@ -309,6 +314,11 @@ func TestReconnectTick_DisabledControlWarnsPerTick(t *testing.T) {
 // TestReconnectTick_ZeroIntervalStartsNoTicker: with ReconnectInterval zero no
 // sweep runs, so a DOWN host produces no refresh on its own.
 func TestReconnectTick_ZeroIntervalStartsNoTicker(t *testing.T) {
+	// Parallel: this test spends its time waiting out a real interval, and owns
+	// every fixture it touches - its own server on its own port, its own
+	// cluster. See "Parallel tests" in .agents/rules/300-testing.md.
+	t.Parallel()
+
 	f := newTickFixture(t, nil)
 	f.driveDown(t)
 

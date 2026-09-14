@@ -188,6 +188,86 @@ fuzzing only the neighbourhood of garbage.
     2. Collect all state transitions.
     3. Assert on complete history.
 
+## Parallel tests
+
+The root package is one test binary and was entirely serial, so its seconds were
+wall-clock seconds. 20 tests now call `t.Parallel()`; the unit lane went from
+**95.1s to 41.6s** with the race detector (three runs each side, same machine,
+variance under a second).
+
+The converted set is the timer-bound tail — tests that spend their time asleep
+on a real debounce interval, reconnect tick or connect timeout. They still take
+the same time each; they now overlap, so the parallel set costs about what its
+longest member costs.
+
+**What makes a test safe to convert here:**
+
+- It waits on time, rather than computing. Parallelising CPU-bound tests trades
+  one queue for another.
+- It owns every fixture it touches: its own `TestServer` on its own port, its
+  own `ClusterConfig`, its own channels. The shared mock server is a *type*, not
+  an instance — each test constructs one.
+- It mutates no package-level state. **`failDNS` in `helpers.go` is the one to
+  watch**: `TestDNSLookupConnected` and `TestDNSLookupError` set it, and any
+  parallel test resolving a name would see it. Both must stay top-level serial
+  tests — see below for why that is not the same as "serial".
+- It is not on the [Known flakes](#known-flakes) list. Parallelism raises a
+  timing flake's rate; it does not reveal its cause.
+
+**Why the `failDNS` hazard is currently contained, and how that could break.**
+`t.Parallel()` pauses a test until its parent has finished the sequential pass,
+so at the **top level** parallel tests overlap each other and never overlap
+serial ones. That holds across files and under `-shuffle`, and an ordinary
+`TestMain` wrapping `m.Run()` preserves it.
+
+The protection is narrower than "serial tests are safe", in three ways that
+matter here:
+
+- It is about *top-level* tests. A serial **subtest under a parallel parent**
+  runs while other parallel tests are running. Moving a `failDNS` mutation into
+  one would race even though nothing in it calls `t.Parallel()`.
+- It is about the test *body*. A goroutine a test leaves running outlasts the
+  barrier; state it touches is not covered.
+- Marking either DNS test parallel removes the protection outright.
+
+So the rule is: the `failDNS` writers stay **top-level serial tests**, restore
+the value before they return, and leave no goroutine behind that touches it. If
+a future change needs them parallel, `failDNS` has to stop being a package-level
+variable first.
+
+**Converting more.** Do it in batches, and measure both sides:
+
+```bash
+make test-unit                                    # wall clock, three runs
+make test-flake-scan FLAKE_RUN='TestA|TestB' FLAKE_COUNT=20 FLAKE_RACE=race
+```
+
+Every converted test scanned **0/20 under `-race`**. A batch that moves a rate is
+a batch to revert, not to re-run until it is green.
+
+**Assert on when the event happened, not on when the test noticed.** A test that
+timestamps its own `<-channel` is measuring receipt latency as well as the
+behaviour, and receipt latency under `-race` alongside other tests is not
+negligible. That is invisible while the assertion is "at least X since the
+start", because a late receive only inflates the number — and it bites as soon as
+the assertion is a *gap between two* events, where a late first receive shortens
+the gap and fails a correct implementation.
+`TestRefreshDebouncer_EventsAfterRefreshNow` now sends `time.Now()` from inside
+the callback and asserts on that; the timeouts stay on the receive, where a stall
+really is the failure.
+
+**And anchor an interval assertion to the event that started the interval.**
+Fixing the timestamps above moved the first flush's recorded time a second
+earlier, which quietly widened the *second* assertion: measured from the first
+flush, a debouncer that waited only 2s after the second wave still cleared a 2.5s
+threshold. The anchor has to be the wave itself. Verified by mutation — dropping
+the interval from 3s to 2s now fails with "called 2001 ms after the second wave",
+and passed before the anchor was corrected.
+
+The remaining tail is ~1.5s and below across more than a hundred tests: a much
+larger diff, over fixtures that are shared rather than per-test, for maybe 20
+more seconds. Not obviously worth it.
+
 ## Known flakes
 
 **A flake is a rate, not an event.** These tests pass in isolation and fail
