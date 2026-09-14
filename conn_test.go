@@ -45,6 +45,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1276,7 +1277,7 @@ func (srv *TestServer) serve() {
 					// caller mid-read; not pooling here is harmless in tests.
 					frame, _, _, err := readUncompressedSegment(conn, nil)
 					if err != nil {
-						if errors.Is(err, io.EOF) {
+						if isClientGone(err) {
 							return
 						}
 						srv.errorLocked(err)
@@ -1287,7 +1288,7 @@ func (srv *TestServer) serve() {
 
 				framer, err := srv.readFrame(reader)
 				if err != nil {
-					if err == io.EOF {
+					if isClientGone(err) {
 						return
 					}
 					srv.errorLocked(err)
@@ -1306,6 +1307,42 @@ func (srv *TestServer) serve() {
 			}
 		}(conn)
 	}
+}
+
+// wsaeconnreset is Windows' WSAECONNRESET.
+//
+// syscall.ECONNRESET exists on Windows too, but only as a compatibility
+// constant: a real winsock read returns WSAECONNRESET, and syscall.Errno.Is
+// does not equate the two, so errors.Is against ECONNRESET alone misses every
+// reset on that platform. Comparing the number directly costs nothing
+// elsewhere - no Unix errno is 10054 - and keeps this in one file. Splitting it
+// into _windows.go and _unix.go halves would add platform-constrained test
+// files, which check_test_selection.sh deliberately does not exempt and would
+// then need a lane each.
+const wsaeconnreset = syscall.Errno(10054)
+
+// isClientGone reports whether a read failed because the client hung up, which
+// is an ordinary end to a connection here and not something to fail a test over.
+//
+// EOF is only half of it. A client that closes a socket with data still unread
+// makes the kernel send RST rather than FIN, so the next read returns
+// ECONNRESET - and that is exactly what Session.Close does to a query still in
+// flight. Reporting it as a server error made every test that closes a session
+// mid-request flaky in proportion to how often it lost that race;
+// TestSessionCloseCancelsSchemaAgreementWait failed 3 times in 40 before this
+// and 0 times in 60 after.
+//
+// net.ErrClosed covers the other direction, the server's own listener or
+// connection being closed underneath the read.
+//
+// Deliberately narrow: a short read in the middle of a frame is
+// io.ErrUnexpectedEOF, which stays an error, because that is a framing bug
+// rather than a disconnect.
+func isClientGone(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, wsaeconnreset)
 }
 
 func (srv *TestServer) isClosed() bool {
