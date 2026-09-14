@@ -59,45 +59,33 @@ repo_root="$(git rev-parse --show-toplevel)" || {
 }
 cd "${repo_root}"
 
-# The lanes a test file may legitimately be selected by: the tag sets the
-# Makefile recipes and the CI matrix ACTUALLY run, gocql_debug included, and the
-# unit lane both with and without -race (test-unit runs -race, test-unit-fast
-# does not, and -race sets the "race" build tag).
-#
-# Auditing bare "integration" instead would pass a file tagged
-# `integration && !gocql_debug`, which no lane can ever run. Auditing an extra
-# untagged lane would pass a file whose constraint holds only when no tag is set.
-# Keep this list equal to what is really invoked:
-#
-#   unit                          test-unit-fast
-#   unit + -race                  test-unit
-#   integration gocql_debug       test-integration and test-integration-auth
-#                                 (both default to it), CI matrix
-#   cassandra gocql_debug         test-cassandra, CI matrix
-#   ccm gocql_debug               test-ccm, CI matrix
-#   ccm ccmtopology gocql_debug   test-ccmtopology
-#
-# Files carrying no //go:build line (the examples) are selected by every lane and
-# need no lane of their own. TEST_INTEGRATION_TAGS is validated by the Makefile
-# against this same list, so a legal invocation cannot select outside it.
-#
-# Each entry is "<race>|<tag set>", race being "race" or "norace".
-LANES=(
-	"norace|unit"
-	"race|unit"
-	"norace|integration gocql_debug"
-	"norace|cassandra gocql_debug"
-	"norace|ccm gocql_debug"
-	"norace|ccm ccmtopology gocql_debug"
-)
+# The lanes are defined once, in test_lanes.sh, and shared with
+# check_vet_lanes.sh so the two checks cannot drift apart. It defines LANES
+# (entries of "<race>|<tag set>") and INTEGRATION_TAG_SETS.
+if [ ! -f "${repo_root}/test_lanes.sh" ]; then
+	echo "check_test_selection: test_lanes.sh is missing - the check itself is broken" >&2
+	exit 1
+fi
+# shellcheck source=test_lanes.sh
+. "${repo_root}/test_lanes.sh"
 
-# The tag sets the integration recipes ship with - LANES minus the unit lanes.
-INTEGRATION_TAG_SETS=(
-	"integration gocql_debug"
-	"cassandra gocql_debug"
-	"ccm gocql_debug"
-	"ccm ccmtopology gocql_debug"
-)
+require_lane_arrays() {
+	local who="$1" name
+	# `set -u` does NOT catch this: on bash 5.x "${undefined[@]}" expands to zero
+	# entries without error, so a misspelt declaration in test_lanes.sh would
+	# silently shrink the sweep instead of failing. Verified on bash 5.2.21.
+	for name in LANES INTEGRATION_TAG_SETS; do
+		if ! declare -p "${name}" >/dev/null 2>&1; then
+			echo "${who}: test_lanes.sh did not define ${name} - the check itself is broken" >&2
+			exit 1
+		fi
+	done
+	if [ ${#LANES[@]} -eq 0 ]; then
+		echo "${who}: test_lanes.sh defined no lanes - the check itself is broken" >&2
+		exit 1
+	fi
+}
+require_lane_arrays check_test_selection
 
 ROOT_PKG="github.com/apache/cassandra-gocql-driver/v2"
 EXPECTED_NONROOT="${ROOT_PKG}/internal/ccm"
@@ -279,7 +267,9 @@ if [ -s "${work}/unselected" ]; then
 	while IFS= read -r f; do printf '  %s\n' "${f@Q}" >&2; done <"${work}/unselected"
 	echo >&2
 	echo "Lanes audited: ${LANES[*]}" >&2
-	echo "Fix the file's //go:build line, or add the lane that should own it here and in .agents/rules/300-testing.md." >&2
+	echo "Fix the file's //go:build line, or add the lane that should own it to LANES in test_lanes.sh," >&2
+	echo "which also feeds check_vet_lanes.sh - then update the Makefile recipe, CHECK_INTEGRATION_TAGS and" >&2
+	echo ".agents/rules/300-testing.md, none of which follow automatically." >&2
 	exit 1
 fi
 

@@ -100,7 +100,7 @@ CHECK_INTEGRATION_TAGS = shopt -u nocasematch; \
 		*) \
 			echo "TEST_INTEGRATION_TAGS=\"${TEST_INTEGRATION_TAGS}\" is not one of the audited tag sets." >&2; \
 			echo "Supported: integration | cassandra | ccm | \"ccm ccmtopology\"" >&2; \
-			echo "To add one, extend LANES in check_test_selection.sh and this list together." >&2; \
+			echo "To add one, extend LANES in test_lanes.sh and this list together." >&2; \
 			exit 1 ;; \
 	esac
 
@@ -213,6 +213,23 @@ test-unit-fast:
 check-test-selection:
 	@./check_test_selection.sh
 
+# check-vet-lanes runs `go vet` once per lane, over ./... . It proves the
+# narrower thing vet can prove - that the files each lane SELECTS still compile
+# and pass vet - and nothing about whether a selected test executes or asserts
+# the right thing. It does not replace check-test-selection, which is what
+# catches a file no lane selects at all; vet cannot see one.
+#
+# It is a gate rather than a note telling a human to run it because the
+# `ccm ccmtopology gocql_debug` lane was compiled nowhere in CI, and because a
+# compile error under `ccm` would otherwise surface only after the integration
+# job has built a cluster, minutes into a 15-minute timeout, instead of in the
+# build job's first second. Running in the build job, it now compiles the
+# ccmtopology lane in CI; nothing executes it.
+#
+# The whole sweep takes under half a second.
+check-vet-lanes:
+	@./check_vet_lanes.sh
+
 # check-test-selection-cases pins the escapes earlier versions of that check let
 # through. It creates fixtures in the working tree and removes them again, so it
 # is deliberately not part of `check`, which must not mutate anything. Run it on
@@ -220,7 +237,7 @@ check-test-selection:
 check-test-selection-cases:
 	@./check_test_selection_cases.sh
 
-check: .prepare-golangci check-test-selection
+check: .prepare-golangci check-test-selection check-vet-lanes
 	@echo "Build"
 	@go build -tags all .
 	@echo "Check linting"
@@ -291,7 +308,7 @@ install-ccm:
 # Every target here is a command, not a file. Without this a file named e.g.
 # `check-test-selection` in the working tree would make `make check` consider the
 # check up to date and skip it silently.
-.PHONY: check check-test-selection check-test-selection-cases fix test-unit test-unit-fast test-integration \
+.PHONY: check check-test-selection check-test-selection-cases check-vet-lanes fix test-unit test-unit-fast test-integration \
 	test-integration-auth test-cassandra test-ccm test-ccmtopology \
 	cassandra-start cassandra-stop cassandra-remove install-java install-ccm \
 	.prepare-ccm .prepare-java .prepare-cassandra-cluster .prepare-golangci

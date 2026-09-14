@@ -6,7 +6,9 @@
 
 ## Build Tags
 
-Five tags select the lanes. `TEST_INTEGRATION_TAGS` (`Makefile`, default `integration`)
+Five tags select the lanes. A sixth, `all`, is meant to be a compile-only union
+over them but does not currently compile — see “The `all` tag” below.
+`TEST_INTEGRATION_TAGS` (`Makefile`, default `integration`)
 is forwarded verbatim to `go test`, so `test-integration` is a *parameterised*
 target, not a fixed-tag one. CI drives it with a matrix of
 `["cassandra", "integration", "ccm"]`.
@@ -23,8 +25,8 @@ the cluster starts. The check is inlined as the first line of every recipe that
 acts on the value, not made a prerequisite, because `make -j` runs prerequisites
 in parallel and cluster preparation would start alongside it. An unaudited combination could select a file or package no
 lane covers, which is exactly what `check-test-selection` exists to prevent. To
-add a combination, extend `LANES` in `check_test_selection.sh` and that list
-together.
+add a combination, extend `LANES` in `test_lanes.sh` and that list together —
+the Makefile's whitelist is hardcoded separately and does not follow.
 
 | Tag | Needs a cluster | Status |
 |---|---|---|
@@ -32,7 +34,8 @@ together.
 | `integration` | yes | where every new cluster test goes |
 | `cassandra` | yes | **frozen legacy set — add no new files** |
 | `ccm` | yes, and it stops and starts nodes | in the CI matrix |
-| `ccmtopology` | yes, rebuildable | destructive; **not in CI at all yet** — see below |
+| `ccmtopology` | yes, rebuildable | destructive; **compiled in CI, never executed** — see below |
+| `all` | no — nothing runs it | intended compile-only union; **broken** — see below |
 
 - **New tests go on `unit` or `integration`.** Never add a file to `cassandra`.
   The `integration`/`cassandra` split is historical, not semantic: version and
@@ -45,7 +48,9 @@ together.
   the only coverage that exists. They contain no `// Output:` block, so they cost
   compile time only (2,112 of 61,324 test LOC) and no run time. Do not tag them.
 - **`ccmtopology` runs nowhere automatically.** It is outside the CI matrix and has
-  no job of its own, and it only runs when someone runs it.
+  no job of its own, and it only runs when someone runs it. Since 2026-09-14 it is
+  at least *compiled* in CI: the `build` job runs `make check`, which vets every
+  lane. Compiled, never executed.
 
   A dedicated job is **deferred, and not on cost.** What was measured on
   2026-09-13 is the local run: both subtests on one cluster take 148s. A whole
@@ -85,15 +90,32 @@ together.
     selected, so a file no tag selects at all is invisible to every vet
     invocation: a root test file tagged `integraton` passes all six vet lanes
     while containing syntactically invalid Go.
-  - `go vet -tags <tag> ./...` proves the narrower thing it can prove: that the
-    files a given lane *does* select still compile and pass vet. Use the tag sets
-    that are really run, `gocql_debug` included — `unit`, `unit` with `-race`,
-    `"integration gocql_debug"`, `"cassandra gocql_debug"`, `"ccm gocql_debug"`,
-    `"ccm ccmtopology gocql_debug"`. Vetting bare `integration` misses a file
+  - `make check-vet-lanes` proves the narrower thing vet can prove: that the
+    files each lane *does* select still compile and pass vet. It runs
+    `go vet` once per lane over `./...`, using the tag sets that are really run
+    with `gocql_debug` included, and reports every failing lane rather than
+    stopping at the first. Vetting bare `integration` by hand would miss a file
     that only the real, debug-tagged lane compiles.
   - Neither proves the test binary links, nor that a selected test executes.
-  (`go build` does not compile `_test.go` files, and `go vet -tags all ./...` fails
-  pre-existing in this repo.)
+  (`go build` does not compile `_test.go` files, and `go vet -tags all ./...`
+  fails pre-existing in this repo — see “The `all` tag” below.)
+
+### The `all` tag
+
+121 test files carry an `all || <lane>` prefix; 16 more in the same lanes carry
+only the bare lane tag, `internal/ccm`'s own source among them. **`go vet -tags
+all ./...` therefore does not compile**: `cassandra_test.go` is
+`all || cassandra`, while the `schemaChangesTestListener` it uses lives in
+`schema_events_test.go`, tagged bare `cassandra`.
+
+No recipe, no CI job and no documented workflow selects `all`, so nothing has
+been reporting that. `check_test_selection.sh` cannot see this class of defect
+either: it proves every file is selected by *some* lane, not that a lane is
+internally consistent.
+
+Until it is settled — repair the 16 stragglers, or strip `all ||` from the other
+121 files — `all` is deliberately absent from `test_lanes.sh`, and a
+`go vet -tags all` failure is expected rather than a regression.
 
 ## Rules
 - **No Emojis:** Do not use emojis in test log messages.
@@ -134,6 +156,7 @@ make test-cassandra    # The frozen cassandra-tagged set
 make test-ccm          # ccm-tagged tests (stop/start/pause real nodes)
 make test-ccmtopology  # Destructive rejoin-under-a-new-address test
 make cassandra-start   # Start local Cassandra cluster before integration tests
+make check-vet-lanes   # go vet once per lane: the files each lane selects still compile
 make check-test-selection  # Prove no test file is stranded and no package is compiled-but-never-run
 make check-test-selection-cases  # Regression cases for that check (mutates the tree, then cleans up)
 ```
@@ -174,8 +197,13 @@ things:
   is the only non-root package holding test files. Catches a new subpackage whose
   tests would compile but never run.
 
-**The lanes it audits are the tag sets actually invoked, `gocql_debug`
-included, and the unit lane both with and without `-race`** (`test-unit` runs
+**The lanes it audits are defined once, in `test_lanes.sh`**, and sourced by
+both `check_test_selection.sh` and `check_vet_lanes.sh` so the two checks cannot
+drift apart. It does **not** bind the Makefile: the recipes' `-tags` strings and
+`CHECK_INTEGRATION_TAGS`' whitelist are hardcoded separately, and adding a lane
+still means editing `test_lanes.sh` and the Makefile by hand. They are the tag sets
+actually invoked, `gocql_debug` included, and the unit lane both with and
+without `-race` (`test-unit` runs
 `-race`, which sets the `race` build tag; `test-unit-fast` does not) —
 `unit`, `unit`+`-race`, `integration gocql_debug`, `cassandra gocql_debug`,
 `ccm gocql_debug`, `ccm ccmtopology gocql_debug`. Auditing bare `integration`

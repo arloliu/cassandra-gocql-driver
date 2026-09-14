@@ -27,7 +27,8 @@ and that churn lands in the commit.
 
 ## Make Targets Reference
 ```bash
-make check             # Run golangci-lint
+make check             # golangci-lint, plus check-test-selection and check-vet-lanes
+make check-vet-lanes   # go vet once per test lane (also run by make check)
 make fix               # Run golangci-lint with auto-fix
 make test-unit         # Unit tests with race detector (-tags unit)
 make test-integration  # Integration tests (requires Cassandra via CCM)
