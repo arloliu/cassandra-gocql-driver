@@ -1,10 +1,15 @@
 # 500 - Development Workflow
 
 ## Before Commit
-1. Run `go fix ./...` — Modernize deprecated API usage before anything else.
-2. Run `make check` — Fix all issues.
-3. Run `make test-unit` — All unit tests must pass with race detector.
-4. Verify docs are updated if API changed.
+1. Run `make check` — Fix all issues.
+2. Run `make test-unit` — All unit tests must pass with race detector.
+3. Verify docs are updated if API changed.
+
+Do not run `go fix ./...`.
+It rewrites about a hundred unrelated files
+(`interface{}` to `any`, loop forms, build-tag lines),
+and that churn lands in the commit.
+`make check` is the gate.
 
 ## Git Conventions
 - **Branches:** `feat/`, `fix/`, `docs/`, `chore/`, `test/`.
@@ -30,5 +35,4 @@ make test-integration-auth  # Auth-specific integration tests
 make cassandra-start   # Start local 3-node Cassandra cluster via CCM
 make cassandra-stop    # Stop local Cassandra cluster
 make cassandra-remove  # Remove local Cassandra cluster
-go fix ./...           # Modernize deprecated API usage (run before make check)
 ```
