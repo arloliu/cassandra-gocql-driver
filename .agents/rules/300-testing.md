@@ -6,8 +6,8 @@
 
 ## Build Tags
 
-Five tags select the lanes. A sixth, `all`, is meant to be a compile-only union
-over them but does not currently compile — see “The `all` tag” below.
+Five tags select the lanes, and a sixth — `all` — is a compile-only union over
+them (see “The `all` tag” below).
 `TEST_INTEGRATION_TAGS` (`Makefile`, default `integration`)
 is forwarded verbatim to `go test`, so `test-integration` is a *parameterised*
 target, not a fixed-tag one. CI drives it with a matrix of
@@ -35,7 +35,7 @@ the Makefile's whitelist is hardcoded separately and does not follow.
 | `cassandra` | yes | **frozen legacy set — add no new files** |
 | `ccm` | yes, and it stops and starts nodes | in the CI matrix |
 | `ccmtopology` | yes, rebuildable | destructive; **compiled in CI, never executed** — see below |
-| `all` | no — nothing runs it | intended compile-only union; **broken** — see below |
+| `all` | no — nothing runs it | compile-only union; every tagged test file carries an `all \|\|` prefix |
 
 - **New tests go on `unit` or `integration`.** Never add a file to `cassandra`.
   The `integration`/`cassandra` split is historical, not semantic: version and
@@ -97,25 +97,35 @@ the Makefile's whitelist is hardcoded separately and does not follow.
     stopping at the first. Vetting bare `integration` by hand would miss a file
     that only the real, debug-tagged lane compiles.
   - Neither proves the test binary links, nor that a selected test executes.
-  (`go build` does not compile `_test.go` files, and `go vet -tags all ./...`
-  fails pre-existing in this repo — see “The `all` tag” below.)
+  (`go build` does not compile `_test.go` files. `go vet -tags all ./...` does
+  compile every test file, but `all` is a compile-only union and not a lane —
+  see “The `all` tag” below.)
 
 ### The `all` tag
 
-121 test files carry an `all || <lane>` prefix; 16 more in the same lanes carry
-only the bare lane tag, `internal/ccm`'s own source among them. **`go vet -tags
-all ./...` therefore does not compile**: `cassandra_test.go` is
-`all || cassandra`, while the `schemaChangesTestListener` it uses lives in
-`schema_events_test.go`, tagged bare `cassandra`.
+`all` is a **compile-only union**: every tagged test file carries an
+`all || <lane>` prefix, and so does `internal/ccm`'s own source, so
+`go vet -tags all ./...` selects every test file at once. Give any new **tagged**
+test file the same prefix. The untagged `example*_test.go` files keep no build
+line at all — they are already selected by every lane, `all` included.
 
-No recipe, no CI job and no documented workflow selects `all`, so nothing has
-been reporting that. `check_test_selection.sh` cannot see this class of defect
-either: it proves every file is selected by *some* lane, not that a lane is
-internally consistent.
+**It is not a lane, and must never be added to `LANES`.** No recipe and no CI
+job runs it. Listing it as a lane would weaken assertion A in
+`check_test_selection.sh`: a file tagged only `all` would look selected by "a
+lane that runs" while nothing would ever execute it — exactly the escape A
+exists to catch. It lives in `COMPILE_ONLY_LANES` instead, which
+`check_vet_lanes.sh` sweeps and `check_test_selection.sh` never sees.
 
-Until it is settled — repair the 16 stragglers, or strip `all ||` from the other
-121 files — `all` is deliberately absent from `test_lanes.sh`, and a
-`go vet -tags all` failure is expected rather than a regression.
+Why it needs a gate at all: the prefix is decoration unless something compiles
+it. It went unaudited long enough for `cassandra_test.go` (`all || cassandra`)
+to start using `schemaChangesTestListener` from a file tagged bare `cassandra`,
+and for 15 test files — plus `internal/ccm`'s own source, which is not a test
+file — to carry no `all` at all.
+`go vet -tags all ./...` failed the whole time while every lane that runs stayed
+green. Repaired 2026-09-14; `make check` now keeps it that way.
+
+The `all` lane is the one sweep entry with a real cold cost: it compiles the
+whole suite in one package, about 10s on a cold build cache and under 0.5s warm.
 
 ## Rules
 - **No Emojis:** Do not use emojis in test log messages.
@@ -201,7 +211,10 @@ things:
 both `check_test_selection.sh` and `check_vet_lanes.sh` so the two checks cannot
 drift apart. It does **not** bind the Makefile: the recipes' `-tags` strings and
 `CHECK_INTEGRATION_TAGS`' whitelist are hardcoded separately, and adding a lane
-still means editing `test_lanes.sh` and the Makefile by hand. They are the tag sets
+still means editing `test_lanes.sh` and the Makefile by hand. That file also defines
+`COMPILE_ONLY_LANES` — tag sets that must compile but that nothing runs, `all`
+being the only one — which the vet sweep includes and this check deliberately
+does not. They are the tag sets
 actually invoked, `gocql_debug` included, and the unit lane both with and
 without `-race` (`test-unit` runs
 `-race`, which sets the `race` build tag; `test-unit-fast` does not) —

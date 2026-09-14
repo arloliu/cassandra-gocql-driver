@@ -74,7 +74,7 @@ require_lane_arrays() {
 	# `set -u` does NOT catch this: on bash 5.x "${undefined[@]}" expands to zero
 	# entries without error, so a misspelt declaration in test_lanes.sh would
 	# silently shrink the sweep instead of failing. Verified on bash 5.2.21.
-	for name in LANES INTEGRATION_TAG_SETS; do
+	for name in LANES INTEGRATION_TAG_SETS COMPILE_ONLY_LANES; do
 		if ! declare -p "${name}" >/dev/null 2>&1; then
 			echo "${who}: test_lanes.sh did not define ${name} - the check itself is broken" >&2
 			exit 1

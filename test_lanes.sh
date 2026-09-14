@@ -44,12 +44,13 @@
 # need no lane of their own. TEST_INTEGRATION_TAGS is validated by the Makefile
 # against this same list, so a legal invocation cannot select outside it.
 #
-# `all` is deliberately absent. 121 test files carry an `all ||` prefix and 16
-# more in the same lanes do not, so `go vet -tags all ./...` does not currently
-# compile: cassandra_test.go is `all || cassandra` while the
-# schemaChangesTestListener it uses sits in a file tagged bare `cassandra`. No
-# recipe and no CI job selects `all`, so nothing has been reporting that. Decide
-# whether the tag is repaired or dropped before adding it anywhere here.
+# `all` is NOT one of these, and must not be added here. It is a compile-only
+# union - every tagged test file carries an `all ||` prefix, so `-tags all`
+# selects the whole suite at once - but no recipe and no CI job ever RUNS it.
+# Listing it as a lane would weaken assertion A in check_test_selection.sh: a
+# file tagged only `all` would then look selected by "a lane that runs" while
+# nothing would ever execute it, which is precisely the escape A exists to
+# catch. It is vetted instead, through COMPILE_ONLY_LANES below.
 #
 # Each LANES entry is "<race>|<tag set>", race being "race" or "norace".
 
@@ -68,4 +69,19 @@ INTEGRATION_TAG_SETS=(
 	"cassandra gocql_debug"
 	"ccm gocql_debug"
 	"ccm ccmtopology gocql_debug"
+)
+
+# Tag sets that must COMPILE but that nothing runs. Same "<race>|<tag set>"
+# shape as LANES, and vetted alongside them by check_vet_lanes.sh - but
+# deliberately not visible to check_test_selection.sh, whose question is which
+# lanes actually run a file.
+#
+# `all` is the union tag every tagged test file carries as an `all ||` prefix,
+# including internal/ccm's own source. Keeping it compiling is what stops the
+# prefix from decaying into decoration: it went unaudited long enough for
+# cassandra_test.go (`all || cassandra`) to start using a helper in a file
+# tagged bare `cassandra`, which made `go vet -tags all ./...` fail while every
+# lane that runs stayed green.
+COMPILE_ONLY_LANES=(
+	"norace|all"
 )

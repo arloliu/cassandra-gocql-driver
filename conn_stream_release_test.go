@@ -1,5 +1,5 @@
-//go:build unit
-// +build unit
+//go:build all || unit
+// +build all unit
 
 package gocql
 

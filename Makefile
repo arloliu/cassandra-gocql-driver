@@ -219,14 +219,17 @@ check-test-selection:
 # the right thing. It does not replace check-test-selection, which is what
 # catches a file no lane selects at all; vet cannot see one.
 #
-# It is a gate rather than a note telling a human to run it because the
-# `ccm ccmtopology gocql_debug` lane was compiled nowhere in CI, and because a
-# compile error under `ccm` would otherwise surface only after the integration
-# job has built a cluster, minutes into a 15-minute timeout, instead of in the
+# It is a gate rather than a note telling a human to run it because of what was
+# uncovered when it was first run: the `ccm ccmtopology gocql_debug` lane was
+# compiled nowhere in CI, and `all` - the compile-only union every tagged test
+# file carries as an `all ||` prefix, selected by no recipe at all - had
+# silently stopped compiling. It also moves a compile error under `ccm` from
+# minutes into the integration job, after a cluster has been built, to the
 # build job's first second. Running in the build job, it now compiles the
 # ccmtopology lane in CI; nothing executes it.
 #
-# The whole sweep takes under half a second.
+# Warm, the whole sweep is under half a second. The `all` entry compiles the
+# entire suite as one package, so a cold build cache costs it about 10s once.
 check-vet-lanes:
 	@./check_vet_lanes.sh
 

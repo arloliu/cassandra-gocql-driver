@@ -38,6 +38,11 @@
 #   - A compile error under `ccm` otherwise surfaces only after the integration
 #     job has built a Cassandra cluster, minutes into a 15-minute timeout,
 #     instead of in the build job's first second.
+#   - `all`, the union tag every tagged test file carries as an `all ||`
+#     prefix, is selected by no recipe at all. It is swept here as a
+#     compile-only lane; without that, the prefix decays into decoration and
+#     `go vet -tags all ./...` breaks while every lane that runs stays green -
+#     which is exactly what had happened by the time this check was written.
 #   - The whole sweep costs a fraction of a second.
 #
 # Every lane is attempted even after one fails, so a single run reports all of
@@ -65,7 +70,7 @@ require_lane_arrays() {
 	# `set -u` does NOT catch this: on bash 5.x "${undefined[@]}" expands to zero
 	# entries without error, so a misspelt declaration in test_lanes.sh would
 	# silently shrink the sweep instead of failing. Verified on bash 5.2.21.
-	for name in LANES INTEGRATION_TAG_SETS; do
+	for name in LANES INTEGRATION_TAG_SETS COMPILE_ONLY_LANES; do
 		if ! declare -p "${name}" >/dev/null 2>&1; then
 			echo "${who}: test_lanes.sh did not define ${name} - the check itself is broken" >&2
 			exit 1
@@ -78,7 +83,9 @@ require_lane_arrays() {
 }
 require_lane_arrays check_vet_lanes
 
-sweep=("${LANES[@]}")
+# The lanes that run, plus the tag sets that must merely compile. Vet treats
+# them identically; only check_test_selection.sh needs to tell them apart.
+sweep=("${LANES[@]}" "${COMPILE_ONLY_LANES[@]}")
 
 failed=()
 

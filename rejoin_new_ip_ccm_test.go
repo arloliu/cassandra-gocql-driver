@@ -1,5 +1,5 @@
-//go:build ccm && ccmtopology
-// +build ccm,ccmtopology
+//go:build all || (ccm && ccmtopology)
+// +build all ccm,ccmtopology
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one

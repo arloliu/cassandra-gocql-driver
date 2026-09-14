@@ -1,5 +1,5 @@
-//go:build ccm
-// +build ccm
+//go:build all || ccm
+// +build all ccm
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one
