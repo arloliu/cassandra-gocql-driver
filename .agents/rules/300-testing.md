@@ -275,7 +275,7 @@ under load, so one red run says almost nothing and "I re-ran it and it passed"
 says less. Measure with a denominator:
 
 ```bash
-make test-flake-scan FLAKE_RUN=TestPolicyConnPoolClose_IsTerminal FLAKE_COUNT=40
+make test-flake-scan FLAKE_RUN=TestReconnectSkipsFilteredHosts FLAKE_COUNT=40
 make test-flake-scan FLAKE_RUN='TestFoo|TestBar' FLAKE_COUNT=20 FLAKE_RACE=race
 ```
 
@@ -284,8 +284,6 @@ from one side alone proves nothing about which side introduced it.
 
 | Test | Rate | Measured | Mechanism |
 |---|---|---|---|
-| `TestPolicyConnPoolClose_IsTerminal` | 2/40 | 2026-09-14 | **undiagnosed.** Fails at the `ErrSessionClosed` assertion (`pause_recovery_fill_test.go:1407`). The obvious reading — a waiter that has not re-snapshotted when `Close` returns — does not hold: `testAfterParentNotify` collects every result before `Close` can finish |
-| `TestFillingStopped_ConvictsByIdentity` | 1/40 | 2026-09-14 | 10s timeout waiting for conviction after a failed fill cycle |
 | `TestReconnectSkipsFilteredHosts` | 1/20 under `-race` | 2026-09-07 | the opening `refreshRing()`'s async fill can land `handleNodeConnected` after the test's `setState(NodeDown)`, so the peer is UP again when the sweep runs |
 | `TestCAS` (integration, `cassandra` lane) | seen once in four runs | 2026-09-08 | CQL timestamps are millisecond-resolution; when the two `TOTIMESTAMP(NOW())` calls land in the same millisecond the LWT applies and the "not applied" assertion trips |
 
@@ -307,6 +305,81 @@ base commit scanned the same way. Re-running the branch until it passes settles
 nothing.
 
 ### Fixed, and how it was found
+
+Both fill-harness flakes were **fixture** defects, not driver defects, but they are
+two different defects and share no remedy: one fixture started its test body while a
+fill cycle it depended on was still in flight, the other counted arrivals at a test
+seam as if they were goroutines and then closed the session with a hammer that had its
+own way out of the wait. Measured with one combined scan,
+`-run 'TestPolicyConnPoolClose_IsTerminal|TestFillingStopped_ConvictsByIdentity'`,
+before and after on the same machine minutes apart — not comparable to the
+single-test scans that produced the 1/40 and 2/40 recorded on 2026-09-14, which
+is why the before column is re-measured here rather than carried over.
+
+| Test | Before | After | Fix |
+|---|---|---|---|
+| `TestFillingStopped_ConvictsByIdentity` | 4/40 | 0/60 | `newPauseRecoverySession` now waits for the initial fill's claim, not just its UP event |
+| `TestPolicyConnPoolClose_IsTerminal` | 2/40 | 0/60 | the waiters are parked at the `testBeforeWait` seam instead of merely counted there, and the parent pool is closed on its own |
+
+**An UP event does not mean the fill cycle is over.** `hostConnPool.fill` publishes
+UP from its synchronous branch and ends the cycle in the asynchronous one, which
+sets `filling = false` in `fillingStopped` and only then releases the claim. A test
+that killed the fixture connection inside that window lost the refill it meant to
+drive: `HandleError` claimed a fill, `fill()` bailed out at the `filling` check, and
+the cycle that would have convicted the host never ran — a 10s conviction timeout.
+`newPauseRecoverySession` now ends with `awaitNoPendingFills`, the barrier
+`newFillHarness` already had. Because the async branch registers `defer
+pool.fillDone()` first, it runs last, so no pending claim proves the pool is idle as
+well as unclaimed.
+
+**Counting arrivals at a test seam does not count goroutines.** Every query whose
+`Pick` finds the pool empty publishes a fill claim; the claims that lose admission to
+`fill()` release immediately, and each release ends the wake generation. A waiter
+woken that way loops and re-enters the seam, so N tokens can come from fewer than N
+waiters. `TestPolicyConnPoolClose_IsTerminal` then ran `Close` while a query was
+still choosing a host; that query found the pool unregistered and gave up with
+`ErrNoConnections` — correct for a query that never waited, and not what the test
+asserts. Parking each waiter at the seam until the barrier is met makes one token
+mean one goroutine. The release must be a **closed channel, not a token per waiter**
+(a re-looping waiter re-enters the seam), and it must happen **before** `Close`,
+which collects every result from inside `testAfterParentNotify` and would otherwise
+wait on waiters it is itself holding.
+
+**And `Session.Close` is not a way to test `policyConnPool.Close`.** It cancels the
+session context first, which fails a parked dial and releases the fill claim the
+waiters are waiting on. A waiter that took an open-parent snapshot just before that
+then reads the pool as empty and idle - the child is still open, because `Close` is
+blocked collecting results inside `testAfterParentNotify` - and leaves with
+`ErrNoConnections` without ever re-snapshotting. Found by review, not by a scan: it
+survived 0/60. `TestPolicyConnPoolClose_IsTerminal` now closes the parent pool
+directly, which is what its name claims and leaves the closed-parent branch the only
+way out.
+
+**Closing the parent alone leaves the dial parked, so the session still has to go.**
+Four arrivals at the waiter seam prove four fill *claims* exist, not that any query's
+fill goroutine won admission - so a concurrent `addHost` can be the one holding it,
+parked in the gated dialer on a context the parent's close does not cancel. Joining
+that goroutine then hangs the test body until the lane's timeout, and the registered
+session cleanup never runs. `TestPolicyConnPoolClose_IsTerminal` closes the session
+before it joins. Reproduced by holding the first four `poolFillAdmission` arrivals and
+letting `addHost` take the fifth: without the close the test panics in `wg.Wait` at the
+45s timeout, with it 5/5.
+
+**Read the terminal state before the teardown that re-establishes it.** That session
+close closes the parent a second time, which empties `hostConnPools` and drops `wake`
+again, so an assertion placed after it passes over a violation instead of over the
+close under test. The state is now read between the two closes — and asked for through
+`snapshot` and `registerPool` rather than read off `p.wake`, because every `notify`
+clears that field, so a successor generation handed to a waiter is witnessed only until
+the next one. Mutating the closed-parent `snapshot` to hand back a generation, and
+`registerPool` to admit a host after close, each fail 5/5 under `-race`; asserted after
+the teardown the first passed 5/5.
+
+Verified by mutation: disabling the conviction, convicting an address-looked-up
+object instead of the held one, and returning `ErrNoConnections` from `awaitFill`'s
+closed-parent branch each still fail their test. The third is 5/5 since the parent
+pool is closed on its own; through `Session.Close` a waiter could leave by the
+context branch instead and never reach the mutated line.
 
 `TestSessionCloseCancelsSchemaAgreementWait` was **3/40 on 2026-09-14** and is
 now **0/60**. The bug was in the mock server, not the driver: its read loop

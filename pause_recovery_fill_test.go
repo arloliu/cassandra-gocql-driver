@@ -1351,10 +1351,12 @@ func TestAwaitFill_RemoveHostWakeCannotBeMissed(t *testing.T) {
 // TestPolicyConnPoolClose_IsTerminal proves closing the session's pool is terminal:
 // every waiter gives up with ErrSessionClosed, a concurrent addHost registers nothing,
 // and Close itself returns.
-// Known flaky - see "Known flakes" in .agents/rules/300-testing.md for the
-// measured rate and the failure signature. A lone failure neither establishes
-// nor rules out a regression: compare the signature against the recorded one,
-// and the rate against the base commit, with `make test-flake-scan`.
+// The parent pool is closed directly, not through Session.Close,
+// so the closed-parent branch is the only way out of the wait.
+// Was flaky at 2/40 until the waiters were parked at the testBeforeWait seam
+// rather than merely counted there - see "Fixed, and how it was found" in
+// .agents/rules/300-testing.md. Keep the parking: counting arrivals at that seam
+// counts wake-ups, not goroutines.
 func TestPolicyConnPoolClose_IsTerminal(t *testing.T) {
 	const waiters = 4
 
@@ -1363,14 +1365,33 @@ func TestPolicyConnPoolClose_IsTerminal(t *testing.T) {
 	pool := harness.pool(t, host)
 
 	harness.dialer.arm(nil)
-	detachPoolConn(t, pool)
+	// detachPoolConn does not close what it removes,
+	// and neither parent close can reach a connection the pool no longer holds.
+	detached := detachPoolConn(t, pool)
+	t.Cleanup(func() { detached.Close() })
 
+	// The waiters are held at the seam rather than merely counted there.
+	// A token published by a waiter that then loops
+	// - every aborted fill claim another query publishes ends the wake generation,
+	// and a woken waiter re-enters the seam -
+	// is indistinguishable from a token published by a query
+	// that has not reached awaitFill yet,
+	// so counting alone lets Close land while a query is still choosing a host.
+	// That query finds the pool unregistered and gives up with ErrNoConnections,
+	// which is correct for a query that never waited
+	// and is not what this test is about.
+	// Parked, each waiter publishes exactly once before blocking,
+	// so the tokens count goroutines.
 	waiting := make(chan struct{}, waiters)
+	release := make(chan struct{})
+	releaseWaiters := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseWaiters)
 	harness.session.executor.testBeforeWait = func() {
 		select {
 		case waiting <- struct{}{}:
 		default:
 		}
+		<-release
 	}
 
 	results := make([]<-chan error, waiters)
@@ -1380,6 +1401,13 @@ func TestPolicyConnPoolClose_IsTerminal(t *testing.T) {
 	for range waiters {
 		awaitSignal(t, waiting, "every query to await the fill")
 	}
+
+	// Released before Close, which collects every result from inside testAfterParentNotify
+	// and would otherwise wait on waiters it is holding itself.
+	// A released waiter re-snapshots a pool that is still open,
+	// still empty and still holding the parked dial's fill claim,
+	// so it goes straight back into the wait it was in.
+	releaseWaiters()
 
 	// Every waiter must re-snapshot and give up before the children are closed.
 	var once sync.Once
@@ -1399,9 +1427,18 @@ func TestPolicyConnPoolClose_IsTerminal(t *testing.T) {
 		harness.session.pool.addHost(host)
 	}()
 
+	// The parent pool is closed on its own rather than through Session.Close,
+	// which is both what this test is named for and what keeps the assertion decisive.
+	// Session.Close cancels the session context first,
+	// which fails the parked dial and releases the fill claim the waiters are waiting on;
+	// a waiter that took an open-parent snapshot just before that
+	// then reads the pool as empty and idle and leaves with ErrNoConnections,
+	// never reaching the closed-parent branch this test exists to pin.
+	// Closing the parent alone leaves the dial parked and that branch the only way out.
+	// The session's own cleanup cancels the dial afterwards.
 	closed := make(chan struct{})
 	go func() {
-		harness.session.Close()
+		harness.session.pool.Close()
 		close(closed)
 	}()
 
@@ -1414,13 +1451,43 @@ func TestPolicyConnPoolClose_IsTerminal(t *testing.T) {
 		}
 	}
 
-	awaitSignal(t, closed, "Close to return")
+	awaitSignal(t, closed, "the parent pool's Close to return")
+
+	// The terminal state is read here, before the session teardown below can
+	// re-establish it: that teardown closes the parent a second time, which would
+	// empty the map and drop the wake channel again and make the last two assertions
+	// pass over a violation rather than over the close under test.
+	// Asked directly, rather than read off p.wake, because any notify clears that
+	// field again - a successor generation handed to a waiter would be witnessed only
+	// until the next one.
+	gen, parentClosed, kept := harness.session.pool.snapshot(nil)
+	require.True(t, parentClosed, "a closed pool must report itself closed to a waiter")
+	require.Nil(t, gen, "a closed pool must hand a waiter no successor generation")
+	require.Empty(t, kept, "a closed pool must keep no candidate")
+
+	admitted, needFill := harness.session.pool.registerPool(host)
+	require.Nil(t, admitted, "a closed pool must admit no host")
+	require.False(t, needFill, "a host a closed pool refused must not be filled")
+
+	requireTerminalPool := func() {
+		harness.session.pool.mu.RLock()
+		defer harness.session.pool.mu.RUnlock()
+		require.Nil(t, harness.session.pool.wake, "no successor generation may exist after Close")
+		require.Empty(t, harness.session.pool.hostConnPools, "no pool may be registered after Close")
+	}
+	requireTerminalPool()
+
+	// The concurrent addHost may hold the pool's fill admission and be parked in the
+	// dialer, and closing the parent alone does not cancel that dial:
+	// four arrivals at the waiter seam prove four claims exist, not that a query's fill
+	// goroutine won admission, so addHost is a real candidate for the one that did.
+	// Without this, wg.Wait would hold the test body open until the lane's timeout,
+	// and the registered session cleanup would never run.
+	harness.session.Close()
 	wg.Wait()
 
-	harness.session.pool.mu.RLock()
-	defer harness.session.pool.mu.RUnlock()
-	require.Nil(t, harness.session.pool.wake, "no successor generation may exist after Close")
-	require.Empty(t, harness.session.pool.hostConnPools, "no pool may be registered after Close")
+	// Nothing the unwinding fill did may have revived the pool.
+	requireTerminalPool()
 }
 
 // TestAwaitFill_DoesNotWaitForSaturatedPool proves a saturated pool keeps its

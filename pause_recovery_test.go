@@ -215,8 +215,11 @@ func (p *recordingConvictionPolicy) recorded() []*HostInfo {
 // the same shape as a port-mapped or NAT'd deployment,
 // where DOWN bookkeeping keyed by the broadcast address cannot find the host the driver actually dialled.
 //
-// It returns only after the initial fill has published its UP through the policy,
-// so no session-init goroutine is still mutating the host when the test body starts.
+// It returns only after the initial fill has published its UP through the policy
+// and released its fill claim,
+// so no session-init goroutine is still mutating the host
+// - or still holding the pool in its filling state -
+// when the test body starts.
 //
 // Parameters:
 //   - t: the test; the server and session are registered for cleanup
@@ -251,6 +254,20 @@ func newPauseRecoverySession(t *testing.T, tune func(*ClusterConfig)) (*Session,
 	host := hosts[0]
 	awaitHost(t, collector.up, host, "the fixture host to finish its initial fill")
 	require.Equal(t, NodeUp, host.State(), "the fixture host must start UP")
+
+	// The initial fill publishes its UP event from the synchronous branch
+	// and ends its cycle in the asynchronous one,
+	// so the UP barrier above says nothing about whether that cycle is over.
+	// While it is not, pool.filling is still true,
+	// and a test that kills the fixture connection inside that window
+	// loses the refill it meant to drive:
+	// fill() bails out at the filling check
+	// and the cycle that would convict the host never runs.
+	// The claim is released after fillingStopped,
+	// so no pending claim proves the pool is idle as well as unclaimed.
+	pool, ok := session.pool.getPoolFor(host)
+	require.True(t, ok, "the fixture host must have a registered pool")
+	awaitNoPendingFills(t, session.pool, pool)
 
 	return session, host, collector
 }
@@ -520,10 +537,10 @@ func TestHandleNodeConnected_ReplacementAfterOwnershipCheck(t *testing.T) {
 // and fillingStopped convicts the host it holds rather than an address it has to look up.
 // Before the fix this cycle left the host UP behind port mapping or NAT,
 // so application traffic kept refilling it and recovery never became ReconnectInterval's job.
-// Known flaky - see "Known flakes" in .agents/rules/300-testing.md for the
-// measured rate and the failure signature. A lone failure neither establishes
-// nor rules out a regression: compare the signature against the recorded one,
-// and the rate against the base commit, with `make test-flake-scan`.
+// Was flaky at 4/40 until newPauseRecoverySession began waiting for the initial
+// fill's claim rather than only for its UP event - see "Fixed, and how it was
+// found" in .agents/rules/300-testing.md. The fixture barrier is what makes the
+// refill this test drives reach fill() at all.
 func TestFillingStopped_ConvictsByIdentity(t *testing.T) {
 	gate := &gatedDialer{}
 	conviction := &recordingConvictionPolicy{}

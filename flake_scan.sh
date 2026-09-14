@@ -27,7 +27,7 @@
 # Usage:
 #   ./flake_scan.sh <-run regex> [count] [race|norace]
 #
-#   ./flake_scan.sh TestPolicyConnPoolClose_IsTerminal 40
+#   ./flake_scan.sh TestReconnectSkipsFilteredHosts 40
 #   ./flake_scan.sh 'TestFoo|TestBar' 20 race
 #
 # Exit status is 0 whenever the scan itself completed, FAILURES or not - a
