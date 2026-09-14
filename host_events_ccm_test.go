@@ -26,6 +26,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,17 +34,50 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// topologyChangeTestListener records every topology event the driver reports.
+//
+// The driver calls it from several goroutines, so the slices are guarded and
+// only read through the snapshot accessors below.
 type topologyChangeTestListener struct {
+	mu               sync.Mutex
 	hostAddedEvent   []NewHostEvent
 	hostRemovedEvent []RemovedHostEvent
 }
 
 func (t *topologyChangeTestListener) OnNewHost(event NewHostEvent) {
-	(*t).hostAddedEvent = append((*t).hostAddedEvent, event)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.hostAddedEvent = append(t.hostAddedEvent, event)
 }
 
 func (t *topologyChangeTestListener) OnRemovedHost(event RemovedHostEvent) {
-	(*t).hostRemovedEvent = append((*t).hostRemovedEvent, event)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.hostRemovedEvent = append(t.hostRemovedEvent, event)
+}
+
+// addedEvents returns a copy of the new-host events seen so far.
+//
+// Returns:
+//   - []NewHostEvent: events in arrival order
+func (t *topologyChangeTestListener) addedEvents() []NewHostEvent {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return append([]NewHostEvent(nil), t.hostAddedEvent...)
+}
+
+// removedEvents returns a copy of the removed-host events seen so far.
+//
+// Returns:
+//   - []RemovedHostEvent: events in arrival order
+func (t *topologyChangeTestListener) removedEvents() []RemovedHostEvent {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return append([]RemovedHostEvent(nil), t.hostRemovedEvent...)
 }
 
 func TestTopologyChangesListener(t *testing.T) {
@@ -76,7 +110,7 @@ func TestTopologyChangesListener(t *testing.T) {
 
 	// Expecting to see the new node event for the added node
 	require.Eventually(t, func() bool {
-		for _, event := range listener.hostAddedEvent {
+		for _, event := range listener.addedEvents() {
 			if event.Host.ConnectAddress().String() == newNodeIP {
 				return true
 			}
@@ -94,7 +128,7 @@ func TestTopologyChangesListener(t *testing.T) {
 
 	// Expecting to see the removed node event for the removed node
 	require.Eventually(t, func() bool {
-		for _, event := range listener.hostRemovedEvent {
+		for _, event := range listener.removedEvents() {
 			if event.Host.ConnectAddress().String() == newNodeIP {
 				return true
 			}
@@ -148,22 +182,59 @@ func nextNodeSpec(t *testing.T, clusterMetadata *ccm.ClusterInfo) (name string, 
 	return name, ip, jmxPort
 }
 
+// hostStateChangeTestListener records every host state event the driver
+// reports.
+//
+// The driver calls it from several goroutines, so the slices are guarded and
+// only read through the snapshot accessors below.
 type hostStateChangeTestListener struct {
+	mu            sync.Mutex
 	nodeUpEvent   []HostUpEvent
 	nodeDownEvent []HostDownEvent
 }
 
 func (t *hostStateChangeTestListener) OnHostUp(event HostUpEvent) {
-	(*t).nodeUpEvent = append((*t).nodeUpEvent, event)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.nodeUpEvent = append(t.nodeUpEvent, event)
 }
 
 func (t *hostStateChangeTestListener) OnHostDown(event HostDownEvent) {
-	(*t).nodeDownEvent = append((*t).nodeDownEvent, event)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.nodeDownEvent = append(t.nodeDownEvent, event)
 }
 
 func (t *hostStateChangeTestListener) clear() {
-	(*t).nodeUpEvent = nil
-	(*t).nodeDownEvent = nil
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.nodeUpEvent = nil
+	t.nodeDownEvent = nil
+}
+
+// upEvents returns a copy of the host-up events seen since the last clear.
+//
+// Returns:
+//   - []HostUpEvent: events in arrival order
+func (t *hostStateChangeTestListener) upEvents() []HostUpEvent {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return append([]HostUpEvent(nil), t.nodeUpEvent...)
+}
+
+// downEvents returns a copy of the host-down events seen since the last clear.
+//
+// Returns:
+//   - []HostDownEvent: events in arrival order
+func (t *hostStateChangeTestListener) downEvents() []HostDownEvent {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return append([]HostDownEvent(nil), t.nodeDownEvent...)
 }
 
 func TestHostStateChangesListener(t *testing.T) {
@@ -193,7 +264,7 @@ func TestHostStateChangesListener(t *testing.T) {
 
 	// Expecting to see the node down event for the stopped node
 	require.Eventually(t, func() bool {
-		for _, event := range listener.nodeDownEvent {
+		for _, event := range listener.downEvents() {
 			if event.Host.ConnectAddress().String() == nodeToStop.Addr {
 				return true
 			}
@@ -207,7 +278,7 @@ func TestHostStateChangesListener(t *testing.T) {
 
 	// Expecting to see the node up event for the started node
 	require.Eventually(t, func() bool {
-		for _, event := range listener.nodeUpEvent {
+		for _, event := range listener.upEvents() {
 			if event.Host.ConnectAddress().String() == nodeToStop.Addr {
 				return true
 			}
@@ -233,8 +304,8 @@ func TestHostListenersNeverCalledDuringSessionCreation(t *testing.T) {
 	})
 	defer session.Close()
 
-	require.Empty(t, hostStateChangeListener.nodeUpEvent)
-	require.Empty(t, hostStateChangeListener.nodeDownEvent)
-	require.Empty(t, topologyChangeListener.hostAddedEvent)
-	require.Empty(t, topologyChangeListener.hostRemovedEvent)
+	require.Empty(t, hostStateChangeListener.upEvents())
+	require.Empty(t, hostStateChangeListener.downEvents())
+	require.Empty(t, topologyChangeListener.addedEvents())
+	require.Empty(t, topologyChangeListener.removedEvents())
 }
