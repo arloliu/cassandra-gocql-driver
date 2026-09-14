@@ -132,8 +132,54 @@ whole suite in one package, about 10s on a cold build cache and under 0.5s warm.
 - **Context:** Use `t.Context()`.
 - **Env:** Use `t.Setenv()` (not `os.Setenv`).
 - **Benchmarks:** Use `for b.Loop()` (Go 1.24+).
+- **Fuzzing:** Native `FuzzXxx` in a `_test.go`, never a `gofuzz`-tagged file —
+  see “Fuzzing” below.
 - **Assertions:** Use `testify` (`require`, `assert`).
 - **Cleanup:** Always use `t.Cleanup()` or `defer` for resource cleanup.
+
+## Fuzzing
+
+`FuzzFrameDecode` (`frame_fuzz_test.go`, `all || unit`) fuzzes **envelope
+decoding**: the 9-byte header, the body read sized from it, and `parseFrame`'s
+dispatch over that body. Every byte it sees is untrusted at the point it is
+parsed.
+
+**It does not cover the proto-v5 segment layer.** After the v5 startup
+handshake, socket bytes reach this path only through segment decoding — segment
+header, CRC24 over it, CRC32 over the payload, decompression, reassembly — and
+no number of passing executions here says anything about that code. Covering it
+needs a second target over the segment decoder.
+
+```bash
+go test -tags unit -run FuzzFrameDecode -fuzz FuzzFrameDecode .
+```
+
+The seeds run as ordinary subtests whenever the unit lane selects the target —
+`make test-unit` does, a narrower `-run` filter may not. Generating new input
+happens only under `-fuzz`.
+
+**A fuzz target belongs in a `_test.go` on a lane, never in a tagged production
+file.** It replaced `fuzz.go`, a go-fuzz harness under a `gofuzz` build tag that
+no check could see: `check-test-selection` walks only `*_test.go`, and `gofuzz`
+is not one of the tag sets `check-vet-lanes` sweeps. Nothing compiled it, and
+its `newFramer` and `readFrame` calls had drifted out of date with the
+signatures they called.
+
+Two properties, deliberately split:
+
+- **`FuzzFrameDecode`** asserts only what holds for arbitrary input — decoding
+  must not panic, and must not report success while returning a nil frame. A
+  rejected input is the correct outcome, not a skip.
+- **`TestFuzzBugs`** asserts the stronger property that none of the historical
+  go-fuzz crashers decodes. It can, because its corpus is fixed. Both read that
+  corpus from `goFuzzCrashers`, which has one copy.
+
+**`TestFrameDecodeSeeds` is not ceremony.** The well-formed seeds set the
+direction bit on the version byte by hand, because `writeHeader` emits a
+*request* frame and `parseFrame` rejects those outright — so a seed built the
+obvious way never reaches a body parser. Without that test the seeds can rot
+into bytes that die in `readHeader` while `FuzzFrameDecode` still passes,
+fuzzing only the neighbourhood of garbage.
 
 ## Async Testing (CRITICAL)
 - ❌ **NEVER** use `time.Sleep()` to wait for state.
@@ -161,6 +207,7 @@ func TestOneThing(t *testing.T) {
 ```bash
 make test-unit         # Unit tests with race detector (-tags unit)
 make test-unit-fast    # Same selection without -race, for the inner loop
+go test -tags unit -run FuzzFrameDecode -fuzz FuzzFrameDecode .   # fuzz the decode path
 make test-integration  # Integration tests (requires Cassandra via CCM)
 make test-cassandra    # The frozen cassandra-tagged set
 make test-ccm          # ccm-tagged tests (stop/start/pause real nodes)
