@@ -138,10 +138,11 @@ func TestFillingStopped_RetiredPoolsFailureIsNotConvicted(t *testing.T) {
 // test.
 func TestFillingStopped_StaleDownIsRefusedAfterTheConvictionPolicy(t *testing.T) {
 	var (
-		harness *fillHarness
-		host    *HostInfo
-		poolA   *hostConnPool
-		poolB   *hostConnPool
+		harness         *fillHarness
+		host            *HostInfo
+		poolA           *hostConnPool
+		poolB           *hostConnPool
+		replacementConn *Conn
 	)
 
 	// The replacement is installed from inside AddFailure, so the advisory gate has
@@ -162,7 +163,12 @@ func TestFillingStopped_StaleDownIsRefusedAfterTheConvictionPolicy(t *testing.T)
 			poolB, needFill = harness.session.pool.registerPool(host)
 			if poolB == nil || !needFill || poolB == poolA {
 				t.Errorf("the replacement must register as a distinct pool, got %v (needFill=%v)", poolB, needFill)
+				return true
 			}
+			// B is made healthy here, not after the cycle finishes: D1 must refuse
+			// a stale DOWN for a replacement that is already serving traffic, which
+			// is the state the defect destroyed.
+			attachPoolConn(poolB, replacementConn)
 			return true
 		},
 	}
@@ -176,13 +182,13 @@ func TestFillingStopped_StaleDownIsRefusedAfterTheConvictionPolicy(t *testing.T)
 	// A empties and starts a cycle that parks in the dialer; A is still the
 	// registered pool, so the advisory gate will pass.
 	harness.dialer.arm(func(string) error { return errFillTestDialRefused })
-	conn := detachPoolConn(t, poolA)
+	replacementConn = detachPoolConn(t, poolA)
 	require.True(t, poolA.claimFill(), "the fixture must be able to claim a fill")
 	go poolA.runFill()
 	harness.dialer.awaitStarted(t)
 	harness.dialer.releaseAll()
 
-	<-replaced
+	awaitSignal(t, replaced, "the replacement to be installed from inside AddFailure")
 	awaitNoPendingFills(t, harness.session.pool, poolA)
 
 	require.Len(t, conviction.recorded(), 1,
@@ -195,9 +201,155 @@ func TestFillingStopped_StaleDownIsRefusedAfterTheConvictionPolicy(t *testing.T)
 	require.Same(t, poolB, registered, "and it must still be the replacement")
 	require.Equal(t, NodeUp, host.State(), "the host must not have been marked DOWN")
 
-	// The replacement is usable: nothing removed or closed it.
-	attachPoolConn(poolB, conn)
-	require.Equal(t, 1, poolB.Size(), "the replacement must still accept connections")
+	// The replacement was healthy before D1 ran, and is untouched by it. Size alone
+	// would not prove that: attachPoolConn appends without consulting pool.closed, so
+	// a closed pool can still report a connection. The closed flag is the real oracle.
+	require.False(t, isPoolClosed(poolB), "the replacement must not have been closed")
+	require.Equal(t, 1, poolB.Size(), "and it must still hold its connection")
+}
+
+// TestFillingStopped_StaleDownPreservesALegitimateOutage proves that refusing a stale
+// DOWN leaves the outage ledger exactly as it found it.
+//
+// The refusal is a return out of a closure that also arms a panic-safety defer for the
+// ledger: if it were not the closure's FIRST act, the stale return would unwind through
+// that defer and outageRemove the entry a legitimate DOWN had just added. The host would
+// then be down with nothing holding its outage open, and the next DOWN would start a
+// fresh generation.
+//
+// The schedule is the ordinary one. A's cycle fails and blocks inside AddFailure; a real
+// DOWN convicts the host, opens an outage and removes A; recovery registers B, which is
+// still empty because it has not finished connecting; A resumes into D1. What must be
+// true afterwards is not only that A changed nothing, but that it removed nothing.
+//
+// No other delivered test asserts on the ledger, so this is the only one that can fail
+// if the ordering inside the closure regresses.
+func TestFillingStopped_StaleDownPreservesALegitimateOutage(t *testing.T) {
+	var (
+		harness *fillHarness
+		host    *HostInfo
+		poolA   *hostConnPool
+		poolB   *hostConnPool
+		legit   ledgerState
+	)
+
+	replaced := make(chan struct{})
+	conviction := &recordingConvictionPolicy{
+		onFailure: func(*HostInfo) bool {
+			select {
+			case <-replaced:
+				return true
+			default:
+			}
+			defer close(replaced)
+
+			// A real DOWN, taken synchronously so that everything it does - the
+			// state change, the ledger entry, the policy callback and the pool
+			// removal - has landed before this returns. Reading driver state off
+			// the DOWN callback instead would race the removal that follows it.
+			harness.session.markHostDown(host)
+			legit = readLedger(harness.session, host.HostID())
+			if !legit.holds {
+				t.Errorf("the legitimate DOWN must have opened an outage for %s", host.HostID())
+			}
+
+			var needFill bool
+			poolB, needFill = harness.session.pool.registerPool(host)
+			if poolB == nil || !needFill || poolB == poolA {
+				t.Errorf("the replacement must register as a distinct pool, got %v (needFill=%v)", poolB, needFill)
+			}
+			return true
+		},
+	}
+
+	harness = newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		cluster.ConvictionPolicy = conviction
+	})
+	host = harness.hosts[0]
+	poolA = harness.pool(t, host)
+
+	harness.dialer.arm(func(string) error { return errFillTestDialRefused })
+	detachPoolConn(t, poolA).Close()
+	require.True(t, poolA.claimFill(), "the fixture must be able to claim a fill")
+	go poolA.runFill()
+	harness.dialer.awaitStarted(t)
+	harness.dialer.releaseAll()
+
+	awaitSignal(t, replaced, "the legitimate DOWN and the replacement to be installed")
+	awaitNoPendingFills(t, harness.session.pool, poolA)
+
+	after := readLedger(harness.session, host.HostID())
+	require.True(t, after.holds, "the refused stale DOWN must not remove the legitimate outage entry")
+	require.Equal(t, legit.gen, after.gen, "and must not move the outage generation")
+	require.Equal(t, legit.startedAt, after.startedAt, "and must not restart the outage clock")
+	require.Equal(t, legit.members, after.members, "and must not change the outage membership")
+
+	// Exactly one DOWN reached the policy: the legitimate one. A's stale request
+	// must not have produced a second.
+	require.Len(t, conviction.recorded(), 1, "the failure passed the advisory gate, so the policy saw it once")
+	require.Len(t, awaitHost(t, harness.collector.down, host, "the legitimate DOWN"), 0,
+		"no DOWN may precede the legitimate one")
+	requireNoPolicyDown(t, harness.collector, "D1 must not publish a second DOWN for the retired pool")
+
+	registered, ok := harness.session.pool.getPoolFor(host)
+	require.True(t, ok, "the replacement must still be registered")
+	require.Same(t, poolB, registered, "and it must still be the replacement")
+	require.False(t, isPoolClosed(poolB), "and it must not have been closed")
+	require.Equal(t, NodeDown, host.State(), "the host stays DOWN because the legitimate DOWN put it there")
+}
+
+// TestFillingStopped_RetiredPoolDischargesItsDeferredRefill covers the fifth discharge
+// case the advisory gate creates for the fill gate's obligation ledger.
+//
+// The predecessor workstream's contract says an accepted removal obligation is either
+// satisfied by a later cycle or explicitly discharged by the cycle that owned the gate.
+// It listed four ways to discharge. The advisory gate adds a fifth: a cycle can clear
+// the obligation because it predicts a conviction, and then decline to convict because
+// its own pool is no longer registered - a disposition none of the four describes.
+//
+// That is the intended outcome, not an accident. The obligation dies with the pool;
+// rearming a retired pool to chase a refill nothing routes to would be the synchronous
+// retirement the design rejected, arriving by the back door. What must not happen is a
+// leaked claim, a successor spawned on a retired pool, or a conviction.
+//
+// T-ADV reaches the gate with no obligation outstanding and T-GATE covers a successful
+// handover, so this is the only test that puts a real obligation through the gate.
+func TestFillingStopped_RetiredPoolDischargesItsDeferredRefill(t *testing.T) {
+	conviction := &recordingConvictionPolicy{}
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		cluster.NumConns = 2
+		cluster.ConvictionPolicy = conviction
+	})
+	host := harness.hosts[0]
+	poolA := harness.pool(t, host)
+
+	// An owning cycle parked in its continuation, holding one connection; that
+	// connection then dies, so the cycle owes a refill it cannot serve itself.
+	survivor, _ := startPartialCycle(t, harness, poolA)
+	killDeferred(t, poolA, survivor)
+	require.True(t, poolRefillPending(poolA), "the fixture must leave a real obligation outstanding")
+
+	// A is retired and replaced while its cycle is still parked.
+	harness.session.pool.removeHost(host)
+	poolB, _ := harness.session.pool.registerPool(host)
+	require.NotNil(t, poolB, "the replacement must register")
+	require.NotSame(t, poolA, poolB, "the replacement must be a different pool")
+
+	// The parked dial fails over an empty pool, which is the shape that predicts a
+	// conviction and therefore discharges the obligation before the gate is reached.
+	harness.dialer.setErr(func(string) error { return errFillTestDialRefused })
+	harness.dialer.releaseAll()
+	awaitNoPendingFills(t, harness.session.pool, poolA)
+
+	require.False(t, poolRefillPending(poolA), "the obligation must not outlive the retired pool")
+	require.Zero(t, pendingFills(poolA), "and no claim may be left outstanding")
+	require.Empty(t, conviction.recorded(), "a retired pool's failure must not reach the conviction policy")
+	requireNoPolicyDown(t, harness.collector, "and must not convict the host")
+
+	registered, ok := harness.session.pool.getPoolFor(host)
+	require.True(t, ok, "the replacement must still be registered")
+	require.Same(t, poolB, registered, "and it must still be the replacement")
+	require.Equal(t, NodeUp, host.State(), "the host must not have been marked DOWN")
 }
 
 // TestRemoveHostPool_RefusesAPoolItDoesNotOwn drives D2 directly.

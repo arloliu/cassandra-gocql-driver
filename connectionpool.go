@@ -595,9 +595,9 @@ func (p *policyConnPool) removeHost(host *HostInfo) {
 // taken before the call could go stale before the delete, which is why
 // fillingStopped's gate is documented as advisory and this one is not.
 //
-// The pool.host check is kept for the nil case and is not subsumed by want: a
-// pool that refreshRing replaced under the same host ID belongs to a superseded
-// object and must survive a removal driven by the object it replaced.
+// The pool.host check is kept for the nil case and is not subsumed by want: a pool
+// built for the *HostInfo that refreshRing installed survives a removal requested
+// with the object it replaced, even though both carry the same host ID.
 //
 // The unregistration and the wake share one p.mu section, so a query waiting for
 // a fill on this pool cannot miss the removal.
@@ -1148,10 +1148,14 @@ func (pool *hostConnPool) fillingStopped(gen uint64, err error) {
 	// A fill cancelled by session shutdown must not convict its host: the session
 	// context is cancelled before the refreshers are joined in Close, so a fill in
 	// flight then fails, and marking the host DOWN here would fire the user's
-	// HostDown callback during shutdown. Only ctx cancellation is skipped; every
-	// other failure still convicts as before. fillingStopped already did not check
+	// HostDown callback during shutdown. fillingStopped already did not check
 	// pool.closed, so a post-shutdown conviction was possible before this; the
 	// cancel is one more trigger, not the first.
+	//
+	// Cancellation is no longer the only skip: the gate below also declines a
+	// failure whose pool is observed to be no longer registered. Both are refusals
+	// to convict, and neither changes what an ordinary failure on the pool that is
+	// still registered does.
 	if pool.session.ctx.Err() != nil {
 		return
 	}

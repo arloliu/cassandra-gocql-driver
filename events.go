@@ -424,12 +424,19 @@ func (s *Session) completeAdmission(host *HostInfo) bool {
 // nil means "whatever pool this object has", which is the pre-existing behaviour and
 // is what a caller with no originating pool wants.
 //
-// The check, the state change and the policy publication are one transition under
-// hostPublishMu, so a removal or a DOWN of the same host cannot interleave with it.
-// It reads the registration under p.mu, the mutex every registration and removal
-// shares, and registerPool returns the pool already registered for the same object
-// rather than replacing it, so the one registration path outside hostPublishMu cannot
-// substitute a different pool underneath.
+// The check authorises; it does not pin. The check, the state change and the policy
+// publication are one transition under hostPublishMu, so no removal or DOWN that also
+// takes hostPublishMu can interleave with them, and the registration read is taken
+// under p.mu, the mutex every registration and removal shares. registerPool returns the
+// pool already registered for the same object rather than replacing it, so the one
+// registration path outside hostPublishMu cannot substitute a different pool underneath.
+//
+// What the check does NOT promise is that the registration survives the transition.
+// Session.Close empties the pool map without taking hostPublishMu, so a handler already
+// past this point - paused in the application logger, say - completes its effects with
+// no pool registered at all. That is deliberate and is the same exception
+// hostPublishClosed makes for an already-admitted callback: a registration change does
+// not revoke an authorisation already granted.
 //
 // Abandoning the transition is safe in the sense that matters here: the result was
 // never this host's to publish. It is not a claim that recovery is automatic - see
@@ -450,8 +457,9 @@ func (s *Session) handleNodeConnected(host *HostInfo, from *hostConnPool) {
 	}
 
 	// The ownership and pool checks, the state change and the policy
-	// publication form one transition under hostPublishMu,
-	// so a removal or a DOWN of the same host cannot interleave with it.
+	// publication form one transition under hostPublishMu, so no removal or DOWN
+	// that takes hostPublishMu can interleave with it. Close does not take it; see
+	// the doc comment for why that exception is intended.
 	if s.withOwnedHost(host, func() bool {
 		if cur, ok := s.pool.getPoolFor(host); !ok || (from != nil && cur != from) {
 			// The pool was removed, or replaced by one this result says nothing
@@ -554,12 +562,18 @@ func (s *Session) markHostDown(host *HostInfo) {
 // hostPublishMu cannot substitute a different pool underneath. removeHostPool
 // re-checks under p.mu regardless, which is what makes the removal itself exact.
 //
+// Like handleNodeConnected's, this check authorises rather than pins: Session.Close
+// empties the pool map without hostPublishMu, so a transition already past this point
+// finishes its effects even though nothing is registered any more. A registration
+// change does not revoke an authorisation already granted.
+//
 // Parameters:
 //   - host: the resolved ring object
 //   - from: the pool whose cycle decided this DOWN, or nil for the host-keyed form
 func (s *Session) markHostDownFromPool(host *HostInfo, from *hostConnPool) {
-	// State, policy and pool change as one transition under hostPublishMu,
-	// so a late fill success for the same host cannot leave it UP with no pool.
+	// State, policy and pool change as one transition under hostPublishMu, so a
+	// late fill success for the same host cannot leave it UP with no pool. Close is
+	// the documented exception: it empties the map without this mutex.
 	// An object the ring no longer owns is left untouched: its state no longer
 	// matters, and reporting it DOWN to a policy that keys by address could
 	// evict a replacement that took the same address.
