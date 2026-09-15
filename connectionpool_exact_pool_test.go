@@ -57,46 +57,79 @@ func quiesceReconnects(cluster *ClusterConfig) {
 	cluster.ReconnectInterval = 0
 }
 
-// downListener records DOWN notifications from the public HostStateChangeListener API.
+// stateListener records notifications from the public HostStateChangeListener API.
 //
 // The fill harness installs its collector as the selection policy only, so the listener
 // side is invisible there; a test that wants it installs one of these through tune.
 //
-// The two publications are separate on purpose: markHostDownFromPool's closure returns a
-// bool, and only a true reaches hostListeners.OnHostDown. A refusal that wrongly returned
-// true would leave every policy, ledger, state and pool assertion satisfied and still
-// fire the application's callback, so the listener is asserted on its own.
-type downListener struct {
-	seen chan *HostInfo
+// The two publications are separate on purpose. Both handlers decide with a bool
+// returned from a withOwnedHost closure, and only a true reaches hostListeners; the
+// policy call happens inside. So a refusal that wrongly returned true would leave every
+// policy, ledger, state and pool assertion satisfied and still call the application
+// back. Both directions are asserted on their own.
+type stateListener struct {
+	down chan *HostInfo
+	up   chan *HostInfo
 }
 
-var _ HostStatusChangeListener = (*downListener)(nil)
+var _ HostStatusChangeListener = (*stateListener)(nil)
 
-// newDownListener returns a listener installed on cluster.
-func newDownListener(cluster *ClusterConfig) *downListener {
-	l := &downListener{seen: make(chan *HostInfo, 64)}
+// newStateListener returns a listener installed on cluster.
+func newStateListener(cluster *ClusterConfig) *stateListener {
+	l := &stateListener{down: make(chan *HostInfo, 64), up: make(chan *HostInfo, 64)}
 	cluster.Metadata.HostListener.HostStateChangeListener = l
 	return l
 }
 
-// OnHostUp satisfies HostStatusChangeListener; only DOWN is collected.
-func (l *downListener) OnHostUp(HostUpEvent) {}
-
-// OnHostDown records a DOWN notification.
-func (l *downListener) OnHostDown(event HostDownEvent) {
+// OnHostUp records an UP notification.
+func (l *stateListener) OnHostUp(event HostUpEvent) {
 	select {
-	case l.seen <- event.Host:
+	case l.up <- event.Host:
 	default:
 	}
 }
 
-// requireNone fails the test if a DOWN notification is waiting.
-func (l *downListener) requireNone(t *testing.T, what string) {
+// OnHostDown records a DOWN notification.
+func (l *stateListener) OnHostDown(event HostDownEvent) {
+	select {
+	case l.down <- event.Host:
+	default:
+	}
+}
+
+// requireNoDown fails the test if a DOWN notification is waiting.
+func (l *stateListener) requireNoDown(t *testing.T, what string) {
 	t.Helper()
 
 	select {
-	case host := <-l.seen:
+	case host := <-l.down:
 		t.Fatalf("the application listener saw a DOWN for %v: %s", host, what)
+	default:
+	}
+}
+
+// drainUp discards the UP notifications published so far.
+func (l *stateListener) drainUp() {
+	for {
+		select {
+		case <-l.up:
+		default:
+			return
+		}
+	}
+}
+
+// requireNoUp fails the test if an UP notification is waiting.
+//
+// U1's refusal returns false from handleNodeConnected's closure; a refusal that wrongly
+// returned true would fire OnHostUp while leaving host state, the ledger, the policy and
+// the replacement pool exactly as the UP tests expect them.
+func (l *stateListener) requireNoUp(t *testing.T, what string) {
+	t.Helper()
+
+	select {
+	case host := <-l.up:
+		t.Fatalf("the application listener saw an UP for %v: %s", host, what)
 	default:
 	}
 }
@@ -137,11 +170,11 @@ func requireNoPolicyDown(t *testing.T, collector *hostStateCollector, what strin
 // fix no DOWN happens, so a test that waited for one could never pass.
 func TestFillingStopped_RetiredPoolsFailureIsNotConvicted(t *testing.T) {
 	conviction := &recordingConvictionPolicy{}
-	var listener *downListener
+	var listener *stateListener
 	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		cluster.ConvictionPolicy = conviction
 		quiesceReconnects(cluster)
-		listener = newDownListener(cluster)
+		listener = newStateListener(cluster)
 	})
 	host := harness.hosts[0]
 	poolA := harness.pool(t, host)
@@ -173,7 +206,7 @@ func TestFillingStopped_RetiredPoolsFailureIsNotConvicted(t *testing.T) {
 	require.Empty(t, conviction.recorded(),
 		"a failure already visible as stale must not reach the conviction policy")
 	requireNoPolicyDown(t, harness.collector, "a retired pool's failure must not convict its host")
-	listener.requireNone(t, "and must not notify the application listener")
+	listener.requireNoDown(t, "and must not notify the application listener")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
 	require.True(t, ok, "the replacement pool must still be registered")
@@ -204,7 +237,7 @@ func TestFillingStopped_StaleDownIsRefusedAfterTheConvictionPolicy(t *testing.T)
 		poolA           *hostConnPool
 		poolB           *hostConnPool
 		replacementConn *Conn
-		listener        *downListener
+		listener        *stateListener
 	)
 
 	// The replacement is installed from inside AddFailure, so the advisory gate has
@@ -238,7 +271,7 @@ func TestFillingStopped_StaleDownIsRefusedAfterTheConvictionPolicy(t *testing.T)
 	harness = newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		cluster.ConvictionPolicy = conviction
 		quiesceReconnects(cluster)
-		listener = newDownListener(cluster)
+		listener = newStateListener(cluster)
 	})
 	host = harness.hosts[0]
 	poolA = harness.pool(t, host)
@@ -259,7 +292,7 @@ func TestFillingStopped_StaleDownIsRefusedAfterTheConvictionPolicy(t *testing.T)
 		"the failure passed the advisory gate legitimately, so the policy must have seen it exactly once")
 	requireNoPolicyDown(t, harness.collector,
 		"D1 must refuse the DOWN once the originating pool is no longer registered")
-	listener.requireNone(t, "and must not notify the application listener")
+	listener.requireNoDown(t, "and must not notify the application listener")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
 	require.True(t, ok, "the replacement pool must still be registered")
@@ -296,7 +329,7 @@ func TestFillingStopped_StaleDownPreservesALegitimateOutage(t *testing.T) {
 		poolA    *hostConnPool
 		poolB    *hostConnPool
 		legit    ledgerState
-		listener *downListener
+		listener *stateListener
 	)
 
 	replaced := make(chan struct{})
@@ -331,7 +364,7 @@ func TestFillingStopped_StaleDownPreservesALegitimateOutage(t *testing.T) {
 	harness = newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		cluster.ConvictionPolicy = conviction
 		quiesceReconnects(cluster)
-		listener = newDownListener(cluster)
+		listener = newStateListener(cluster)
 	})
 	host = harness.hosts[0]
 	poolA = harness.pool(t, host)
@@ -358,9 +391,9 @@ func TestFillingStopped_StaleDownPreservesALegitimateOutage(t *testing.T) {
 	require.Len(t, awaitHost(t, harness.collector.down, host, "the legitimate DOWN"), 0,
 		"no DOWN may precede the legitimate one")
 	requireNoPolicyDown(t, harness.collector, "D1 must not publish a second DOWN for the retired pool")
-	require.Len(t, awaitHost(t, listener.seen, host, "the legitimate listener DOWN"), 0,
+	require.Len(t, awaitHost(t, listener.down, host, "the legitimate listener DOWN"), 0,
 		"no listener DOWN may precede the legitimate one")
-	listener.requireNone(t, "and D1 must not fire a second listener DOWN")
+	listener.requireNoDown(t, "and D1 must not fire a second listener DOWN")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
 	require.True(t, ok, "the replacement must still be registered")
@@ -396,13 +429,13 @@ func TestFillingStopped_StaleDownPreservesALegitimateOutage(t *testing.T) {
 // legitimate and must run; that is T-GATE's subject, not this one's.
 func TestFillingStopped_RetiredPoolDischargesItsDeferredRefill(t *testing.T) {
 	conviction := &recordingConvictionPolicy{}
-	var listener *downListener
+	var listener *stateListener
 	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		cluster.NumConns = 2
 		cluster.ConvictionPolicy = conviction
 		// Nothing but this test may fill a pool for this host; see quiesceReconnects.
 		quiesceReconnects(cluster)
-		listener = newDownListener(cluster)
+		listener = newStateListener(cluster)
 	})
 	host := harness.hosts[0]
 	poolA := harness.pool(t, host)
@@ -443,8 +476,16 @@ func TestFillingStopped_RetiredPoolDischargesItsDeferredRefill(t *testing.T) {
 
 	// The parked dial fails over an empty pool, which is the shape that predicts a
 	// conviction and therefore discharges the obligation before the gate is reached.
+	//
+	// releaseOne, not releaseAll. The owner has exactly one parked attempt, so this
+	// releases that and nothing else: a successor wrongly reserved here finds the
+	// dialer still armed and parks with its claim outstanding, which the owner's
+	// sample cannot miss. Under releaseAll it would dial, fail, be refused by the
+	// advisory gate and release - and its checkpoint could beat the owner's, so the
+	// first sample would read ordinal 1, pending 0 and the reservation would go
+	// unseen. The decrement and the checkpoint are separate operations.
 	harness.dialer.setErr(func(string) error { return errFillTestDialRefused })
-	harness.dialer.releaseAll()
+	harness.dialer.releaseOne()
 
 	sample := awaitReleaseSample(t, sampled)
 	require.Equal(t, 1, sample.ordinal, "the owning cycle's release must be the first of this episode")
@@ -455,7 +496,7 @@ func TestFillingStopped_RetiredPoolDischargesItsDeferredRefill(t *testing.T) {
 	require.False(t, poolRefillPending(poolA), "the obligation must not outlive the retired pool")
 	require.Empty(t, conviction.recorded(), "a retired pool's failure must not reach the conviction policy")
 	requireNoPolicyDown(t, harness.collector, "and must not convict the host")
-	listener.requireNone(t, "and must not notify the application listener")
+	listener.requireNoDown(t, "and must not notify the application listener")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
 	require.True(t, ok, "the replacement must still be registered")
@@ -630,7 +671,11 @@ func retireAndReplace(t *testing.T, harness *fillHarness, host *HostInfo) *hostC
 // nil, so the cycle still reaches the UP notification - with a connection that exists
 // nowhere. U1 is what refuses it.
 func TestFill_RetiredPoolDoesNotPublishUpFromTheInitialFill(t *testing.T) {
-	harness := newFillHarness(t, 1, quiesceReconnects)
+	var listener *stateListener
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		quiesceReconnects(cluster)
+		listener = newStateListener(cluster)
+	})
 	host := harness.hosts[0]
 	poolA := harness.pool(t, host)
 	watch := watchNodeConnected(t, harness)
@@ -644,11 +689,13 @@ func TestFill_RetiredPoolDoesNotPublishUpFromTheInitialFill(t *testing.T) {
 
 	poolB := retireAndReplace(t, harness, host)
 	watch.drainUp()
+	listener.drainUp()
 
 	harness.dialer.releaseAll()
 	watch.await(t, "the retired pool's UP notification to be decided")
 
 	watch.requireNoPolicyUp(t, "a retired pool's fill must not publish UP for its replacement")
+	listener.requireNoUp(t, "and must not notify the application listener")
 	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
@@ -665,9 +712,11 @@ func TestFill_RetiredPoolDoesNotPublishUpFromTheInitialFill(t *testing.T) {
 // startCount > 0 - so one fixture cannot reach both, and one mutation cannot stand
 // for both.
 func TestFill_RetiredPoolDoesNotPublishUpFromTheContinuation(t *testing.T) {
+	var listener *stateListener
 	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		cluster.NumConns = 2
 		quiesceReconnects(cluster)
+		listener = newStateListener(cluster)
 	})
 	host := harness.hosts[0]
 	poolA := harness.pool(t, host)
@@ -684,11 +733,13 @@ func TestFill_RetiredPoolDoesNotPublishUpFromTheContinuation(t *testing.T) {
 
 	poolB := retireAndReplace(t, harness, host)
 	watch.drainUp()
+	listener.drainUp()
 
 	harness.dialer.releaseAll()
 	watch.await(t, "the retired pool's UP notification to be decided")
 
 	watch.requireNoPolicyUp(t, "a retired pool's continuation must not publish UP for its replacement")
+	listener.requireNoUp(t, "and must not notify the application listener")
 	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
@@ -716,9 +767,11 @@ func TestFill_RetiredPoolDoesNotPublishUpFromTheContinuation(t *testing.T) {
 //     consumed while the successor is still parked, when nothing else can be in
 //     flight, so the second one observed is unambiguously the successor's.
 func TestFill_SuccessorAdmittedBeforeRetirementDoesNotAffectTheReplacement(t *testing.T) {
+	var listener *stateListener
 	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		cluster.NumConns = 2
 		quiesceReconnects(cluster)
+		listener = newStateListener(cluster)
 	})
 	host := harness.hosts[0]
 	poolA := harness.pool(t, host)
@@ -746,11 +799,13 @@ func TestFill_SuccessorAdmittedBeforeRetirementDoesNotAffectTheReplacement(t *te
 
 	poolB := retireAndReplace(t, harness, host)
 	watch.drainUp()
+	listener.drainUp()
 
 	harness.dialer.releaseAll()
 	watch.await(t, "the successor's UP notification to be decided")
 
 	watch.requireNoPolicyUp(t, "a successor admitted before retirement must not publish UP for the replacement")
+	listener.requireNoUp(t, "and must not notify the application listener")
 	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
