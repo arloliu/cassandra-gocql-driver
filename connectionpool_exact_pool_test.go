@@ -108,13 +108,32 @@ func (l *stateListener) requireNoDown(t *testing.T, what string) {
 	}
 }
 
-// drainUp discards the UP notifications published so far.
+// drainUp discards the UP notifications published so far, and keeps draining until the
+// channel has been quiet for a short run of intervals.
+//
+// A single pass is not enough, and the reason is worth stating because it cannot be
+// fixed by waiting for the initial UP instead. newFillHarness joins the initial fill's
+// POLICY UP and its claim release, and neither orders the public callback:
+// handleNodeConnected calls hostListeners.OnHostUp after releasing hostPublishMu, so
+// when the harness returns the initial handler can be sitting between those two
+// statements. Nor can a test simply wait for that UP to arrive, because
+// internalHostListeners suppresses every notification while session.initialized() is
+// false and the initial fill normally completes inside CreateSession - so usually it is
+// never delivered at all, and a wait would hang.
+//
+// The quiet run absorbs a late initial UP either way. It bounds a window a few
+// instructions wide on one goroutine; closing it outright would need a production seam
+// installed before CreateSession, which this change does not add. The residual is that
+// window, and it can only ever cause a false FAILURE, never a false pass.
 func (l *stateListener) drainUp() {
-	for {
+	quiet := 0
+	for quiet < 5 {
 		select {
 		case <-l.up:
+			quiet = 0
 		default:
-			return
+			quiet++
+			time.Sleep(time.Millisecond)
 		}
 	}
 }
