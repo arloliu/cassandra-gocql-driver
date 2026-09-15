@@ -174,6 +174,10 @@ type recordingConvictionPolicy struct {
 
 	mu    sync.Mutex
 	hosts []*HostInfo
+	// errs holds the error each call was made with, in call order, so a test can
+	// prove the policy saw the cycle's own failure rather than a panic the driver
+	// substituted for it.
+	errs []error
 }
 
 var _ ConvictionPolicy = (*recordingConvictionPolicy)(nil)
@@ -182,9 +186,10 @@ var _ ConvictionPolicy = (*recordingConvictionPolicy)(nil)
 //
 // Returns:
 //   - bool: true when the host should be marked DOWN
-func (p *recordingConvictionPolicy) AddFailure(_ error, host *HostInfo) bool {
+func (p *recordingConvictionPolicy) AddFailure(err error, host *HostInfo) bool {
 	p.mu.Lock()
 	p.hosts = append(p.hosts, host)
+	p.errs = append(p.errs, err)
 	p.mu.Unlock()
 
 	if p.onFailure == nil {
@@ -204,6 +209,16 @@ func (p *recordingConvictionPolicy) recorded() []*HostInfo {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.hosts)
+}
+
+// recordedErrs returns the errors AddFailure was invoked with, in call order.
+//
+// Returns:
+//   - []error: one entry per call
+func (p *recordingConvictionPolicy) recordedErrs() []error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.errs)
 }
 
 // newPauseRecoverySession starts a TestServer

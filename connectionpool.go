@@ -609,6 +609,13 @@ type hostConnPool struct {
 	conns   []*Conn
 	closed  bool
 	filling bool
+	// fillGen identifies the admitted fill cycle that currently owns filling.
+	// It is incremented under mu every time the gate is taken, and the cycle
+	// carries the value it was given, so a completion that arrives late - a
+	// recovery handler re-entering fillingStopped after the cycle already
+	// finished - can tell that the gate it sees belongs to someone else.
+	// Guarded by mu; never read or written outside it.
+	fillGen uint64
 	// fillsPending counts the fill claims that have been published and not yet
 	// released by fillDone.
 	// It is a plain int, not an atomic, on purpose:
@@ -911,6 +918,8 @@ func (pool *hostConnPool) fill() (handedOff bool) {
 
 	// ok fill the pool
 	pool.filling = true
+	pool.fillGen++
+	gen := pool.fillGen
 
 	// allow others to access the pool while filling
 	pool.mu.Unlock()
@@ -931,7 +940,7 @@ func (pool *hostConnPool) fill() (handedOff bool) {
 				// it can't escape this recover.
 				func() {
 					defer func() { _ = recover() }()
-					pool.fillingStopped(fmt.Errorf("gocql: fill panicked: %v", r))
+					pool.fillingStopped(gen, fmt.Errorf("gocql: fill panicked: %v", r))
 				}()
 			}
 			// Surface the panic through the standard handler for uniform
@@ -947,7 +956,7 @@ func (pool *hostConnPool) fill() (handedOff bool) {
 
 		if err != nil {
 			// probably unreachable host
-			pool.fillingStopped(err)
+			pool.fillingStopped(gen, err)
 			return false
 		}
 		// notify the session that this node is connected
@@ -974,7 +983,7 @@ func (pool *hostConnPool) fill() (handedOff bool) {
 		// `stopped` flag prevents double-call when the body completed normally.
 		defer recoverGoroutine(pool.logger, "hostConnPool.fill.async", func(err error) {
 			if !stopped {
-				pool.fillingStopped(err)
+				pool.fillingStopped(gen, err)
 			}
 		})
 
@@ -983,7 +992,7 @@ func (pool *hostConnPool) fill() (handedOff bool) {
 		err := pool.connectMany(fillCount)
 
 		// mark the end of filling
-		pool.fillingStopped(err)
+		pool.fillingStopped(gen, err)
 		stopped = true
 
 		if err == nil && startCount > 0 {
@@ -1013,22 +1022,60 @@ func (pool *hostConnPool) logConnectErr(err error) {
 	}
 }
 
-// transition back to a not-filling state.
-func (pool *hostConnPool) fillingStopped(err error) {
+// fillingStopped transitions the pool back to a not-filling state and, when the
+// cycle failed over an empty pool, convicts the host.
+//
+// Only the cycle that holds the gate may complete it. A recovery handler that
+// re-enters this function after its cycle already finished - the tail below runs
+// application code, and a panic there sends fill's recover back in here - would
+// otherwise clear whatever cycle now owns the gate, admitting a second runner
+// alongside it. gen is the generation fill stamped at admission, and a call whose
+// generation is no longer current does nothing at all.
+//
+// The two calls into the application logger are isolated: a logger that panics
+// before the gate is released would leave the pool permanently stuck, and one
+// that panics after would keep this cycle from ever reaching the conviction
+// policy it is about to consult.
+//
+// Parameters:
+//   - gen: the generation this cycle was admitted with
+//   - err: the cycle's own result
+func (pool *hostConnPool) fillingStopped(gen uint64, err error) {
 	if err != nil {
-		pool.logger.Warning("Connection pool filling failed.",
-			NewLogFieldIP("host_addr", pool.host.ConnectAddress()), NewLogFieldString("host_id", pool.host.HostID()), NewLogFieldError("err", err))
+		safely(pool.logger, "hostConnPool.fillingStopped.warn", func() {
+			pool.logger.Warning("Connection pool filling failed.",
+				NewLogFieldIP("host_addr", pool.host.ConnectAddress()), NewLogFieldString("host_id", pool.host.HostID()), NewLogFieldError("err", err))
+		})
 		// wait for some time to avoid back-to-back filling
 		// this provides some time between failed attempts
 		// to fill the pool for the host to recover
 		time.Sleep(time.Duration(rand.Int31n(100)+31) * time.Millisecond)
 	}
 
-	pool.mu.Lock()
-	pool.filling = false
-	count := len(pool.conns)
-	host := pool.host
-	pool.mu.Unlock()
+	var (
+		owned bool
+		count int
+		host  *HostInfo
+	)
+	func() {
+		// The deferred unlock keeps this transition atomic against a panic: nothing
+		// here may strand pool.mu, and nothing here touches pool.session, so a pool
+		// built without one still reaches the gate release.
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+
+		if !pool.filling || pool.fillGen != gen {
+			// This cycle already completed; the gate, if held, is someone else's.
+			return
+		}
+		owned = true
+		pool.filling = false
+		count = len(pool.conns)
+		host = pool.host
+	}()
+	if !owned {
+		return
+	}
 
 	// A fill cancelled by session shutdown must not convict its host: the session
 	// context is cancelled before the refreshers are joined in Close, so a fill in
@@ -1043,8 +1090,10 @@ func (pool *hostConnPool) fillingStopped(err error) {
 
 	// if we errored and the size is now zero, make sure the host is marked as down
 	// see https://github.com/apache/cassandra-gocql-driver/issues/1614
-	pool.logger.Debug("Logging number of connections of pool after filling stopped.",
-		NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldString("host_id", host.HostID()), NewLogFieldInt("count", count))
+	safely(pool.logger, "hostConnPool.fillingStopped.debug", func() {
+		pool.logger.Debug("Logging number of connections of pool after filling stopped.",
+			NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldString("host_id", host.HostID()), NewLogFieldInt("count", count))
+	})
 	if err != nil && count == 0 {
 		if pool.session.cfg.ConvictionPolicy.AddFailure(err, host) {
 			pool.session.handleHostDown(host)
