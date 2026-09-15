@@ -582,8 +582,14 @@ func TestFillingStopped_ConvictsByIdentity(t *testing.T) {
 	require.Equal(t, []*HostInfo{host}, conviction.recorded(), "the failed cycle must convict the host object it filled")
 	require.Equal(t, NodeDown, host.State(), "a fill cycle that ends with an empty pool must mark the host DOWN")
 
-	_, ok = session.pool.getPoolFor(host)
-	require.False(t, ok, "the convicted host's pool must be unregistered")
+	// The DOWN event is published by the policy callback, which markHostDown runs
+	// BEFORE it takes the pool away, so observing the event says nothing yet about
+	// the registration. Waiting is the barrier; asserting straight off the event is
+	// a race that only shows up under load.
+	require.Eventually(t, func() bool {
+		_, registered := session.pool.getPoolFor(host)
+		return !registered
+	}, hostStateEventBudget, time.Millisecond, "the convicted host's pool must be unregistered")
 }
 
 // TestConvictOnDialFailure_NoPoolDuringInit asserts the control connection does not convict a host

@@ -375,6 +375,15 @@ the next one. Mutating the closed-parent `snapshot` to hand back a generation, a
 `registerPool` to admit a host after close, each fail 5/5 under `-race`; asserted after
 the teardown the first passed 5/5.
 
+**A DOWN event is not the pool removal.** `markHostDown` runs the selection policy's
+`HostDown` callback — which is where a test collector sees the event — and only then takes
+the pool away (events.go:538–539). A test that asserts on the registration straight off the
+event races that gap. It is invisible in isolation and shows up under load:
+`TestFillingStopped_ConvictsByIdentity` scanned **0/120 alone on both sides** of the pool
+change while failing **1/40** in a binary running eighteen fill tests, with a signature
+("the convicted host's pool must be unregistered") that is not the one recorded above. The
+test now waits for the unregistration instead of asserting on it.
+
 Verified by mutation: disabling the conviction, convicting an address-looked-up
 object instead of the held one, and returning `ErrNoConnections` from `awaitFill`'s
 closed-parent branch each still fail their test. The third is 5/5 since the parent

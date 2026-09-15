@@ -24,6 +24,7 @@ package gocql
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -397,6 +398,11 @@ func awaitReleaseSample(t *testing.T, sampled <-chan releaseSample) releaseSampl
 
 // requireDischarged requires the first release of the episode to be the owning
 // cycle's own, with nothing reserved behind it.
+//
+// The sample is taken on the releasing goroutine after its decrement, which is one
+// operation later than the decrement itself: a second runner that had decremented but
+// not yet reached its checkpoint would not be in the number.
+// requireNoFurtherReleases closes that from the other side.
 func requireDischarged(t *testing.T, sampled <-chan releaseSample, what string) {
 	t.Helper()
 
@@ -404,6 +410,39 @@ func requireDischarged(t *testing.T, sampled <-chan releaseSample, what string) 
 	require.Equal(t, 1, sample.ordinal,
 		"%s: the owning cycle's release must be the first of the episode, so nothing else claimed", what)
 	require.Zero(t, sample.pending, "%s: no successor may be reserved", what)
+}
+
+// requireNoFurtherReleases requires the episode to end with exactly want releases
+// past base.
+//
+// It first waits for every claim to be gone, which proves each decrement has run, and
+// then allows a bounded settle for the checkpoints those decrements publish.
+// The settle is a negative assertion with a budget rather than a barrier, because an
+// extra release has no event of its own to wait for;
+// it is what catches a runner that decremented before the sampler looked and reached
+// its checkpoint after.
+func requireNoFurtherReleases(t *testing.T, events *poolEventRecorder, pool *hostConnPool, base, want int) {
+	t.Helper()
+
+	deadline := time.After(fillEventBudget)
+	for pendingFills(pool) != 0 {
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline:
+			t.Fatalf("timed out after %v waiting for every claim to be released (%d outstanding)",
+				fillEventBudget, pendingFills(pool))
+		}
+	}
+	settle := time.After(50 * time.Millisecond)
+	for {
+		require.Equal(t, base+want, events.count(poolFillDone),
+			"the episode must end with exactly %d claim release(s)", want)
+		select {
+		case <-time.After(time.Millisecond):
+		case <-settle:
+			return
+		}
+	}
 }
 
 // poolRefillPending reads the obligation a removal left behind.
@@ -630,12 +669,14 @@ func TestFill_ClosedPoolDischargesTheRemoval(t *testing.T) {
 	pool.Close()
 
 	// A successor reserved on a closed pool is refused before it reaches any
-	// checkpoint, so it cannot be held; the ordinal is what catches it, whichever of
-	// the two releases lands first.
-	sampled := sampleFirstRelease(harness.events, pool, harness.events.count(poolFillDone))
+	// checkpoint, so it cannot be held; the ordinal catches it when it releases second
+	// and requireNoFurtherReleases catches it when it releases first.
+	base := harness.events.count(poolFillDone)
+	sampled := sampleFirstRelease(harness.events, pool, base)
 	harness.dialer.releaseAll()
 
 	requireDischarged(t, sampled, "a closed pool")
+	requireNoFurtherReleases(t, harness.events, pool, base, 1)
 	require.False(t, poolRefillPending(pool), "the obligation must not outlive the pool")
 }
 
@@ -864,6 +905,8 @@ func TestFill_SeveralRemovalsCoalesceIntoOneSuccessor(t *testing.T) {
 	require.False(t, poolRefillPending(pool), "the obligation must not survive the handover")
 
 	releaseSuccessor()
+	require.Eventually(t, func() bool { return pool.Size() == 3 }, fillEventBudget, time.Millisecond,
+		"the one successor must refill both gaps the removals left")
 	awaitNoPendingFills(t, harness.session.pool, pool)
 }
 
@@ -893,19 +936,28 @@ func TestFill_WaiterSpansAnEmptyPoolHandover(t *testing.T) {
 		default:
 		}
 	}
-	// No retries: a waiter that gives up must surface ErrNoConnections to the caller
-	// rather than have the executor re-pick and start a fresh cycle that succeeds -
-	// which would make this test pass on a build with no handover at all.
-	result := harness.query(t.Context(), func(qry *Query) {
-		qry.RetryPolicy(&SimpleRetryPolicy{NumRetries: 0})
-	})
+	var gateReads atomic.Bool
+	killed := make(chan struct{})
+	harness.session.executor.testBeforePickOrState = func() {
+		if gateReads.Load() {
+			<-killed
+		}
+	}
+	result := harness.query(t.Context(), nil)
 	awaitSignal(t, waiting, "the query to await the fill")
 	harness.dialer.awaitStarted(t)
 
-	// The connection that cycle appends dies before it can be picked, so the pool is
-	// empty across the whole handover and only the successor can end the wait.
+	// From here the waiter's state reads are held until the connection this cycle
+	// appends has been taken away again. Without that hold the waiter can be woken by
+	// an unrelated notification during the window between the append and the kill,
+	// pick that connection and finish - which passes whether or not the obligation was
+	// handed on, and can equally fail a correct build when the query loses the race
+	// with the close instead.
+	gateReads.Store(true)
+
+	// The connection that cycle appends is taken away again, so the pool is empty
+	// across the whole handover and only the successor can end the wait.
 	var killOnce sync.Once
-	killed := make(chan struct{})
 	harness.events.on(poolConnAppended, func(*HostInfo) {
 		killOnce.Do(func() {
 			defer close(killed)
@@ -1019,16 +1071,33 @@ func TestFill_ClosureAfterReservationRefusesTheSuccessor(t *testing.T) {
 		}
 	})
 
+	// Taken before the owning cycle can finish. Its release checkpoint is published
+	// AFTER the successor is spawned, so a baseline captured once the successor has
+	// arrived can still be missing it - and a barrier waiting for one release would
+	// then be satisfied by the predecessor's while the successor still holds a claim.
+	base := harness.events.count(poolFillDone)
+
 	harness.dialer.releaseAll()
 	awaitSignal(t, arrived, "the successor to reach its admission checkpoint")
+
+	// Captured while the successor is still held, so they describe the state it must
+	// not change.
+	_, genBefore := poolGate(pool)
+	attemptsBefore := harness.events.count(poolConnectAttempt)
 
 	// The pool goes while the successor is held, so the close lands strictly after
 	// the reservation.
 	pool.Close()
 	releaseSuccessor()
+	awaitClaimReleases(t, harness.events, base, 2)
 
-	require.Eventually(t, func() bool { return pendingFills(pool) == 0 }, fillEventBudget, time.Millisecond,
-		"a successor refused by a closed pool must still release its claim")
+	// Refusal, not merely cleanup: admitting would take a generation and dial.
+	held, genAfter := poolGate(pool)
+	require.False(t, held, "a closed pool must admit no successor")
+	require.Equal(t, genBefore, genAfter, "no new cycle may be admitted on a closed pool")
+	require.Equal(t, attemptsBefore, harness.events.count(poolConnectAttempt),
+		"a refused successor must not dial")
+	require.Zero(t, pendingFills(pool), "a refused successor must still release its claim")
 	require.False(t, poolRefillPending(pool), "no obligation may outlive the pool")
 }
 
