@@ -433,10 +433,11 @@ func (s *Session) completeAdmission(host *HostInfo) bool {
 //
 // What the check does NOT promise is that the registration survives the transition.
 // Session.Close empties the pool map without taking hostPublishMu, so a handler already
-// past this point - paused in the application logger, say - completes its effects with
-// no pool registered at all. That is deliberate and is the same exception
-// hostPublishClosed makes for an already-admitted callback: a registration change does
-// not revoke an authorisation already granted.
+// past this point - paused in the application logger, say - stays authorised with no
+// pool registered at all. That is deliberate and is the same exception hostPublishClosed
+// makes for an already-admitted callback: a registration change does not revoke an
+// authorisation already granted. It is a statement about authorisation only; the filter
+// and a panicking callback can still cut the effects short.
 //
 // Abandoning the transition is safe in the sense that matters here: the result was
 // never this host's to publish. It is not a claim that recovery is automatic - see
@@ -564,8 +565,10 @@ func (s *Session) markHostDown(host *HostInfo) {
 //
 // Like handleNodeConnected's, this check authorises rather than pins: Session.Close
 // empties the pool map without hostPublishMu, so a transition already past this point
-// finishes its effects even though nothing is registered any more. A registration
-// change does not revoke an authorisation already granted.
+// stays authorised even though nothing is registered any more. A registration change
+// does not revoke an authorisation already granted - which is not to say the transition
+// always completes: the filter returns before the policy call and the removal, and a
+// panicking callback unwinds.
 //
 // Parameters:
 //   - host: the resolved ring object
