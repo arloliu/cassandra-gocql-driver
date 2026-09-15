@@ -23,6 +23,7 @@ package gocql
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -266,4 +267,228 @@ func TestRemoveHostPool_RefusesAPoolItDoesNotOwn(t *testing.T) {
 		require.False(t, ok, "the membership form must remove the registered pool")
 		require.NotNil(t, poolB, "the replacement is the pool that was removed")
 	})
+}
+
+// upWatch joins the asynchronous handleNodeConnected callbacks of a harness session.
+//
+// handleNodeConnected runs on a goroutine fill spawns, so a test that asserts "no UP
+// was published" without joining it passes for the wrong reason - it observes the
+// absence before the goroutine had a chance to produce one. The seam is host-keyed, so
+// a watch cannot tell two pools' handlers apart by argument; a test that has more than
+// one in play consumes the earlier one while the later one is provably still parked.
+type upWatch struct {
+	connected chan *HostInfo
+	collector *hostStateCollector
+}
+
+// watchNodeConnected installs the join seam and drains whatever the fixture already
+// published, so every later observation belongs to the test.
+//
+// It is installed after newFillHarness has joined the initial fill's UP event and its
+// claim release, which orders this write after the initial handler's read of the field.
+func watchNodeConnected(t *testing.T, harness *fillHarness) *upWatch {
+	t.Helper()
+
+	w := &upWatch{connected: make(chan *HostInfo, 8), collector: harness.collector}
+	harness.session.testAfterNodeConnected = func(host *HostInfo) {
+		select {
+		case w.connected <- host:
+		default:
+		}
+	}
+	w.drainUp()
+	return w
+}
+
+// await blocks until one handleNodeConnected call has returned.
+func (w *upWatch) await(t *testing.T, what string) {
+	t.Helper()
+
+	select {
+	case <-w.connected:
+	case <-time.After(fillEventBudget):
+		t.Fatalf("timed out after %v waiting for %s", fillEventBudget, what)
+	}
+}
+
+// drainUp discards the UP transitions published so far.
+func (w *upWatch) drainUp() {
+	for {
+		select {
+		case <-w.collector.up:
+		default:
+			return
+		}
+	}
+}
+
+// requireNoPolicyUp fails when the selection policy saw an UP since the last drain.
+func (w *upWatch) requireNoPolicyUp(t *testing.T, what string) {
+	t.Helper()
+
+	select {
+	case host := <-w.collector.up:
+		t.Fatalf("the policy saw an UP for %v: %s", host, what)
+	default:
+	}
+}
+
+// retireAndReplace marks host DOWN - which removes and closes its pool - and registers
+// a fresh pool for the SAME object, leaving it empty.
+//
+// This is the state a retired cycle's success must not disturb: the host is DOWN
+// because something already convicted it, and the replacement holds nothing, so an UP
+// published on the strength of the retired pool's connection would be a lie the
+// replacement cannot back.
+//
+// Returns:
+//   - *hostConnPool: the replacement pool
+func retireAndReplace(t *testing.T, harness *fillHarness, host *HostInfo) *hostConnPool {
+	t.Helper()
+
+	harness.session.markHostDown(host)
+	require.Equal(t, NodeDown, host.State(), "the fixture must leave the host DOWN")
+
+	replacement, needFill := harness.session.pool.registerPool(host)
+	require.NotNil(t, replacement, "the replacement must register")
+	require.True(t, needFill, "a freshly registered pool wants a fill")
+	require.Zero(t, replacement.Size(), "the replacement must start empty")
+	return replacement
+}
+
+// TestFill_RetiredPoolDoesNotPublishUpFromTheInitialFill drives U1 from the
+// synchronous fill site, which runs only when the cycle started over an empty pool.
+//
+// A cycle parks in its first dial, its pool is retired, a replacement is registered
+// for the SAME object while the host is DOWN, and the dial then succeeds. connect
+// closes the connection it just established because the pool is closed, but returns
+// nil, so the cycle still reaches the UP notification - with a connection that exists
+// nowhere. U1 is what refuses it.
+func TestFill_RetiredPoolDoesNotPublishUpFromTheInitialFill(t *testing.T) {
+	harness := newFillHarness(t, 1, nil)
+	host := harness.hosts[0]
+	poolA := harness.pool(t, host)
+	watch := watchNodeConnected(t, harness)
+
+	// startCount == 0: the cycle takes the synchronous branch.
+	harness.dialer.arm(nil)
+	detachPoolConn(t, poolA).Close()
+	require.True(t, poolA.claimFill(), "the fixture must be able to claim a fill")
+	go poolA.runFill()
+	harness.dialer.awaitStarted(t)
+
+	poolB := retireAndReplace(t, harness, host)
+	watch.drainUp()
+
+	harness.dialer.releaseAll()
+	watch.await(t, "the retired pool's UP notification to be decided")
+
+	watch.requireNoPolicyUp(t, "a retired pool's fill must not publish UP for its replacement")
+	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
+
+	registered, ok := harness.session.pool.getPoolFor(host)
+	require.True(t, ok, "the replacement must still be registered")
+	require.Same(t, poolB, registered, "and it must still be the replacement")
+	require.Zero(t, poolB.Size(), "the replacement must still be empty")
+}
+
+// TestFill_RetiredPoolDoesNotPublishUpFromTheContinuation drives U1 from the
+// asynchronous fill site, which runs only when the cycle started over a pool that
+// already held a connection.
+//
+// The two sites have mutually exclusive conditions - startCount == 0 against
+// startCount > 0 - so one fixture cannot reach both, and one mutation cannot stand
+// for both.
+func TestFill_RetiredPoolDoesNotPublishUpFromTheContinuation(t *testing.T) {
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		cluster.NumConns = 2
+	})
+	host := harness.hosts[0]
+	poolA := harness.pool(t, host)
+	watch := watchNodeConnected(t, harness)
+
+	// startCount == 1: the cycle skips the synchronous branch and goes straight to
+	// the asynchronous continuation.
+	harness.dialer.arm(nil)
+	detachPoolConn(t, poolA).Close()
+	require.Equal(t, 1, poolA.Size(), "the cycle must start over a pool that holds one connection")
+	require.True(t, poolA.claimFill(), "the fixture must be able to claim a fill")
+	go poolA.runFill()
+	harness.dialer.awaitStarted(t)
+
+	poolB := retireAndReplace(t, harness, host)
+	watch.drainUp()
+
+	harness.dialer.releaseAll()
+	watch.await(t, "the retired pool's UP notification to be decided")
+
+	watch.requireNoPolicyUp(t, "a retired pool's continuation must not publish UP for its replacement")
+	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
+
+	registered, ok := harness.session.pool.getPoolFor(host)
+	require.True(t, ok, "the replacement must still be registered")
+	require.Same(t, poolB, registered, "and it must still be the replacement")
+	require.Zero(t, poolB.Size(), "the replacement must still be empty")
+}
+
+// TestFill_SuccessorAdmittedBeforeRetirementDoesNotAffectTheReplacement is the one
+// place this change meets the fill gate.
+//
+// A successor admitted BEFORE its pool is retired is not a bug and must not be
+// refused: requiring that would re-import the synchronous retirement the design
+// rejected. What must hold is that its result, like any other cycle's, cannot act on
+// a pool it did not run on.
+//
+// Two barriers carry the test, and neither is the obvious one:
+//
+//   - admission is proven by the successor's PARKED DIAL, not by its arrival at
+//     poolFillAdmission. That checkpoint fires before fill's second admission check,
+//     so a successor held there while its pool closes would refuse admission and never
+//     reach a publication at all - the test would assert nothing.
+//   - completion is joined through testAfterNodeConnected, which is host-keyed and so
+//     cannot distinguish the owner's handler from the successor's. The owner's is
+//     consumed while the successor is still parked, when nothing else can be in
+//     flight, so the second one observed is unambiguously the successor's.
+func TestFill_SuccessorAdmittedBeforeRetirementDoesNotAffectTheReplacement(t *testing.T) {
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		cluster.NumConns = 2
+	})
+	host := harness.hosts[0]
+	poolA := harness.pool(t, host)
+	watch := watchNodeConnected(t, harness)
+
+	// An owning cycle parked in its continuation, holding one connection.
+	survivor, _ := startPartialCycle(t, harness, poolA)
+	// That connection dies, so the owner owes a refill it cannot serve itself.
+	killDeferred(t, poolA, survivor)
+
+	// The owner's dial succeeds: it lands a connection, ends below size, and hands
+	// the obligation to a successor. Because it started over a non-empty pool it also
+	// publishes an UP of its own - the one the next step consumes.
+	base := harness.events.count(poolFillDone)
+	harness.dialer.releaseOne()
+	awaitClaimReleases(t, harness.events, base, 1)
+
+	// The successor is admitted and parked in its own dial. Only now is it certain
+	// that it passed fill's second admission check.
+	harness.dialer.awaitStarted(t)
+	awaitGate(t, poolA, true, "the successor to take the gate")
+
+	// Consume the owner's completion while the successor is demonstrably parked.
+	watch.await(t, "the owning cycle's UP notification")
+
+	poolB := retireAndReplace(t, harness, host)
+	watch.drainUp()
+
+	harness.dialer.releaseAll()
+	watch.await(t, "the successor's UP notification to be decided")
+
+	watch.requireNoPolicyUp(t, "a successor admitted before retirement must not publish UP for the replacement")
+	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
+
+	registered, ok := harness.session.pool.getPoolFor(host)
+	require.True(t, ok, "the replacement must still be registered")
+	require.Same(t, poolB, registered, "and it must still be the replacement")
+	require.Zero(t, poolB.Size(), "the replacement must still be empty")
+	require.False(t, poolRefillPending(poolA), "no obligation may outlive the retired pool")
 }

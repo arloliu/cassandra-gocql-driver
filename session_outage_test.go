@@ -229,7 +229,7 @@ func TestOutageLedger_SingleHostFlapOpensEachTime(t *testing.T) {
 
 	// Bring it up the way handleNodeConnected does, which needs a registered pool.
 	f.session.pool.registerPool(host)
-	f.session.handleNodeConnected(host)
+	f.session.handleNodeConnected(host, nil)
 	require.False(t, readLedger(f.session, host.HostID()).holds, "an UP host leaves the ledger")
 
 	f.session.markHostDown(host)

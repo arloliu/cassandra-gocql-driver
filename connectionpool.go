@@ -997,7 +997,7 @@ func (pool *hostConnPool) fill() (handedOff bool) {
 		// notify the session that this node is connected
 		go func() {
 			defer recoverGoroutine(pool.logger, "Session.handleNodeConnected", nil)
-			pool.session.handleNodeConnected(pool.host)
+			pool.session.handleNodeConnected(pool.host, pool)
 		}()
 
 		// filled one
@@ -1036,7 +1036,7 @@ func (pool *hostConnPool) fill() (handedOff bool) {
 			// so it is recovered like the initial-fill notification above.
 			go func() {
 				defer recoverGoroutine(pool.logger, "Session.handleNodeConnected", nil)
-				pool.session.handleNodeConnected(pool.host)
+				pool.session.handleNodeConnected(pool.host, pool)
 			}()
 		}
 	}()

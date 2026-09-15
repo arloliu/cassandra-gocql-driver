@@ -535,7 +535,7 @@ func TestHandleNodeConnected_ReplacementAfterOwnershipCheck(t *testing.T) {
 		})
 	}
 
-	session.handleNodeConnected(stale)
+	session.handleNodeConnected(stale, nil)
 
 	before := awaitHost(t, collector.up, replacement, "the replacement host to come UP")
 	require.NotContains(t, before, stale, "a replaced object must not be brought back UP")
@@ -693,7 +693,7 @@ func TestConvictOnDialFailure_EmptyPoolGainsConnDuringDecision(t *testing.T) {
 
 	// A fill success arriving after the conviction must not resurrect the host:
 	// the pool it belonged to is gone, so the identity check misses.
-	session.handleNodeConnected(host)
+	session.handleNodeConnected(host, nil)
 	require.Equal(t, NodeDown, host.State(), "a late fill success must not undo the conviction")
 	require.Empty(t, drainHosts(collector.up), "a late fill success must not report an UP transition")
 }

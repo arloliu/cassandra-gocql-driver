@@ -413,7 +413,32 @@ func (s *Session) completeAdmission(host *HostInfo) bool {
 	return published
 }
 
-func (s *Session) handleNodeConnected(host *HostInfo) {
+// handleNodeConnected marks host UP on the strength of a pool fill that succeeded,
+// and publishes it to the selection policy.
+//
+// from is the pool whose fill succeeded, and it is the authorisation: the transition
+// is applied only while that pool is still the one registered for host. A cycle still
+// in flight when its pool was retired must not publish UP for a replacement pool
+// registered under the same *HostInfo object - the replacement has none of the
+// connections this result is evidence of, and can legitimately be empty and DOWN.
+// nil means "whatever pool this object has", which is the pre-existing behaviour and
+// is what a caller with no originating pool wants.
+//
+// The check, the state change and the policy publication are one transition under
+// hostPublishMu, so a removal or a DOWN of the same host cannot interleave with it.
+// It reads the registration under p.mu, the mutex every registration and removal
+// shares, and registerPool returns the pool already registered for the same object
+// rather than replacing it, so the one registration path outside hostPublishMu cannot
+// substitute a different pool underneath.
+//
+// Abandoning the transition is safe in the sense that matters here: the result was
+// never this host's to publish. It is not a claim that recovery is automatic - see
+// the pool's own fill, which owns it.
+//
+// Parameters:
+//   - host: the ring object whose pool filled
+//   - from: the pool that filled, or nil to accept whatever pool is registered
+func (s *Session) handleNodeConnected(host *HostInfo, from *hostConnPool) {
 	if s.testAfterNodeConnected != nil {
 		defer s.testAfterNodeConnected(host)
 	}
@@ -428,10 +453,10 @@ func (s *Session) handleNodeConnected(host *HostInfo) {
 	// publication form one transition under hostPublishMu,
 	// so a removal or a DOWN of the same host cannot interleave with it.
 	if s.withOwnedHost(host, func() bool {
-		if _, ok := s.pool.getPoolFor(host); !ok {
-			// The pool was removed or replaced after the fill succeeded; the
-			// host stays in its current state and the replacement's own fill
-			// (or reconnectDownedHosts) owns recovery.
+		if cur, ok := s.pool.getPoolFor(host); !ok || (from != nil && cur != from) {
+			// The pool was removed, or replaced by one this result says nothing
+			// about; the host stays in its current state and the registered
+			// pool's own fill (or reconnectDownedHosts) owns recovery.
 			return false
 		}
 

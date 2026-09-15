@@ -737,7 +737,7 @@ func TestDownRace_DownHoldsMutex(t *testing.T) {
 	}
 	upped := make(chan struct{})
 	go func() {
-		f.session.handleNodeConnected(a)
+		f.session.handleNodeConnected(a, nil)
 		close(upped)
 	}()
 	awaitDone(t, arrived, "handleNodeConnected to reach the mutex")
