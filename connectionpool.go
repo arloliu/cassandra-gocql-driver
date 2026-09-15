@@ -565,22 +565,51 @@ func (p *policyConnPool) addHost(host *HostInfo) {
 	}
 }
 
-// removeHost unregisters and closes the pool built for this exact *HostInfo.
+// removeHost unregisters and closes the pool built for this exact *HostInfo,
+// whichever pool that is.
 //
-// The pointer check runs under p.mu, so a caller holding an object that
-// refreshRing has since replaced under the same host ID leaves the
-// replacement's pool untouched.
-//
-// The unregistration and the wake share one p.mu section,
-// so a query waiting for a fill on this pool cannot miss the removal.
+// This is the membership form: the host itself is going away, so whatever pool
+// it currently has should go with it. A caller that acted on one particular
+// pool and must not touch its replacement wants removeHostPool instead.
 //
 // Parameters:
 //   - host: the ring object whose pool should be removed
 func (p *policyConnPool) removeHost(host *HostInfo) {
+	p.removeHostPool(host, nil)
+}
+
+// removeHostPool unregisters and closes host's pool, optionally only when it is
+// the pool the caller acted on.
+//
+// want is the authorisation: nil means "whatever pool this exact *HostInfo has",
+// and a non-nil want means "only this pool". The second form exists because a
+// fill cycle's result must not act on a pool registered after the cycle's own
+// pool was retired - handleHostDown's caller holds the pool it failed on, and a
+// replacement can be registered under the same *HostInfo object while the cycle
+// is still in flight.
+//
+// Both halves of the predicate are evaluated in the same p.mu section as the
+// delete, which is the linearization point for every registration and removal:
+// registerPool, removeHostPool and policyConnPool.Close all mutate the map under
+// it. That is what makes the authorisation exact rather than advisory - a check
+// taken before the call could go stale before the delete, which is why
+// fillingStopped's gate is documented as advisory and this one is not.
+//
+// The pool.host check is kept for the nil case and is not subsumed by want: a
+// pool that refreshRing replaced under the same host ID belongs to a superseded
+// object and must survive a removal driven by the object it replaced.
+//
+// The unregistration and the wake share one p.mu section, so a query waiting for
+// a fill on this pool cannot miss the removal.
+//
+// Parameters:
+//   - host: the ring object whose pool should be removed
+//   - want: the only pool that may be removed, or nil for any
+func (p *policyConnPool) removeHostPool(host *HostInfo, want *hostConnPool) {
 	hostID := host.HostID()
 	p.mu.Lock()
 	pool, ok := p.hostConnPools[hostID]
-	if !ok || pool.host != host {
+	if !ok || pool.host != host || (want != nil && pool != want) {
 		p.mu.Unlock()
 		return
 	}
@@ -1044,6 +1073,16 @@ func (pool *hostConnPool) logConnectErr(err error) {
 // that panics after would keep this cycle from ever reaching the conviction
 // policy it is about to consult.
 //
+// The conviction is authorised against this pool, not against its host. A cycle
+// that is still in flight when its pool is retired must not convict a host whose
+// replacement pool is healthy, so the tail returns when it observes that this
+// pool is no longer the one registered. That return is also a fifth disposition
+// for a deferred removal: the gate section above may already have discharged
+// refillPending on the strength of a conviction it predicted, and when the
+// conviction is then refused the obligation is simply gone. That is intended.
+// The obligation dies with the pool; recovery belongs to whatever pool is
+// registered now, and a retired pool is not rearmed to chase it.
+//
 // Parameters:
 //   - gen: the generation this cycle was admitted with
 //   - err: the cycle's own result
@@ -1124,8 +1163,28 @@ func (pool *hostConnPool) fillingStopped(gen uint64, err error) {
 			NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldString("host_id", host.HostID()), NewLogFieldInt("count", count))
 	})
 	if err != nil && count == 0 {
+		// Advisory, and deliberately not an authorisation point: pool.mu was
+		// released above and the registration can change under this read. Its
+		// only job is to keep a failure already visible as stale out of the
+		// application's ConvictionPolicy, which markHostDownFromPool cannot
+		// undo once AddFailure has counted it - the driver never calls Reset,
+		// so a counting policy would carry a retired pool's failures forward
+		// and convict the replacement with them.
+		//
+		// A cycle whose pool is retired between this read and the call still
+		// reaches the policy; markHostDownFromPool then refuses the DOWN. That
+		// is the exact split: advisory here, authoritative there.
+		//
+		// Returning here also discharges this cycle's refill obligation - the
+		// gate section above already cleared refillPending on the strength of
+		// the conviction it predicted. That is the intended disposition: the
+		// obligation dies with the pool, and recovery belongs to whatever pool
+		// is registered now. It is not a reason to rearm a retired pool.
+		if cur, ok := pool.session.pool.getPoolFor(host); !ok || cur != pool {
+			return
+		}
 		if pool.session.cfg.ConvictionPolicy.AddFailure(err, host) {
-			pool.session.handleHostDown(host)
+			pool.session.handleHostDown(host, pool)
 		}
 	}
 }

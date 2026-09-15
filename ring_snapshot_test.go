@@ -579,7 +579,7 @@ func TestRefreshRing_DuplicateLimitationTwoPhase(t *testing.T) {
 			c, ok := f.session.ring.getHost(peerIDOne)
 			require.True(t, ok, "the peer must have been admitted")
 			require.Eventually(t, func() bool { return c.IsUp() }, snapshotBudget, 10*time.Millisecond, "the peer's fill must succeed")
-			f.session.handleHostDown(c)
+			f.session.handleHostDown(c, nil)
 			require.Equal(t, NodeDown, c.State())
 
 			dup := newPeerRow(f.script.hostID, "127.0.0.9")

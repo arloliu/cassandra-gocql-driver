@@ -475,7 +475,10 @@ func (s *Session) handleNodeDown(ip net.IP, port int) {
 //
 // Parameters:
 //   - host: the ring object to mark DOWN; nil is ignored
-func (s *Session) handleHostDown(host *HostInfo) {
+//   - from: the pool whose failure this is, or nil when the caller has none.
+//     A non-nil from authorises the transition only while that pool is still the
+//     one registered for host; see markHostDownFromPool.
+func (s *Session) handleHostDown(host *HostInfo, from *hostConnPool) {
 	if !s.ring.owns(host) {
 		if host != nil {
 			s.logger.Debug("Ignoring DOWN for a host that is not the current ring entry.",
@@ -489,21 +492,61 @@ func (s *Session) handleHostDown(host *HostInfo) {
 
 	s.logger.Warning("Node is DOWN.",
 		NewLogFieldIP("host_addr", host.ConnectAddress()), NewLogFieldInt("port", host.Port()), NewLogFieldString("host_id", host.HostID()))
-	s.markHostDown(host)
+	s.markHostDownFromPool(host, from)
 }
 
 // markHostDown applies the DOWN transition to a host the caller has already
 // resolved: state, policy, pool removal (pointer-checked) and listeners.
 //
+// This is the host-keyed form, for a caller with no originating pool - a server
+// DOWN event, or the control connection's dial failure.
+//
 // Parameters:
 //   - host: the resolved ring object
 func (s *Session) markHostDown(host *HostInfo) {
+	s.markHostDownFromPool(host, nil)
+}
+
+// markHostDownFromPool applies the DOWN transition, optionally only on behalf of
+// the pool the caller acted on.
+//
+// from is the authorisation. nil is the host-keyed form. A non-nil from means the
+// transition was decided by that pool's fill cycle, and it is applied only while
+// that pool is still the one registered for host: a cycle still in flight when its
+// pool was retired must not mark the host DOWN, remove, or close a replacement pool
+// registered under the same *HostInfo object.
+//
+// The check is the closure's first act, ahead of setState and ahead of the ledger's
+// panic-safety defer. That position is load-bearing in both directions: it gates the
+// whole transition rather than only the removal - a DOWN with a healthy pool left
+// registered is not self-repairing, because the reconnect sweep's fill returns early
+// on a full pool and publishes no UP - and it returns before the defer is armed, so a
+// refused stale DOWN cannot outageRemove an entry a legitimate DOWN just added.
+//
+// It is taken under hostPublishMu, which every other registration and removal that
+// could contradict it also takes; registerPool returns the pool already registered
+// for the same object rather than replacing it, so the one registration path outside
+// hostPublishMu cannot substitute a different pool underneath. removeHostPool
+// re-checks under p.mu regardless, which is what makes the removal itself exact.
+//
+// Parameters:
+//   - host: the resolved ring object
+//   - from: the pool whose cycle decided this DOWN, or nil for the host-keyed form
+func (s *Session) markHostDownFromPool(host *HostInfo, from *hostConnPool) {
 	// State, policy and pool change as one transition under hostPublishMu,
 	// so a late fill success for the same host cannot leave it UP with no pool.
 	// An object the ring no longer owns is left untouched: its state no longer
 	// matters, and reporting it DOWN to a policy that keys by address could
 	// evict a replacement that took the same address.
 	if s.withOwnedHost(host, func() bool {
+		// Authorisation, before anything is changed and before the ledger's
+		// defer is armed. See the doc comment for why both orderings matter.
+		if from != nil {
+			if cur, ok := s.pool.getPoolFor(host); !ok || cur != from {
+				return false
+			}
+		}
+
 		host.setState(NodeDown)
 
 		// The ledger is updated before the policy callback and the pool
@@ -536,7 +579,7 @@ func (s *Session) markHostDown(host *HostInfo) {
 		}
 
 		s.policy.HostDown(host)
-		s.pool.removeHost(host)
+		s.pool.removeHostPool(host, from)
 		return true
 	}) {
 		s.hostListeners.OnHostDown(HostDownEvent{Host: host})

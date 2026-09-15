@@ -134,7 +134,7 @@ func TestSpeculative_AwaitFillRetirementDoesNotEndTheQuery(t *testing.T) {
 		result := iterAsync(fixture.query(t, &SimpleRetryPolicy{NumRetries: 5}, 1))
 		fixture.startBoth(t)
 
-		fixture.harness.session.handleHostDown(fixture.filling)
+		fixture.harness.session.handleHostDown(fixture.filling, nil)
 		fixture.retireAt(t, 1, 1, "the speculative runner's retirement")
 		requireStillRunning(t, result)
 

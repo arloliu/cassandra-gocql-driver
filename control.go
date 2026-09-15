@@ -695,8 +695,10 @@ func (c *controlConn) attemptReconnectToHost(host *HostInfo) (*Conn, error) {
 //   - host: the host the control connection failed to dial
 //   - err: the dial error handed to the ConvictionPolicy
 func (c *controlConn) convictOnDialFailure(host *HostInfo, err error) {
+	// nil: the control connection has no pool of its own, so this DOWN is
+	// authorised by host identity, as it was before pool-exact publication.
 	if c.session.hostPoolEmpty(host) && c.session.cfg.ConvictionPolicy.AddFailure(err, host) {
-		c.session.handleHostDown(host)
+		c.session.handleHostDown(host, nil)
 	}
 }
 

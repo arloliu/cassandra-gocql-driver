@@ -680,7 +680,7 @@ func TestDownRace_UpHoldsMutex(t *testing.T) {
 	}
 	downed := make(chan struct{})
 	go func() {
-		f.session.handleHostDown(a)
+		f.session.handleHostDown(a, nil)
 		close(downed)
 	}()
 	awaitDone(t, arrived, "handleHostDown to reach the mutex")
@@ -721,7 +721,7 @@ func TestDownRace_DownHoldsMutex(t *testing.T) {
 	t.Cleanup(func() { f.recorder.releaseGate("HostDown") })
 	downed := make(chan struct{})
 	go func() {
-		f.session.handleHostDown(a)
+		f.session.handleHostDown(a, nil)
 		close(downed)
 	}()
 	f.recorder.awaitEntered(t, "HostDown", a)

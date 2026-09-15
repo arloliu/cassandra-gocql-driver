@@ -406,7 +406,7 @@ func TestHandleHostDown_MarksHostDownByIdentity(t *testing.T) {
 	require.Equal(t, NodeUp, host.State(), "handleNodeDown must miss here; that miss is the bug under test")
 	require.Empty(t, drainHosts(collector.down), "the missed lookup must not report a transition")
 
-	session.handleHostDown(host)
+	session.handleHostDown(host, nil)
 
 	require.Equal(t, NodeDown, host.State(), "handleHostDown must mark the host it was handed DOWN")
 
@@ -426,13 +426,13 @@ func TestHandleHostDown_MarksHostDownByIdentity(t *testing.T) {
 func TestHandleHostDown_IgnoresNilAndEmptyHostID(t *testing.T) {
 	session, host, collector := newPauseRecoverySession(t, nil)
 
-	session.handleHostDown(nil)
+	session.handleHostDown(nil, nil)
 
 	orphan, err := NewHostInfoFromAddrPort(net.ParseIP("127.0.0.1"), host.Port())
 	require.NoError(t, err, "NewHostInfoFromAddrPort")
 	require.Empty(t, orphan.HostID(), "the orphan must have no host ID")
 
-	session.handleHostDown(orphan)
+	session.handleHostDown(orphan, nil)
 
 	require.Equal(t, NodeUp, host.State(), "the ring host must be untouched")
 	require.Empty(t, drainHosts(collector.down), "an unowned host must not report a transition")
@@ -452,7 +452,7 @@ func TestHandleHostDown_RespectsHostFilter(t *testing.T) {
 	// goroutine is still reading it, so this changes only the path under test.
 	session.cfg.HostFilter = DenyAllFilter()
 
-	session.handleHostDown(host)
+	session.handleHostDown(host, nil)
 
 	require.Equal(t, NodeDown, host.State(), "state is recorded even for a filtered host")
 	require.Empty(t, drainHosts(collector.down), "a filtered host must not reach the policy")
@@ -492,7 +492,7 @@ func TestHandleHostDown_ReplacementAfterOwnershipCheck(t *testing.T) {
 		})
 	}
 
-	session.handleHostDown(stale)
+	session.handleHostDown(stale, nil)
 
 	awaitHost(t, collector.up, replacement, "the replacement host to come UP")
 

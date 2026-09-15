@@ -1013,7 +1013,7 @@ func TestReconnection(t *testing.T) {
 	// Driver-side failure detection (a fill cycle that ended with an empty pool,
 	// a failed control dial) marks hosts DOWN by identity, so exercise that path
 	// rather than the address lookup a server event uses.
-	session.handleHostDown(h)
+	session.handleHostDown(h, nil)
 
 	if h.State() != NodeDown {
 		t.Fatal("Host should be NodeDown but not.")

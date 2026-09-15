@@ -1343,7 +1343,7 @@ func TestAwaitFill_RemoveHostWakeCannotBeMissed(t *testing.T) {
 		once.Do(func() { queryDone <- awaitQuery(t, result) })
 	}
 
-	harness.session.handleHostDown(host)
+	harness.session.handleHostDown(host, nil)
 	select {
 	case err := <-queryDone:
 		require.ErrorIs(t, err, ErrNoConnections, "a removed host must end the wait")
