@@ -342,42 +342,68 @@ func TestFillingStopped_DownstreamPanicDoesNotReconsultThePolicy(t *testing.T) {
 		"a DOWN notification that panicked before it changed state leaves the host as it was")
 }
 
-// sampleClaimsAtRelease reports the pool's outstanding claim count at the moment a
-// cycle releases its own, taken on that cycle's goroutine right after the decrement.
+// releaseSample is what a cycle's claim release looks like from outside.
+type releaseSample struct {
+	// pending is the pool's outstanding claim count taken on the releasing
+	// goroutine, immediately after its own decrement.
+	pending int
+	// ordinal is how many releases have been recorded since the baseline,
+	// counting this one. It is 1 when this is the first release of the episode.
+	ordinal int
+}
+
+// sampleFirstRelease reports the first claim release the pool records after base.
 //
 // A successor's claim is reserved in the same critical section that clears the gate,
-// which is strictly before that decrement,
-// so this one number says whether a handover happened:
-// at least one claim outstanding means a successor was reserved, zero means none was.
-// It is an exact observation rather than a poll,
-// which matters because a refused successor releases its own claim moments later and
-// a count read afterwards cannot tell the two builds apart.
+// which is strictly before the outgoing decrement,
+// so the pair it returns says what happened:
+// a discharge shows no outstanding claim on the first release,
+// and a handover shows one.
+// The ordinal is what catches a build that published extra claims of its own -
+// those are refused and released before the owning cycle gets there,
+// so the first release is no longer the owner's.
 //
 // Returns:
-//   - <-chan int: receives the sample exactly once
-func sampleClaimsAtRelease(events *poolEventRecorder, pool *hostConnPool) <-chan int {
-	sampled := make(chan int, 1)
+//   - <-chan releaseSample: receives the sample exactly once
+func sampleFirstRelease(events *poolEventRecorder, pool *hostConnPool, base int) <-chan releaseSample {
+	sampled := make(chan releaseSample, 1)
 	var once sync.Once
 	events.on(poolFillDone, func(*HostInfo) {
-		once.Do(func() { sampled <- pendingFills(pool) })
+		once.Do(func() {
+			sampled <- releaseSample{
+				pending: pendingFills(pool),
+				ordinal: events.count(poolFillDone) - base,
+			}
+		})
 	})
 	return sampled
 }
 
-// awaitClaimSample blocks for the sample sampleClaimsAtRelease publishes.
+// awaitReleaseSample blocks for the sample sampleFirstRelease publishes.
 //
 // Returns:
-//   - int: the claim count observed at the release
-func awaitClaimSample(t *testing.T, sampled <-chan int) int {
+//   - releaseSample: the first release observed
+func awaitReleaseSample(t *testing.T, sampled <-chan releaseSample) releaseSample {
 	t.Helper()
 
 	select {
-	case pending := <-sampled:
-		return pending
+	case sample := <-sampled:
+		return sample
 	case <-time.After(fillEventBudget):
 		t.Fatalf("timed out after %v waiting for a cycle to release its claim", fillEventBudget)
-		return 0
+		return releaseSample{}
 	}
+}
+
+// requireDischarged requires the first release of the episode to be the owning
+// cycle's own, with nothing reserved behind it.
+func requireDischarged(t *testing.T, sampled <-chan releaseSample, what string) {
+	t.Helper()
+
+	sample := awaitReleaseSample(t, sampled)
+	require.Equal(t, 1, sample.ordinal,
+		"%s: the owning cycle's release must be the first of the episode, so nothing else claimed", what)
+	require.Zero(t, sample.pending, "%s: no successor may be reserved", what)
 }
 
 // poolRefillPending reads the obligation a removal left behind.
@@ -457,7 +483,7 @@ func TestFill_RemovalDuringACycleIsNotLost(t *testing.T) {
 	t.Cleanup(releaseSuccessor)
 
 	var deferred bool
-	var claimsAtDeferral int
+	var claimsAtDeferral, releasesAtDeferral int
 	var killOnce sync.Once
 	killed := make(chan struct{})
 	harness.events.on(poolConnAppended, func(*HostInfo) {
@@ -472,6 +498,7 @@ func TestFill_RemovalDuringACycleIsNotLost(t *testing.T) {
 
 			deferred = awaitDeferredRemoval(t, harness.events, pool, base)
 			claimsAtDeferral = pendingFills(pool)
+			releasesAtDeferral = harness.events.count(poolFillDone) - base
 			held, _ := poolGate(pool)
 			require.True(t, held, "the cycle must still hold the gate when the removal is accounted for")
 		})
@@ -489,6 +516,8 @@ func TestFill_RemovalDuringACycleIsNotLost(t *testing.T) {
 	require.True(t, deferred, "the removal must be recorded against the cycle that holds the gate")
 	require.Equal(t, 1, claimsAtDeferral,
 		"a deferred removal must publish no claim of its own: only the cycle holding the gate has one")
+	require.Zero(t, releasesAtDeferral,
+		"nor may it publish one and release it again before the cycle ends")
 
 	awaitSignal(t, arrived, "a successor to reach admission for the deferred removal")
 	releaseSuccessor()
@@ -566,12 +595,11 @@ func TestFill_ConvictingCycleDischargesTheRemoval(t *testing.T) {
 	survivor, _ := startPartialCycle(t, harness, pool)
 	killDeferred(t, pool, survivor)
 
-	sampled := sampleClaimsAtRelease(harness.events, pool)
+	sampled := sampleFirstRelease(harness.events, pool, harness.events.count(poolFillDone))
 	harness.dialer.setErr(func(string) error { return errFillTestDialRefused })
 	harness.dialer.releaseAll()
 
-	require.Zero(t, awaitClaimSample(t, sampled),
-		"a cycle that consulted the policy must reserve no successor")
+	requireDischarged(t, sampled, "a cycle that consulted the policy")
 	require.Len(t, conviction.recorded(), 1, "the failed cycle must consult the policy")
 	require.False(t, poolRefillPending(pool), "the obligation must not outlive the cycle that held it")
 	require.Equal(t, NodeUp, host.State(), "a declined conviction leaves the host as it was")
@@ -591,10 +619,13 @@ func TestFill_ClosedPoolDischargesTheRemoval(t *testing.T) {
 
 	pool.Close()
 
-	sampled := sampleClaimsAtRelease(harness.events, pool)
+	// A successor reserved on a closed pool is refused before it reaches any
+	// checkpoint, so it cannot be held; the ordinal is what catches it, whichever of
+	// the two releases lands first.
+	sampled := sampleFirstRelease(harness.events, pool, harness.events.count(poolFillDone))
 	harness.dialer.releaseAll()
 
-	require.Zero(t, awaitClaimSample(t, sampled), "a closed pool must reserve no successor")
+	requireDischarged(t, sampled, "a closed pool")
 	require.False(t, poolRefillPending(pool), "the obligation must not outlive the pool")
 }
 
@@ -619,14 +650,13 @@ func TestFill_ShutdownDischargesTheRemoval(t *testing.T) {
 	// The sampler is installed before the trigger: cancelling releases the parked dial
 	// at once, so a baseline read afterwards could already include the release it means
 	// to wait for.
-	sampled := sampleClaimsAtRelease(harness.events, pool)
+	sampled := sampleFirstRelease(harness.events, pool, harness.events.count(poolFillDone))
 
 	// Cancelling alone, rather than closing the session: the child pool stays open,
 	// which is the window the completion has to get right.
 	harness.session.cancel()
 
-	require.Zero(t, awaitClaimSample(t, sampled),
-		"a cycle cut short by shutdown must reserve no successor")
+	requireDischarged(t, sampled, "a cycle cut short by shutdown")
 	require.Empty(t, conviction.recorded(), "a fill cancelled by shutdown must not convict")
 	require.False(t, poolRefillPending(pool), "the obligation must not outlive the cycle that held it")
 }
@@ -665,11 +695,13 @@ func TestFill_HandoverNeverLeavesThePoolIdle(t *testing.T) {
 		}
 	})
 
-	sampled := sampleClaimsAtRelease(harness.events, pool)
+	sampled := sampleFirstRelease(harness.events, pool, harness.events.count(poolFillDone))
 	harness.dialer.releaseAll()
 
 	awaitSignal(t, arrived, "the successor to reach its admission checkpoint")
-	require.GreaterOrEqual(t, awaitClaimSample(t, sampled), 1,
+	sample := awaitReleaseSample(t, sampled)
+	require.Equal(t, 1, sample.ordinal, "the predecessor's release must be the first of the episode")
+	require.GreaterOrEqual(t, sample.pending, 1,
 		"the successor's claim must already be published when its predecessor releases")
 
 	releaseSuccessor()
@@ -780,6 +812,7 @@ func TestFill_SeveralRemovalsCoalesceIntoOneSuccessor(t *testing.T) {
 	pool.mu.RUnlock()
 	require.Len(t, survivors, 2, "this fixture needs two connections to lose")
 
+	base := harness.events.count(poolFillDone)
 	for _, conn := range survivors {
 		conn.closeWithError(errors.New("gocql: test induced connection failure"))
 	}
@@ -791,12 +824,35 @@ func TestFill_SeveralRemovalsCoalesceIntoOneSuccessor(t *testing.T) {
 			t.Fatalf("timed out after %v waiting for both removals (size=%d)", fillEventBudget, pool.Size())
 		}
 	}
+	require.Equal(t, 1, pendingFills(pool),
+		"two deferred removals must publish no claims of their own: only the gate holder has one")
+	require.Equal(t, base, harness.events.count(poolFillDone),
+		"and none may have published a claim and released it again")
 
-	sampled := sampleClaimsAtRelease(harness.events, pool)
+	// The successor is held at its admission checkpoint so it cannot release before
+	// the cycle that handed it over, which is the release the sample must describe.
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	releaseSuccessor := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseSuccessor)
+	harness.events.on(poolFillAdmission, func(*HostInfo) {
+		select {
+		case arrived <- struct{}{}:
+			<-release
+		default:
+		}
+	})
+
+	sampled := sampleFirstRelease(harness.events, pool, base)
 	harness.dialer.releaseAll()
 
-	require.Equal(t, 1, awaitClaimSample(t, sampled),
+	awaitSignal(t, arrived, "the one successor to reach its admission checkpoint")
+	sample := awaitReleaseSample(t, sampled)
+	require.Equal(t, 1, sample.ordinal, "the owning cycle's release must be the first of the episode")
+	require.Equal(t, 1, sample.pending,
 		"two removals behind one cycle must hand over exactly one successor")
 	require.False(t, poolRefillPending(pool), "the obligation must not survive the handover")
+
+	releaseSuccessor()
 	awaitNoPendingFills(t, harness.session.pool, pool)
 }
