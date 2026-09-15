@@ -108,32 +108,16 @@ func (l *stateListener) requireNoDown(t *testing.T, what string) {
 	}
 }
 
-// drainUp discards the UP notifications published so far, and keeps draining until the
-// channel has been quiet for a short run of intervals.
+// drainUp discards the UP notifications published so far.
 //
-// A single pass is not enough, and the reason is worth stating because it cannot be
-// fixed by waiting for the initial UP instead. newFillHarness joins the initial fill's
-// POLICY UP and its claim release, and neither orders the public callback:
-// handleNodeConnected calls hostListeners.OnHostUp after releasing hostPublishMu, so
-// when the harness returns the initial handler can be sitting between those two
-// statements. Nor can a test simply wait for that UP to arrive, because
-// internalHostListeners suppresses every notification while session.initialized() is
-// false and the initial fill normally completes inside CreateSession - so usually it is
-// never delivered at all, and a wait would hang.
-//
-// The quiet run absorbs a late initial UP either way. It bounds a window a few
-// instructions wide on one goroutine; closing it outright would need a production seam
-// installed before CreateSession, which this change does not add. The residual is that
-// window, and it can only ever cause a false FAILURE, never a false pass.
+// One pass is enough because every caller has already joined the handler that could
+// still be publishing; see upWatch.
 func (l *stateListener) drainUp() {
-	quiet := 0
-	for quiet < 5 {
+	for {
 		select {
 		case <-l.up:
-			quiet = 0
 		default:
-			quiet++
-			time.Sleep(time.Millisecond)
+			return
 		}
 	}
 }
@@ -594,35 +578,91 @@ func TestRemoveHostPool_RefusesAPoolItDoesNotOwn(t *testing.T) {
 	})
 }
 
-// upWatch joins the asynchronous handleNodeConnected callbacks of a harness session.
+// initHookPolicy wraps a HostSelectionPolicy so a test can reach the Session before its
+// first fill runs.
 //
-// handleNodeConnected runs on a goroutine fill spawns, so a test that asserts "no UP
-// was published" without joining it passes for the wrong reason - it observes the
-// absence before the goroutine had a chance to produce one. The seam is host-keyed, so
-// a watch cannot tell two pools' handlers apart by argument; a test that has more than
-// one in play consumes the earlier one while the later one is provably still parked.
+// NewSession calls s.policy.Init(s) before s.init() (session.go), which is the only point
+// a test gets the *Session while no pool has been filled yet. Everything else a fixture
+// can set is either a ClusterConfig field - and handleNodeConnected's completion hook is
+// not one - or something it sets after CreateSession has already returned, by which time
+// the initial fill's handler is in flight.
+type initHookPolicy struct {
+	HostSelectionPolicy
+
+	install func(*Session)
+}
+
+var _ HostSelectionPolicy = (*initHookPolicy)(nil)
+
+// Init runs the test's installer and then the wrapped policy's own Init.
+func (p *initHookPolicy) Init(s *Session) {
+	p.install(s)
+	p.HostSelectionPolicy.Init(s)
+}
+
+// upWatch joins the asynchronous handleNodeConnected callbacks of a harness session and
+// observes both UP publications - the selection policy's and the application listener's.
+//
+// handleNodeConnected runs on a goroutine fill spawns, so a test that asserts "no UP was
+// published" without joining it passes for the wrong reason. The seam is host-keyed, so a
+// watch cannot tell two pools' handlers apart by argument; a test with more than one in
+// play consumes the earlier one while the later one is provably still parked.
+//
+// The hook is installed through initHookPolicy rather than after CreateSession, and that
+// is not a stylistic choice. The public listener call happens after handleNodeConnected
+// releases hostPublishMu, while newFillHarness's barriers - the policy UP and the fill
+// claim release - order neither. A watch installed afterwards therefore does not join the
+// INITIAL fill's handler, which can deliver a legitimate listener UP at any later moment
+// and fail a correct build. Nor can a test simply wait for that UP: internalHostListeners
+// suppresses every notification while session.initialized() is false, and the initial fill
+// normally completes inside CreateSession, so usually it is never delivered and the wait
+// hangs. Installing before the first fill makes the initial handler's completion something
+// the test can consume, whether or not the notification itself was suppressed.
 type upWatch struct {
 	connected chan *HostInfo
 	collector *hostStateCollector
+	listener  *stateListener
 }
 
-// watchNodeConnected installs the join seam and drains whatever the fixture already
-// published, so every later observation belongs to the test.
-//
-// It is installed after newFillHarness has joined the initial fill's UP event and its
-// claim release, which orders this write after the initial handler's read of the field.
-func watchNodeConnected(t *testing.T, harness *fillHarness) *upWatch {
+// installUpWatch wires the watch into cluster from inside a fill-harness tune function,
+// before CreateSession.
+func installUpWatch(t *testing.T, cluster *ClusterConfig) *upWatch {
 	t.Helper()
 
-	w := &upWatch{connected: make(chan *HostInfo, 8), collector: harness.collector}
-	harness.session.testAfterNodeConnected = func(host *HostInfo) {
-		select {
-		case w.connected <- host:
-		default:
-		}
+	w := &upWatch{connected: make(chan *HostInfo, 64)}
+	w.listener = newStateListener(cluster)
+
+	inner := cluster.PoolConfig.HostSelectionPolicy
+	collector, ok := inner.(*hostStateCollector)
+	require.True(t, ok, "the fill harness installs a hostStateCollector, got %T", inner)
+	w.collector = collector
+
+	cluster.PoolConfig.HostSelectionPolicy = &initHookPolicy{
+		HostSelectionPolicy: inner,
+		install: func(s *Session) {
+			s.testAfterNodeConnected = func(host *HostInfo) {
+				select {
+				case w.connected <- host:
+				default:
+				}
+			}
+		},
+	}
+	return w
+}
+
+// joinInitialFill consumes the initial fill's handler completion and then discards every
+// UP either publication has recorded, so the whole of the fixture's own history is behind
+// the test before it begins.
+//
+// The harness guarantees each pool filled, so exactly one completion per host is owed.
+func (w *upWatch) joinInitialFill(t *testing.T, hosts ...*HostInfo) {
+	t.Helper()
+
+	for range hosts {
+		w.await(t, "the initial fill's handleNodeConnected to return")
 	}
 	w.drainUp()
-	return w
 }
 
 // await blocks until one handleNodeConnected call has returned.
@@ -636,8 +676,9 @@ func (w *upWatch) await(t *testing.T, what string) {
 	}
 }
 
-// drainUp discards the UP transitions published so far.
+// drainUp discards the UP transitions both publications have recorded so far.
 func (w *upWatch) drainUp() {
+	w.listener.drainUp()
 	for {
 		select {
 		case <-w.collector.up:
@@ -647,8 +688,14 @@ func (w *upWatch) drainUp() {
 	}
 }
 
-// requireNoPolicyUp fails when the selection policy saw an UP since the last drain.
-func (w *upWatch) requireNoPolicyUp(t *testing.T, what string) {
+// requireNoUp fails when either publication saw an UP since the last drain.
+//
+// Both are asserted because they are separate decisions: handleNodeConnected calls the
+// policy inside its withOwnedHost closure and the listener outside it, on the closure's
+// bool. A refusal that wrongly returned true would leave host state, the ledger, the
+// policy and the replacement pool exactly as these tests expect them, and still call the
+// application back.
+func (w *upWatch) requireNoUp(t *testing.T, what string) {
 	t.Helper()
 
 	select {
@@ -656,6 +703,7 @@ func (w *upWatch) requireNoPolicyUp(t *testing.T, what string) {
 		t.Fatalf("the policy saw an UP for %v: %s", host, what)
 	default:
 	}
+	w.listener.requireNoUp(t, what)
 }
 
 // retireAndReplace marks host DOWN - which removes and closes its pool - and registers
@@ -690,14 +738,14 @@ func retireAndReplace(t *testing.T, harness *fillHarness, host *HostInfo) *hostC
 // nil, so the cycle still reaches the UP notification - with a connection that exists
 // nowhere. U1 is what refuses it.
 func TestFill_RetiredPoolDoesNotPublishUpFromTheInitialFill(t *testing.T) {
-	var listener *stateListener
+	var watch *upWatch
 	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		quiesceReconnects(cluster)
-		listener = newStateListener(cluster)
+		watch = installUpWatch(t, cluster)
 	})
 	host := harness.hosts[0]
 	poolA := harness.pool(t, host)
-	watch := watchNodeConnected(t, harness)
+	watch.joinInitialFill(t, host)
 
 	// startCount == 0: the cycle takes the synchronous branch.
 	harness.dialer.arm(nil)
@@ -708,13 +756,11 @@ func TestFill_RetiredPoolDoesNotPublishUpFromTheInitialFill(t *testing.T) {
 
 	poolB := retireAndReplace(t, harness, host)
 	watch.drainUp()
-	listener.drainUp()
 
 	harness.dialer.releaseAll()
 	watch.await(t, "the retired pool's UP notification to be decided")
 
-	watch.requireNoPolicyUp(t, "a retired pool's fill must not publish UP for its replacement")
-	listener.requireNoUp(t, "and must not notify the application listener")
+	watch.requireNoUp(t, "a retired pool's fill must not publish UP for its replacement")
 	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
@@ -731,15 +777,15 @@ func TestFill_RetiredPoolDoesNotPublishUpFromTheInitialFill(t *testing.T) {
 // startCount > 0 - so one fixture cannot reach both, and one mutation cannot stand
 // for both.
 func TestFill_RetiredPoolDoesNotPublishUpFromTheContinuation(t *testing.T) {
-	var listener *stateListener
+	var watch *upWatch
 	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		cluster.NumConns = 2
 		quiesceReconnects(cluster)
-		listener = newStateListener(cluster)
+		watch = installUpWatch(t, cluster)
 	})
 	host := harness.hosts[0]
 	poolA := harness.pool(t, host)
-	watch := watchNodeConnected(t, harness)
+	watch.joinInitialFill(t, host)
 
 	// startCount == 1: the cycle skips the synchronous branch and goes straight to
 	// the asynchronous continuation.
@@ -752,13 +798,11 @@ func TestFill_RetiredPoolDoesNotPublishUpFromTheContinuation(t *testing.T) {
 
 	poolB := retireAndReplace(t, harness, host)
 	watch.drainUp()
-	listener.drainUp()
 
 	harness.dialer.releaseAll()
 	watch.await(t, "the retired pool's UP notification to be decided")
 
-	watch.requireNoPolicyUp(t, "a retired pool's continuation must not publish UP for its replacement")
-	listener.requireNoUp(t, "and must not notify the application listener")
+	watch.requireNoUp(t, "a retired pool's continuation must not publish UP for its replacement")
 	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
@@ -786,15 +830,15 @@ func TestFill_RetiredPoolDoesNotPublishUpFromTheContinuation(t *testing.T) {
 //     consumed while the successor is still parked, when nothing else can be in
 //     flight, so the second one observed is unambiguously the successor's.
 func TestFill_SuccessorAdmittedBeforeRetirementDoesNotAffectTheReplacement(t *testing.T) {
-	var listener *stateListener
+	var watch *upWatch
 	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
 		cluster.NumConns = 2
 		quiesceReconnects(cluster)
-		listener = newStateListener(cluster)
+		watch = installUpWatch(t, cluster)
 	})
 	host := harness.hosts[0]
 	poolA := harness.pool(t, host)
-	watch := watchNodeConnected(t, harness)
+	watch.joinInitialFill(t, host)
 
 	// An owning cycle parked in its continuation, holding one connection.
 	survivor, _ := startPartialCycle(t, harness, poolA)
@@ -818,13 +862,11 @@ func TestFill_SuccessorAdmittedBeforeRetirementDoesNotAffectTheReplacement(t *te
 
 	poolB := retireAndReplace(t, harness, host)
 	watch.drainUp()
-	listener.drainUp()
 
 	harness.dialer.releaseAll()
 	watch.await(t, "the successor's UP notification to be decided")
 
-	watch.requireNoPolicyUp(t, "a successor admitted before retirement must not publish UP for the replacement")
-	listener.requireNoUp(t, "and must not notify the application listener")
+	watch.requireNoUp(t, "a successor admitted before retirement must not publish UP for the replacement")
 	require.Equal(t, NodeDown, host.State(), "the host must stay DOWN")
 
 	registered, ok := harness.session.pool.getPoolFor(host)
