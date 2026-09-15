@@ -559,18 +559,28 @@ func startPartialCycle(t *testing.T, harness *fillHarness, pool *hostConnPool) (
 }
 
 // killDeferred removes conn and waits until the removal has been recorded against
-// the cycle that holds the gate.
+// the cycle that holds the gate, leaving the pool empty.
 func killDeferred(t *testing.T, pool *hostConnPool, conn *Conn) {
+	t.Helper()
+
+	killDeferred2(t, pool, conn, 0)
+}
+
+// killDeferred2 is killDeferred for a pool that keeps connections afterwards.
+//
+// Parameters:
+//   - want: how many connections the pool must be left holding
+func killDeferred2(t *testing.T, pool *hostConnPool, conn *Conn, want int) {
 	t.Helper()
 
 	conn.closeWithError(errors.New("gocql: test induced connection failure"))
 	deadline := time.After(fillEventBudget)
-	for !(pool.Size() == 0 && poolRefillPending(pool)) {
+	for !(pool.Size() == want && poolRefillPending(pool)) {
 		select {
 		case <-time.After(time.Millisecond):
 		case <-deadline:
-			t.Fatalf("timed out after %v waiting for the removal to be deferred (size=%d pending=%v)",
-				fillEventBudget, pool.Size(), poolRefillPending(pool))
+			t.Fatalf("timed out after %v waiting for the removal to be deferred (size=%d want=%d pending=%v)",
+				fillEventBudget, pool.Size(), want, poolRefillPending(pool))
 		}
 	}
 }
@@ -855,4 +865,209 @@ func TestFill_SeveralRemovalsCoalesceIntoOneSuccessor(t *testing.T) {
 
 	releaseSuccessor()
 	awaitNoPendingFills(t, harness.session.pool, pool)
+}
+
+// TestFill_WaiterSpansAnEmptyPoolHandover proves a query waiting on the pool is
+// not sent away while the obligation changes hands.
+//
+// This is the handover invariant seen from outside.
+// A waiter treats the pool as worth waiting for only while a claim is outstanding,
+// and here the pool is genuinely empty for the whole handover:
+// the cycle's own connection dies before it finishes,
+// so there is nothing to serve the query until the successor lands one.
+// A handover that released before it reserved would show the pool as empty and idle
+// for an instant and the query would give up with ErrNoConnections.
+func TestFill_WaiterSpansAnEmptyPoolHandover(t *testing.T) {
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) { cluster.Timeout = 0 })
+	pool := harness.pool(t, harness.hosts[0])
+
+	harness.dialer.arm(nil)
+	detached := detachPoolConn(t, pool)
+	t.Cleanup(func() { detached.Close() })
+
+	// The query's own Pick starts the cycle, and the query then waits for it.
+	waiting := make(chan struct{}, 1)
+	harness.session.executor.testBeforeWait = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+	// No retries: a waiter that gives up must surface ErrNoConnections to the caller
+	// rather than have the executor re-pick and start a fresh cycle that succeeds -
+	// which would make this test pass on a build with no handover at all.
+	result := harness.query(t.Context(), func(qry *Query) {
+		qry.RetryPolicy(&SimpleRetryPolicy{NumRetries: 0})
+	})
+	awaitSignal(t, waiting, "the query to await the fill")
+	harness.dialer.awaitStarted(t)
+
+	// The connection that cycle appends dies before it can be picked, so the pool is
+	// empty across the whole handover and only the successor can end the wait.
+	var killOnce sync.Once
+	killed := make(chan struct{})
+	harness.events.on(poolConnAppended, func(*HostInfo) {
+		killOnce.Do(func() {
+			defer close(killed)
+
+			pool.mu.RLock()
+			conn := pool.conns[len(pool.conns)-1]
+			pool.mu.RUnlock()
+			conn.closeWithError(errors.New("gocql: test induced connection failure"))
+
+			deadline := time.After(fillEventBudget)
+			for !(pool.Size() == 0 && poolRefillPending(pool)) {
+				select {
+				case <-time.After(time.Millisecond):
+				case <-deadline:
+					t.Error("the removal was never deferred")
+					return
+				}
+			}
+		})
+	})
+
+	harness.dialer.releaseAll()
+	awaitSignal(t, killed, "the appended connection to be removed")
+
+	require.NoError(t, awaitQuery(t, result),
+		"the waiter must be carried across the handover, not sent away with ErrNoConnections")
+}
+
+// TestFill_HandoverSurvivesAPanickingWarning proves the obligation reaches its
+// successor even when the completion's warning panics.
+//
+// That warning is the first thing a failed cycle hands to the application, and it
+// runs before the gate is released - so a logger that panics there used to end the
+// cycle without the transition running at all.
+// The pool keeps a connection here, so the failure does not convict and the
+// obligation really is due to be handed on.
+func TestFill_HandoverSurvivesAPanickingWarning(t *testing.T) {
+	conviction := &recordingConvictionPolicy{}
+	logger := newMsgPanicLogger(fillWarnMsg, 8)
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		cluster.NumConns = 3
+		cluster.ConvictionPolicy = conviction
+		cluster.Logger = logger
+	})
+	pool := harness.pool(t, harness.hosts[0])
+
+	// Two connections, a cycle dialling for the third, and one of the two dies while
+	// it holds the gate: the cycle fails over a pool that is not empty.
+	harness.dialer.arm(nil)
+	detached := detachPoolConn(t, pool)
+	t.Cleanup(func() { detached.Close() })
+	require.True(t, pool.claimFill(), "the fixture must be able to claim a fill")
+	go pool.runFill()
+	harness.dialer.awaitStarted(t)
+	awaitGate(t, pool, true, "the partial cycle to take the gate")
+
+	pool.mu.RLock()
+	doomed := pool.conns[0]
+	pool.mu.RUnlock()
+	killDeferred2(t, pool, doomed, 1)
+	logger.arm()
+
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	releaseSuccessor := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseSuccessor)
+	harness.events.on(poolFillAdmission, func(*HostInfo) {
+		select {
+		case arrived <- struct{}{}:
+			<-release
+		default:
+		}
+	})
+
+	sampled := sampleFirstRelease(harness.events, pool, harness.events.count(poolFillDone))
+	harness.dialer.setErr(func(string) error { return errFillTestDialRefused })
+	harness.dialer.releaseAll()
+
+	awaitSignal(t, arrived, "the successor to reach admission despite the panicking warning")
+	sample := awaitReleaseSample(t, sampled)
+	require.Equal(t, 1, sample.ordinal, "the owning cycle's release must be the first of the episode")
+	require.Equal(t, 1, sample.pending, "the obligation must reach a successor")
+	require.NotZero(t, logger.fires(), "the fixture must have made the warning panic")
+	require.Empty(t, conviction.recorded(), "a cycle that kept a connection must not convict")
+
+	releaseSuccessor()
+}
+
+// TestFill_ClosureAfterReservationRefusesTheSuccessor proves a pool closed after the
+// handover disposes of the successor rather than leaking its claim.
+//
+// The transition's closed check covers the moment it runs; this is the rest of the
+// window the property claims - the successor is already reserved and on its way when
+// the pool goes.
+func TestFill_ClosureAfterReservationRefusesTheSuccessor(t *testing.T) {
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) { cluster.NumConns = 2 })
+	pool := harness.pool(t, harness.hosts[0])
+
+	survivor, _ := startPartialCycle(t, harness, pool)
+	killDeferred(t, pool, survivor)
+
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	releaseSuccessor := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseSuccessor)
+	harness.events.on(poolFillAdmission, func(*HostInfo) {
+		select {
+		case arrived <- struct{}{}:
+			<-release
+		default:
+		}
+	})
+
+	harness.dialer.releaseAll()
+	awaitSignal(t, arrived, "the successor to reach its admission checkpoint")
+
+	// The pool goes while the successor is held, so the close lands strictly after
+	// the reservation.
+	pool.Close()
+	releaseSuccessor()
+
+	require.Eventually(t, func() bool { return pendingFills(pool) == 0 }, fillEventBudget, time.Millisecond,
+		"a successor refused by a closed pool must still release its claim")
+	require.False(t, poolRefillPending(pool), "no obligation may outlive the pool")
+}
+
+// TestFill_ShutdownDuringAReservedHandoverConvictsNothing proves a successor cut
+// short by session shutdown ends quietly.
+//
+// The owning cycle succeeded, so it handed the obligation on rather than disposing
+// of it; the session is then cancelled while the successor is still dialling. Its
+// dial fails on the cancelled context, and the guard in its own completion is what
+// keeps that failure from reaching the conviction policy during teardown.
+func TestFill_ShutdownDuringAReservedHandoverConvictsNothing(t *testing.T) {
+	conviction := &recordingConvictionPolicy{}
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		cluster.NumConns = 2
+		cluster.ConvictionPolicy = conviction
+	})
+	pool := harness.pool(t, harness.hosts[0])
+
+	survivor, _ := startPartialCycle(t, harness, pool)
+	killDeferred(t, pool, survivor)
+
+	// Only the owning cycle's dial is let through, so the successor parks.
+	base := harness.events.count(poolFillDone)
+	harness.dialer.releaseOne()
+	awaitClaimReleases(t, harness.events, base, 1)
+	harness.dialer.awaitStarted(t)
+	awaitGate(t, pool, true, "the successor to take the gate")
+
+	// The connection the owning cycle landed dies too, so the successor will finish
+	// over an empty pool - the only shape that reaches the conviction condition, and
+	// therefore the only one that tests the guard.
+	pool.mu.RLock()
+	last := pool.conns[0]
+	pool.mu.RUnlock()
+	killDeferred(t, pool, last)
+
+	harness.session.cancel()
+
+	awaitClaimReleases(t, harness.events, base, 2)
+	require.Empty(t, conviction.recorded(), "a successor cancelled by shutdown must not convict")
+	require.Zero(t, pendingFills(pool), "no claim may be left outstanding")
 }
