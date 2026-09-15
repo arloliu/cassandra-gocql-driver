@@ -22,6 +22,7 @@
 package gocql
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -336,4 +337,290 @@ func TestFillingStopped_DownstreamPanicDoesNotReconsultThePolicy(t *testing.T) {
 	require.Len(t, conviction.recorded(), 1, "one cycle must spend exactly one policy decision")
 	require.Equal(t, NodeUp, host.State(),
 		"a DOWN notification that panicked before it changed state leaves the host as it was")
+}
+
+// poolRefillPending reads the obligation a removal left behind.
+//
+// Returns:
+//   - bool: whether a removal is waiting for the cycle holding the gate to end
+func poolRefillPending(pool *hostConnPool) bool {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	return pool.refillPending
+}
+
+// awaitDeferredRemoval blocks until the connection killed inside a fill cycle has
+// been taken out of the pool and its refill has been accounted for.
+//
+// The accounting is an either/or on purpose.
+// A pool that defers the removal records it and publishes no claim,
+// so there is no release to wait for;
+// one that spawns a runner the gate then refuses publishes a claim and releases it.
+// Waiting for whichever arrives lets the same schedule drive a build that keeps the
+// obligation and one that drops it,
+// instead of the second timing out in setup and failing for the wrong reason.
+//
+// Returns:
+//   - bool: true when the removal was deferred, false when a claim was refused instead
+func awaitDeferredRemoval(t *testing.T, events *poolEventRecorder, pool *hostConnPool, base int) bool {
+	t.Helper()
+
+	deadline := time.After(fillEventBudget)
+	for {
+		if pool.Size() == 0 {
+			if poolRefillPending(pool) {
+				return true
+			}
+			if events.count(poolFillDone) > base {
+				return false
+			}
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline:
+			t.Fatalf("timed out after %v waiting for the removal to be accounted for (size=%d)",
+				fillEventBudget, pool.Size())
+			return false
+		}
+	}
+}
+
+// TestFill_RemovalDuringACycleIsNotLost proves a connection that dies while one of
+// the pool's own fill cycles is in flight still gets a fill of its own.
+//
+// HandleError is the only place in normal operation that takes a connection out of
+// a pool, so its request is the pool's only record that the connection is gone.
+// A fill spawned for it while a cycle holds the gate is refused and forgotten, and
+// the cycle that refused it then judges conviction by ITS OWN error - nil, because
+// it succeeded - over a pool that is empty by the time it reads the count.
+// The pool was left empty, idle and UP, with nothing scheduled and the reconnect
+// sweep skipping it because the host is not down.
+//
+// The kill and its refill both happen inside the poolConnAppended hook, so the gate
+// is provably still held when the refill is accounted for, rather than racing it.
+func TestFill_RemovalDuringACycleIsNotLost(t *testing.T) {
+	harness := newFillHarness(t, 1, nil)
+	host := harness.hosts[0]
+	pool := harness.pool(t, host)
+
+	startGatedCycle(t, harness, pool)
+
+	// The successor is held at admission, so "a successor ran" is observed rather
+	// than inferred from a pool that something else might have refilled.
+	admitted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	releaseSuccessor := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseSuccessor)
+
+	var deferred bool
+	var killOnce sync.Once
+	killed := make(chan struct{})
+	harness.events.on(poolConnAppended, func(*HostInfo) {
+		killOnce.Do(func() {
+			defer close(killed)
+
+			base := harness.events.count(poolFillDone)
+			pool.mu.RLock()
+			conn := pool.conns[len(pool.conns)-1]
+			pool.mu.RUnlock()
+			conn.closeWithError(errors.New("gocql: test induced connection failure"))
+
+			deferred = awaitDeferredRemoval(t, harness.events, pool, base)
+			held, _ := poolGate(pool)
+			require.True(t, held, "the cycle must still hold the gate when the removal is accounted for")
+		})
+	})
+	harness.events.on(poolFillAdmission, func(*HostInfo) {
+		select {
+		case admitted <- struct{}{}:
+			<-release
+		default:
+		}
+	})
+
+	harness.dialer.releaseAll()
+	awaitSignal(t, killed, "the appended connection to be removed")
+	require.True(t, deferred, "the removal must be recorded against the cycle that holds the gate")
+
+	awaitSignal(t, admitted, "a successor to be admitted for the deferred removal")
+	releaseSuccessor()
+
+	require.Eventually(t, func() bool { return pool.Size() == 1 }, fillEventBudget, time.Millisecond,
+		"the deferred removal must end with the pool refilled")
+	require.Equal(t, NodeUp, host.State(), "a pool that refilled must leave its host up")
+	awaitNoPendingFills(t, harness.session.pool, pool)
+}
+
+// startPartialCycle leaves the pool one connection short and starts a cycle that
+// parks in the gated dialer filling the gap.
+//
+// The pool keeps a connection throughout, so fill takes its asynchronous branch and
+// the test still has something to kill while the gate is held.
+//
+// Returns:
+//   - *Conn: the connection still in the pool
+func startPartialCycle(t *testing.T, harness *fillHarness, pool *hostConnPool) *Conn {
+	t.Helper()
+
+	require.Equal(t, 2, pool.size, "this fixture needs a pool that holds two connections")
+
+	harness.dialer.arm(nil)
+	detached := detachPoolConn(t, pool)
+	t.Cleanup(func() { detached.Close() })
+
+	require.True(t, pool.claimFill(), "the fixture must be able to claim a fill")
+	go pool.runFill()
+	harness.dialer.awaitStarted(t)
+	awaitGate(t, pool, true, "the partial cycle to take the gate")
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	require.Len(t, pool.conns, 1, "the partial cycle must leave one connection in the pool")
+	return pool.conns[0]
+}
+
+// killDeferred removes conn and waits until the removal has been recorded against
+// the cycle that holds the gate.
+func killDeferred(t *testing.T, pool *hostConnPool, conn *Conn) {
+	t.Helper()
+
+	conn.closeWithError(errors.New("gocql: test induced connection failure"))
+	deadline := time.After(fillEventBudget)
+	for !(pool.Size() == 0 && poolRefillPending(pool)) {
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline:
+			t.Fatalf("timed out after %v waiting for the removal to be deferred (size=%d pending=%v)",
+				fillEventBudget, pool.Size(), poolRefillPending(pool))
+		}
+	}
+}
+
+// TestFill_ConvictingCycleDischargesTheRemoval proves a cycle that is about to
+// consult the conviction policy keeps the deferred removal to itself.
+//
+// The policy decides what happens to the host, so a successor dialling it at the
+// same moment would race the removal the policy is about to cause.
+// The obligation ends there whatever the policy answers:
+// this fixture declines conviction, which leaves the pool registered, empty and
+// idle - exactly what an unconvicted failed cycle leaves behind today.
+func TestFill_ConvictingCycleDischargesTheRemoval(t *testing.T) {
+	conviction := &recordingConvictionPolicy{onFailure: func(*HostInfo) bool { return false }}
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		cluster.NumConns = 2
+		cluster.ConvictionPolicy = conviction
+	})
+	host := harness.hosts[0]
+	pool := harness.pool(t, host)
+
+	survivor := startPartialCycle(t, harness, pool)
+	killDeferred(t, pool, survivor)
+
+	attempts := harness.events.count(poolConnectAttempt)
+	base := harness.events.count(poolFillDone)
+	harness.dialer.setErr(func(string) error { return errFillTestDialRefused })
+	harness.dialer.releaseAll()
+	awaitClaimReleases(t, harness.events, base, 1)
+
+	require.Len(t, conviction.recorded(), 1, "the failed cycle must consult the policy")
+	require.False(t, poolRefillPending(pool), "the obligation must not outlive the cycle that held it")
+	require.Equal(t, attempts, harness.events.count(poolConnectAttempt),
+		"a cycle that consulted the policy must not also start a successor")
+	require.Zero(t, pendingFills(pool), "no claim may be left outstanding")
+	require.Equal(t, NodeUp, host.State(), "a declined conviction leaves the host as it was")
+}
+
+// TestFill_ClosedPoolDischargesTheRemoval proves a removal deferred behind a cycle
+// dies with the pool.
+//
+// The cycle here succeeds, so nothing else would stop a successor being handed the
+// obligation; closure is the only reason there is no fill left to give.
+func TestFill_ClosedPoolDischargesTheRemoval(t *testing.T) {
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) { cluster.NumConns = 2 })
+	pool := harness.pool(t, harness.hosts[0])
+
+	survivor := startPartialCycle(t, harness, pool)
+	killDeferred(t, pool, survivor)
+
+	pool.Close()
+
+	base := harness.events.count(poolFillDone)
+	harness.dialer.releaseAll()
+	awaitClaimReleases(t, harness.events, base, 1)
+
+	require.False(t, poolRefillPending(pool), "the obligation must not outlive the pool")
+	require.Equal(t, base+1, harness.events.count(poolFillDone),
+		"a closed pool must reserve no successor, so only the owning cycle releases a claim")
+	require.Zero(t, pendingFills(pool), "no claim may be left outstanding")
+}
+
+// TestFill_ShutdownDischargesTheRemoval proves a cycle cut short by session shutdown
+// does not convict and does not hand its obligation on.
+//
+// The cycle predicts conviction from its own empty-pool failure and keeps the
+// obligation on that basis, then finds the session cancelled and returns before the
+// policy is consulted at all. Nothing is owed after that: recovery during shutdown
+// is not this pool's job.
+func TestFill_ShutdownDischargesTheRemoval(t *testing.T) {
+	conviction := &recordingConvictionPolicy{}
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) {
+		cluster.NumConns = 2
+		cluster.ConvictionPolicy = conviction
+	})
+	pool := harness.pool(t, harness.hosts[0])
+
+	survivor := startPartialCycle(t, harness, pool)
+	killDeferred(t, pool, survivor)
+
+	// Cancelling alone, rather than closing the session: the child pool stays open,
+	// which is the window the completion has to get right.
+	harness.session.cancel()
+
+	attempts := harness.events.count(poolConnectAttempt)
+	base := harness.events.count(poolFillDone)
+	awaitClaimReleases(t, harness.events, base, 1)
+
+	require.Empty(t, conviction.recorded(), "a fill cancelled by shutdown must not convict")
+	require.False(t, poolRefillPending(pool), "the obligation must not outlive the cycle that held it")
+	require.Equal(t, attempts, harness.events.count(poolConnectAttempt),
+		"nothing may be dialled after the session was cancelled")
+	require.Zero(t, pendingFills(pool), "no claim may be left outstanding")
+}
+
+// TestFill_HandoverNeverLeavesThePoolIdle proves the successor's claim is already
+// outstanding when the cycle that handed it over releases its own.
+//
+// A query reads the pool as worth waiting for only while a claim is outstanding
+// (pickOrState), so a handover that released before it reserved would show the pool
+// as empty and idle for an instant and send every waiter away with
+// ErrNoConnections.
+// The claim is therefore reserved in the same critical section that clears the
+// gate, and the sample below is taken on the outgoing goroutine immediately after
+// its own decrement.
+func TestFill_HandoverNeverLeavesThePoolIdle(t *testing.T) {
+	harness := newFillHarness(t, 1, func(cluster *ClusterConfig) { cluster.NumConns = 2 })
+	pool := harness.pool(t, harness.hosts[0])
+
+	survivor := startPartialCycle(t, harness, pool)
+	killDeferred(t, pool, survivor)
+
+	var sampleOnce sync.Once
+	sampled := make(chan int, 1)
+	harness.events.on(poolFillDone, func(*HostInfo) {
+		sampleOnce.Do(func() { sampled <- pendingFills(pool) })
+	})
+
+	harness.dialer.releaseAll()
+
+	select {
+	case pending := <-sampled:
+		require.GreaterOrEqual(t, pending, 1,
+			"the successor's claim must already be published when its predecessor releases")
+	case <-time.After(fillEventBudget):
+		t.Fatalf("timed out after %v waiting for the handover", fillEventBudget)
+	}
+
+	require.Eventually(t, func() bool { return pool.Size() == 2 }, fillEventBudget, time.Millisecond,
+		"the successor must fill the gap the removal left")
+	awaitNoPendingFills(t, harness.session.pool, pool)
 }

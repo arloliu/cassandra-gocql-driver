@@ -609,6 +609,12 @@ type hostConnPool struct {
 	conns   []*Conn
 	closed  bool
 	filling bool
+	// refillPending records a connection removal that could not be turned into a
+	// fill of its own because a cycle already held the gate.
+	// The cycle that holds the gate owns it: it either hands the obligation to a
+	// successor when it ends, or discharges it deliberately.
+	// Guarded by mu.
+	refillPending bool
 	// fillGen identifies the admitted fill cycle that currently owns filling.
 	// It is incremented under mu every time the gate is taken, and the cycle
 	// carries the value it was given, so a completion that arrives late - a
@@ -1022,8 +1028,9 @@ func (pool *hostConnPool) logConnectErr(err error) {
 	}
 }
 
-// fillingStopped transitions the pool back to a not-filling state and, when the
-// cycle failed over an empty pool, convicts the host.
+// fillingStopped transitions the pool back to a not-filling state, hands any
+// removal deferred behind this cycle to a successor, and, when the cycle failed
+// over an empty pool, convicts the host.
 //
 // Only the cycle that holds the gate may complete it. A recovery handler that
 // re-enters this function after its cycle already finished - the tail below runs
@@ -1054,6 +1061,7 @@ func (pool *hostConnPool) fillingStopped(gen uint64, err error) {
 
 	var (
 		owned bool
+		rearm bool
 		count int
 		host  *HostInfo
 	)
@@ -1072,9 +1080,30 @@ func (pool *hostConnPool) fillingStopped(gen uint64, err error) {
 		pool.filling = false
 		count = len(pool.conns)
 		host = pool.host
+
+		// A removal deferred behind this cycle is handed to a successor, unless
+		// this cycle disposes of it instead: a cycle that is about to consult the
+		// conviction policy owns that host's fate and a successor would race the
+		// removal it is about to cause; a closed pool has no fill to give; and with
+		// the pool back at size there is nothing the removal wanted.
+		convicting := err != nil && count == 0
+		rearm = pool.refillPending && !pool.closed && !convicting && count < pool.size
+		pool.refillPending = false
+		if rearm {
+			// Reserved here so the count never reaches zero between this cycle's
+			// claim and its successor's: a query must not read the pool as empty
+			// and idle in the handover.
+			pool.fillsPending++
+		}
 	}()
 	if !owned {
 		return
+	}
+	if rearm {
+		// Spawned immediately: a reserved claim with no runner to release it would
+		// leave every waiter on this pool waiting for a fill that never comes, so
+		// nothing that can panic may sit between the reservation and this line.
+		go pool.runFill()
 	}
 
 	// A fill cancelled by session shutdown must not convict its host: the session
@@ -1237,6 +1266,18 @@ func (pool *hostConnPool) HandleError(conn *Conn, err error, closed bool) {
 			}
 			// remove the connection, not preserving order
 			pool.conns[i], pool.conns = pool.conns[len(pool.conns)-1], pool.conns[:len(pool.conns)-1]
+
+			if pool.filling {
+				// A cycle already holds the gate, and a fill spawned now would be
+				// refused by it and forgotten - this removal is the pool's only
+				// record that a connection is gone, so it is handed to the cycle
+				// that owns the gate instead.
+				// No claim is published: a cycle holding the gate is running under
+				// a claim of its own, so a query still reads the pool as empty
+				// with a fill in flight throughout.
+				pool.refillPending = true
+				return false
+			}
 
 			// The claim is published in the same critical section as the
 			// removal, so a query cannot observe the pool empty and idle in

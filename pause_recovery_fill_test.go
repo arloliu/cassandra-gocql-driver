@@ -758,7 +758,11 @@ func newFillHarnessOpts(t testing.TB, hosts int, opts fillHarnessOpts) *fillHarn
 
 	for _, host := range ring {
 		pool := harness.pool(t, host)
-		require.Equal(t, 1, pool.Size(), "every fixture pool must start with one connection")
+		// cluster.NumConns is 1 unless a tune raised it; either way every pool must
+		// start saturated, so a test knows exactly how many connections it has to
+		// take away to reach the state it wants.
+		require.Equal(t, cluster.NumConns, pool.Size(),
+			"every fixture pool must start with %d connection(s)", cluster.NumConns)
 		awaitNoPendingFills(t, session.pool, pool)
 	}
 
