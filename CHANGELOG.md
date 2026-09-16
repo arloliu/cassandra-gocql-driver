@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.2-otter] - 2026-09-16
+
+Patch release covering two connection-pool correctness workstreams: a refill obligation
+that could be lost to the fill gate, and a fill result that was published against the host
+object rather than the pool it ran on. No exported symbol changes.
+
+Both are narrow but unbounded: neither is likely on any given cycle, and neither repairs
+itself once it happens.
+
+### Fixed
+
+- **A connection removal that landed during a fill cycle was dropped.** `HandleError`
+  schedules a refill when a connection dies, but a cycle already holding the fill gate made
+  that scheduling a no-op, so the removal left no obligation behind and the pool stayed
+  below size with nothing owing it a refill. The removal is now recorded against the cycle
+  that holds the gate, and that cycle either hands it to a successor when it ends or
+  discharges it deliberately. Recovery previously depended on the next query routed to the
+  host, an UP event, or a control-connection dial failure.
+
+- **Only the cycle that holds the fill gate can complete it.** A panic in the tail of
+  `fillingStopped` sent the recovery handler back in, where it cleared a gate that by then
+  could belong to a newer cycle, admitting a second runner alongside it. Each cycle now
+  carries the generation it was admitted with, and a completion for an older one is inert.
+  The two calls into the application logger are isolated so that a logger which panics
+  cannot leave the pool permanently stuck, nor stop the cycle reaching the conviction
+  policy.
+
+- **A fill result could act on a replacement pool.** `handleNodeConnected` and
+  `handleHostDown` keyed on host identity, and `ring.owns` compares the ring's current
+  object, so a cycle still in flight when its pool was retired could convict the host,
+  remove a **replacement pool registered under the same host**, and close its healthy
+  connections — or publish UP for that replacement on the strength of a connection it does
+  not have. A fill's result is now authorised against the pool the cycle ran on, checked
+  in the same critical section that orders every pool registration and removal. The
+  replacement path is the ordinary one: convict, remove, then the reconnect sweep or an UP
+  event re-admits the same ring entry under a new pool.
+
+### Changed
+
+- **More `HostDown` callbacks in one scenario.** A cycle that fails over an empty pool now
+  convicts the host where it previously left it UP with an empty pool. This restores the
+  documented intent rather than adding behaviour, and recovery is prompt:
+  `ReconnectInterval` caps an exponential delay rather than setting a rhythm, so at the
+  default a convicted host is retried about a second later.
+
+- **Fewer `HostDown` callbacks, and fewer pool removals, in another.** A failure whose pool
+  is observed to be no longer registered no longer reaches `ConvictionPolicy.AddFailure`,
+  fires `HostDown`, or removes a pool. The driver never calls `ConvictionPolicy.Reset`, so
+  a counting policy would otherwise carry a retired pool's failures forward and convict its
+  replacement with them.
+
+- **Panic paths no longer repeat completion work.** A panic in `AddFailure` or in the
+  downstream DOWN processing no longer causes recovery to invoke the policy a second time,
+  and a panicking diagnostic no longer replaces a cycle's own error with a synthetic one —
+  the policy now sees the real fill error.
+
+### Documentation
+
+- `MaxPreparedStmts` says what it counts.
+
 ## [2.7.1-otter] - 2026-09-09
 
 Patch release from the v2.7.0-otter verification pass: one long-standing panic fixed, the
