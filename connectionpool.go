@@ -120,6 +120,12 @@ type poolEvent uint8
 const (
 	// poolConnectAttempt fires in connect, before each session.connect attempt.
 	poolConnectAttempt poolEvent = iota
+	// poolConnBeforeAppend fires in connect, after a connection was established and
+	// before pool.mu is taken to append it.
+	poolConnBeforeAppend
+	// poolHandleErrorNotOurs fires in HandleError when the scan did not find the
+	// connection, after pool.mu was released and before any fill is spawned.
+	poolHandleErrorNotOurs
 	// poolConnAppended fires in connect, after a connection was appended to the pool
 	// and before the parent generation is notified.
 	poolConnAppended
@@ -1233,7 +1239,20 @@ func (pool *hostConnPool) connectMany(count int) error {
 	return connectErr
 }
 
-// create a new connection to the host and add it to the pool
+// connect creates a new connection to the host and adds it to the pool.
+//
+// It only runs under the fill gate, from fill's synchronous branch or a connectMany
+// worker, so pool.filling is held by the cycle this call belongs to.
+//
+// The connection is already serving when it is appended, so it can fail and reach
+// HandleError before it is in pool.conns. HandleError then finds nothing and records
+// nothing, and the append below records the removal it missed instead of appending a
+// dead connection that nothing would ever replace.
+//
+// Returns:
+//   - error: the last connection error, or an error for a reconnection policy that
+//     allows no attempt; nil when the connection was appended, the pool is closed,
+//     or the connection died before it could be appended
 func (pool *hostConnPool) connect() (err error) {
 	// TODO: provide a more robust connection retry mechanism, we should also
 	// be able to detect hosts that come up by trying to connect to downed ones.
@@ -1241,6 +1260,11 @@ func (pool *hostConnPool) connect() (err error) {
 	var conn *Conn
 	reconnectionPolicy := pool.session.cfg.ReconnectionPolicy
 	maxRetries := reconnectionPolicy.GetMaxRetries()
+	if maxRetries <= 0 {
+		// Without an attempt the loop below leaves both conn and err nil,
+		// and a nil connection must never reach the append.
+		return fmt.Errorf("gocql: ReconnectionPolicy.GetMaxRetries() must be positive, got %d", maxRetries)
+	}
 	for i := 0; i < maxRetries; i++ {
 		pool.testHook(poolConnectAttempt)
 		conn, err = pool.session.connect(pool.session.ctx, pool.host, pool)
@@ -1277,12 +1301,24 @@ func (pool *hostConnPool) connect() (err error) {
 		}
 	}
 
+	pool.testHook(poolConnBeforeAppend)
+
 	// add the Conn to the pool
 	pool.mu.Lock()
 
 	if pool.closed {
 		pool.mu.Unlock()
 		conn.Close()
+		return nil
+	}
+
+	// A connection that is not closed now is appended before its HandleError can scan
+	// the pool, because c.closed is set before HandleError takes pool.mu. One that is
+	// closed was, or will be, missed by that scan, so the removal it would have
+	// recorded is recorded here. connect runs under the gate, so that is refillPending.
+	if conn.Closed() {
+		pool.refillPending = true
+		pool.mu.Unlock()
 		return nil
 	}
 
@@ -1308,6 +1344,7 @@ func (pool *hostConnPool) HandleError(conn *Conn, err error, closed bool) {
 
 	// The mutation keeps a deferred unlock so a panicking application logger
 	// cannot strand pool.mu; only the spawn moves outside the lock.
+	var notOurs bool
 	spawn := func() bool {
 		// TODO: track the number of errors per host and detect when a host is dead,
 		// then also have something which can detect when a host comes back.
@@ -1349,9 +1386,16 @@ func (pool *hostConnPool) HandleError(conn *Conn, err error, closed bool) {
 			return true
 		}
 
-		// the connection was not ours: nothing removed, nothing claimed
+		// The connection was not ours: nothing removed, nothing claimed. A
+		// connection that died before connect appended it lands here too; connect
+		// records that removal itself.
+		notOurs = true
 		return false
 	}()
+
+	if notOurs {
+		pool.testHook(poolHandleErrorNotOurs)
+	}
 
 	if spawn {
 		go pool.runFill()

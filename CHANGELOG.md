@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A connection that died before it was added to its pool stayed there forever.**
+  A connection starts serving before `connect` appends it,
+  so it could fail and reach `HandleError` while not yet in the pool.
+  `HandleError` then found nothing to remove and scheduled nothing,
+  and `connect` appended the dead connection anyway.
+  It counted toward the pool's size, so no fill was ever due again,
+  the host stayed UP, and `Pick` preferred it because all its streams were free:
+  with `NumConns = 1` every query to that host failed with `ErrConnectionClosed`
+  until the pool was closed for some unrelated reason.
+  `connect` now checks the connection under the pool lock before appending it,
+  and records a dead one as a removal for the fill cycle it belongs to,
+  exactly as `HandleError` would have had the append come first.
+
+- **A reconnection policy that allows no attempt no longer reaches the pool with no connection.**
+  `GetMaxRetries() <= 0` left `connect` with neither a connection nor an error,
+  and a nil connection was appended.
+  `connect` now fails with an error naming the policy.
+
 ## [2.7.2-otter] - 2026-09-16
 
 Patch release covering two connection-pool correctness workstreams: a refill obligation

@@ -321,8 +321,12 @@ func poolEventName(ev poolEvent) string {
 	switch ev {
 	case poolConnectAttempt:
 		return "poolConnectAttempt"
+	case poolConnBeforeAppend:
+		return "poolConnBeforeAppend"
 	case poolConnAppended:
 		return "poolConnAppended"
+	case poolHandleErrorNotOurs:
+		return "poolHandleErrorNotOurs"
 	case poolFillAsyncStart:
 		return "poolFillAsyncStart"
 	case poolFillAdmission:
