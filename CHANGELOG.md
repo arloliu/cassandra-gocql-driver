@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.7.3-otter] - 2026-09-17
+
+Patch release for one connection-pool defect that never repaired itself:
+a connection that died between establishment and being added to its pool stayed in the pool as a dead slot.
+No exported symbol changes.
 
 ### Fixed
 
