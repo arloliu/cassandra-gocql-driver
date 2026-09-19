@@ -930,23 +930,52 @@ func refreshSchemas(session *Session) error {
 // a debounced refresh, such as the one a control reconnect requests, has no listener,
 // so its error would otherwise vanish.
 //
+// It also turns a panic out of the refresh into a failed round.
+// refreshSchemas runs schema listeners and policy callbacks on the flusher's goroutine,
+// and the flusher's own recover-and-stop is terminal:
+// without the recover here, one panicking callback would end schema refreshes for the rest of the session.
+//
+// The guarantee is narrow on purpose.
+// It is that the flusher survives and the next round still runs,
+// NOT that the notifications the panicking round skipped are made again:
+// the refreshed schema is published before the policy and the listeners are told,
+// so the next round may see nothing left to announce.
+//
 // Returns:
-//   - error: refreshSchemas's error, after logging it
-func (s *Session) runSchemaRefresh() error {
+//   - error: refreshSchemas's error, or the recovered panic as an error, after logging it
+func (s *Session) runSchemaRefresh() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// The shared handler logs with the original stack and has its own
+			// outermost barrier, so it cannot propagate.
+			handleRecoveredPanic(s.logger, "Session.runSchemaRefresh", r, nil)
+			err = fmt.Errorf("gocql: schema refresh panicked: %v", r)
+		}
+		// Reporting the outcome calls user code twice, inside the handler that just produced err.
+		// handleRecoveredPanic's barrier covers only its own call, not the statements after it,
+		// so a panic from either of these would escape to the flusher's recover-and-stop,
+		// the very outcome the recover above exists to prevent.
+		// Isolate each one separately.
+		safely(s.logger, "Session.runSchemaRefresh.report", func() {
+			if err != nil {
+				s.logger.Warning("Schema refresh failed. "+
+					"Schema might be stale or missing, causing token-aware routing to fall back to the configured fallback policy. "+
+					"Keyspace metadata queries might fail with ErrKeyspaceDoesNotExist until schema refresh succeeds.",
+					NewLogFieldError("err", err))
+			}
+		})
+		safely(s.logger, "Session.runSchemaRefresh.done", func() {
+			if s.cfg.testSchemaRefreshDone != nil {
+				s.cfg.testSchemaRefreshDone(err)
+			}
+		})
+	}()
+	// Deliberately after the defer above: a test that injects a panic here is
+	// asserting that the round fails, not that the flusher dies.
 	if s.cfg.testSchemaRefreshHook != nil {
 		s.cfg.testSchemaRefreshHook()
 	}
-	err := refreshSchemas(s)
-	if err != nil {
-		s.logger.Warning("Schema refresh failed. "+
-			"Schema might be stale or missing, causing token-aware routing to fall back to the configured fallback policy. "+
-			"Keyspace metadata queries might fail with ErrKeyspaceDoesNotExist until schema refresh succeeds.",
-			NewLogFieldError("err", err))
-	}
-	if s.cfg.testSchemaRefreshDone != nil {
-		s.cfg.testSchemaRefreshDone(err)
-	}
-	return err
+	return refreshSchemas(s)
 }
 
 func (s *schemaDescriber) debounceRefreshSchemaMetadata() {

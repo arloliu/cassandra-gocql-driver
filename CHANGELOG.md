@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Those checks return an error and no session, so nothing could ever stop the goroutines.
   The debouncers are now constructed after the last of those checks.
 
+- **One panic out of a schema listener or `KeyspaceChanged` stopped schema refreshes for the rest of the session.**
+  A schema refresh runs the schema change listeners and the policy's `KeyspaceChanged` on the refresher's own goroutine.
+  A panic from one of them ended that goroutine, and every later schema refresh failed at once,
+  so the session kept whatever schema it last held.
+  It is now a failed refresh round, logged with its stack, and the next round runs,
+  as was already the case for ring refreshes.
+  The notifications that the panicking round skipped are not made again.
+  A panicking logger reporting a failed round no longer stops schema refreshes either.
+
 ## [2.7.3-otter] - 2026-09-17
 
 Patch release for one connection-pool defect that never repaired itself:
