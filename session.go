@@ -231,21 +231,9 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		s.types = cfg.RegisteredTypes.Copy()
 	}
 
-	schemaDebounce := schemaRefreshDebounceTime
-	if cfg.schemaRefreshDebounce > 0 {
-		schemaDebounce = cfg.schemaRefreshDebounce
-	}
-	s.schemaDescriber = newSchemaDescriber(s, newRefreshDebouncer(schemaDebounce, s.runSchemaRefresh, s.logger))
-
-	// The overflow callback is a method value, not s.ringRefresher.trigger: the
-	// refresher is not built until a few lines below this, so binding its method here
-	// would capture a nil receiver and panic on the first overflow.
-	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent, s.triggerRingRefresh, s.logger)
-
 	s.routingMetadataCache = newRoutingKeyInfoLRU(cfg.MaxRoutingKeyInfo)
 
 	s.hostSource = &ringDescriber{session: s}
-	s.ringRefresher = newRefreshDebouncer(ringRefreshDebounceTime, s.runRingRefresh, s.logger)
 
 	s.queryObserver = cfg.QueryObserver
 	s.batchObserver = cfg.BatchObserver
@@ -287,6 +275,21 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		return nil, fmt.Errorf("gocql: unable to create session: %w", err)
 	}
 	s.connCfg = connCfg
+
+	// The debouncers start a goroutine in their constructors, and only Close stops them.
+	// They are built here, after the last return that hands the caller no session to close:
+	// built any earlier, a refused configuration would leave all three running for good.
+	schemaDebounce := schemaRefreshDebounceTime
+	if cfg.schemaRefreshDebounce > 0 {
+		schemaDebounce = cfg.schemaRefreshDebounce
+	}
+	s.schemaDescriber = newSchemaDescriber(s, newRefreshDebouncer(schemaDebounce, s.runSchemaRefresh, s.logger))
+
+	// The overflow callback is a method value, not s.ringRefresher.trigger: the
+	// refresher is not built until the next statement, so binding its method here
+	// would capture a nil receiver and panic on the first overflow.
+	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent, s.triggerRingRefresh, s.logger)
+	s.ringRefresher = newRefreshDebouncer(ringRefreshDebounceTime, s.runRingRefresh, s.logger)
 
 	if cfg.PoolConfig.HostSelectionPolicy == nil {
 		cfg.PoolConfig.HostSelectionPolicy = RoundRobinHostPolicy()

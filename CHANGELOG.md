@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The check now compares the whole version.
   A host whose version is unknown keeps the delay, as before.
 
+- **`NewSession` leaked three background goroutines each time it rejected a configuration.**
+  The schema, node-event and ring debouncers each start a goroutine when they are constructed,
+  and `NewSession` constructed them before three of its configuration checks:
+  schema listeners with the metadata cache `Disabled`,
+  table-level listeners with the cache `KeyspaceOnly`,
+  and TLS options that could not be loaded.
+  Those checks return an error and no session, so nothing could ever stop the goroutines.
+  The debouncers are now constructed after the last of those checks.
+
 ## [2.7.3-otter] - 2026-09-17
 
 Patch release for one connection-pool defect that never repaired itself:
