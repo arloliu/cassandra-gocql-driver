@@ -105,6 +105,40 @@ func TestCassVersionBefore(t *testing.T) {
 	}
 }
 
+// TestCassVersion_NodeUpDelay pins the CASSANDRA-8236 delay to the releases that need it.
+//
+// Only a release before 2.2 announces a node UP before it can accept connections.
+// The delay is decided by the whole version, not by its major and minor numbers separately:
+// 3.0 and 4.0 have a minor below 2 and must still get no delay.
+// An unknown version keeps the delay, since nothing says the node is new enough to skip it.
+func TestCassVersion_NodeUpDelay(t *testing.T) {
+	tests := []struct {
+		name    string
+		version cassVersion
+		want    time.Duration
+	}{
+		{"1.2.19", cassVersion{1, 2, 19, ""}, 10 * time.Second},
+		{"2.0.17", cassVersion{2, 0, 17, ""}, 10 * time.Second},
+		{"2.1.22", cassVersion{2, 1, 22, ""}, 10 * time.Second},
+		{"2.2.0", cassVersion{2, 2, 0, ""}, 0},
+		{"2.2.19", cassVersion{2, 2, 19, ""}, 0},
+		{"3.0.30", cassVersion{3, 0, 30, ""}, 0},
+		{"3.11.17", cassVersion{3, 11, 17, ""}, 0},
+		{"4.0.13", cassVersion{4, 0, 13, ""}, 0},
+		{"4.1.5", cassVersion{4, 1, 5, ""}, 0},
+		{"5.0.2", cassVersion{5, 0, 2, ""}, 0},
+		{"unknown version", cassVersion{}, 10 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.version.nodeUpDelay(); got != tt.want {
+				t.Errorf("nodeUpDelay() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewHostInfoFromRow(t *testing.T) {
 	id := MustRandomUUID()
 	row := map[string]interface{}{

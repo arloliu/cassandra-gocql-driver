@@ -1026,11 +1026,12 @@ func TestReconnection(t *testing.T) {
 		t.Fatal("Host pool should have been removed but was not.")
 	}
 
-	time.Sleep(cluster.ReconnectInterval + h.Version().nodeUpDelay() + 1*time.Second)
-
-	if h.State() != NodeUp {
-		t.Fatal("Host should be NodeUp but not. Failed to reconnect.")
-	}
+	// The recovery runs through the reconnect scheduler, never through handleNodeUp,
+	// so nodeUpDelay has no part in how long it takes.
+	// The bound is a test deadline, not a claim about how long a reconnect may take.
+	require.Eventually(t, func() bool { return h.State() == NodeUp },
+		cluster.ReconnectInterval+15*time.Second, 100*time.Millisecond,
+		"Host should be NodeUp but not. Failed to reconnect.")
 }
 
 type FullName struct {

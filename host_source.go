@@ -162,7 +162,7 @@ func (c cassVersion) String() string {
 }
 
 func (c cassVersion) nodeUpDelay() time.Duration {
-	if c.Major >= 2 && c.Minor >= 2 {
+	if c.AtLeast(2, 2, 0) {
 		// CASSANDRA-8236
 		return 0
 	}

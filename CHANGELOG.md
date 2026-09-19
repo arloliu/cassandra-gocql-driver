@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A node-up event was acted on 10 s late on Cassandra 3.0, 3.1, 4.0, 4.1 and 5.0.**
+  The delay exists for releases before 2.2, which announce a node UP before it accepts connections (CASSANDRA-8236).
+  The check compared the major and minor numbers separately,
+  so any release whose minor number is below 2 took the delay whatever its major number.
+  Events are handled one after another within a batch, so each such event also held up the ones behind it.
+  The check now compares the whole version.
+  A host whose version is unknown keeps the delay, as before.
+
 ## [2.7.3-otter] - 2026-09-17
 
 Patch release for one connection-pool defect that never repaired itself:
