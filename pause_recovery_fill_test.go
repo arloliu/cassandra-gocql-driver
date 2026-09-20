@@ -1311,22 +1311,51 @@ func TestHandleError_UnlocksClosedBranch(t *testing.T) {
 	require.False(t, pool.filling, "the closed branch must not start a fill")
 }
 
-// TestHandleError_PanickingLoggerDoesNotStrandMutex proves an application logger that
-// panics leaves neither pool.mu held nor the pool half-mutated.
+// TestHandleError_PanickingLoggerStillRemovesTheConn proves an application logger that
+// panics on HandleError's first line costs the log line and nothing else (F-conn-2).
 //
-// The claim is published only after the removal, which the panic never reaches.
-func TestHandleError_PanickingLoggerDoesNotStrandMutex(t *testing.T) {
-	conn := &Conn{}
-	pool := &hostConnPool{size: 1, conns: []*Conn{conn}, logger: &infoPanickingLogger{}}
+// The deferred unlock always protected pool.mu; what the panic discarded was everything
+// after it — the removal, and with it the refill obligation. This is the half the test
+// pinned the wrong way round before the log was isolated: it asserted that the dead
+// connection was still in the pool, which is the defect.
+//
+// filling is set so that the removal hands the refill to the cycle that owns the gate
+// and publishes refillPending, which is durable. The claim counter is not an oracle: it
+// is transient, and a replacement fill that has already completed returns it to zero.
+func TestHandleError_PanickingLoggerStillRemovesTheConn(t *testing.T) {
+	newPool := func() (*Conn, *hostConnPool) {
+		conn := &Conn{}
+		return conn, &hostConnPool{size: 1, conns: []*Conn{conn}, logger: &infoPanickingLogger{}, filling: true}
+	}
 
-	require.Panics(t, func() { pool.HandleError(conn, errFillTestConnClosed, true) },
-		"the injected logger panic must surface")
+	t.Run("the removal and the refill obligation survive it", func(t *testing.T) {
+		conn, pool := newPool()
 
-	awaitPoolLock(t, pool)
-	require.Zero(t, pendingFills(pool), "no fill claim may be published before the removal")
-	pool.mu.RLock()
-	require.Equal(t, []*Conn{conn}, pool.conns, "the connection must still be in the pool")
-	pool.mu.RUnlock()
+		func() {
+			// Whether the panic escapes HandleError is the next sub-test's subject.
+			defer func() {
+				if r := recover(); r != nil {
+					t.Logf("HandleError propagated the logger panic: %v", r)
+				}
+			}()
+			pool.HandleError(conn, errFillTestConnClosed, true)
+		}()
+
+		awaitPoolLock(t, pool)
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+		if len(pool.conns) != 0 {
+			t.Fatal("pool still holds the dead conn")
+		}
+		require.True(t, pool.refillPending, "the removal must hand the refill to the cycle that owns the gate")
+	})
+
+	t.Run("the panicking log is isolated", func(t *testing.T) {
+		conn, pool := newPool()
+
+		require.NotPanics(t, func() { pool.HandleError(conn, errFillTestConnClosed, true) },
+			"the isolated logger panic must not reach the caller")
+	})
 }
 
 // TestAwaitFill_RemoveHostWakeCannotBeMissed proves a host removed while a query waits

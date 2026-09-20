@@ -29,6 +29,7 @@ package gocql
 
 import (
 	"crypto/tls"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -240,4 +241,46 @@ func TestPool_StreamObserverPanicDoesNotAbortPoolClose(t *testing.T) {
 	for _, c := range conns {
 		require.Error(t, c.ctx.Err(), "every closed connection's teardown must have run")
 	}
+}
+
+// armableInfoPanicLogger panics once armed, on the pool's connection-error line only.
+type armableInfoPanicLogger struct {
+	StructuredLogger
+	armed  atomic.Bool
+	panics atomic.Int32
+}
+
+func (l *armableInfoPanicLogger) Info(msg string, fields ...LogField) {
+	if msg == "Pool connection error." && l.armed.CompareAndSwap(true, false) {
+		l.panics.Add(1)
+		panic("test: logger panic injected by the application logger")
+	}
+	l.StructuredLogger.Info(msg, fields...)
+}
+
+// TestPool_HandleErrorLoggerPanicDoesNotStrandDeadConn is the inversion of
+// _repro/zz_repro_conn_stranded_test.go's
+// TestRepro_C2_PanickingLoggerInHandleErrorStrandsDeadConn (F-conn-2), the end-to-end
+// half. HandleError's first act under pool.mu was the application's Info call, before
+// the removal scan, so one panic there left the dead connection in the pool with no
+// removal, no refill obligation and no retry: the pool never healed, although the
+// logger worked again immediately afterwards.
+func TestPool_HandleErrorLoggerPanicDoesNotStrandDeadConn(t *testing.T) {
+	logger := &armableInfoPanicLogger{StructuredLogger: newTestLogger(LogLevelDebug)}
+	swallower := &requestSwallower{}
+	harness := newFillHarnessOpts(t, 1, fillHarnessOpts{
+		rawRespHook: swallower.hook,
+		tune:        func(c *ClusterConfig) { c.Logger = logger },
+	})
+	pool := harness.pool(t, harness.hosts[0])
+
+	conn, _ := killPooledConnWithOutstandingCalls(t, harness, swallower, 1, func() {
+		logger.armed.Store(true)
+	})
+	require.Eventually(t, func() bool { return logger.panics.Load() == 1 }, fillEventBudget, time.Millisecond,
+		"the panic site must have been reached exactly once")
+
+	awaitConnGoneFromPool(t, pool, conn)
+	require.NoError(t, awaitQuery(t, harness.query(t.Context(), nil)),
+		"the pool must serve queries again once it has replaced the dead connection")
 }

@@ -1356,8 +1356,17 @@ func (pool *hostConnPool) HandleError(conn *Conn, err error, closed bool) {
 			return false
 		}
 
-		pool.logger.Info("Pool connection error.",
-			NewLogFieldString("addr", conn.addr), NewLogFieldError("err", err))
+		// Isolated: this is the first statement of the critical section, and
+		// everything the pool owes for a dead connection — the removal, and with it
+		// either the refill obligation or the fill claim — comes after it. The
+		// deferred unlock saves the mutex and nothing else, and HandleError is never
+		// retried, so one panic here left the corpse in the pool for good.
+		// Reporting through the logger that just panicked is safe: safely's handler
+		// recovers its own report as well.
+		safely(pool.logger, "hostConnPool.HandleError.log", func() {
+			pool.logger.Info("Pool connection error.",
+				NewLogFieldString("addr", conn.addr), NewLogFieldError("err", err))
+		})
 
 		// find the connection index
 		for i, candidate := range pool.conns {
