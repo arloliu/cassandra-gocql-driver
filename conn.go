@@ -334,12 +334,22 @@ func (s *Session) dial(ctx context.Context, host *HostInfo, connConfig *ConnConf
 
 	conn, err := s.dialWithoutObserver(ctx, host, connConfig, errorHandler)
 
+	// The observer below is the application's, and it runs after the connection is
+	// serving and before any owner has it. A panic there orphans it.
+	owned := false
+	defer func() {
+		if !owned && conn != nil {
+			conn.Close()
+		}
+	}()
+
 	if s.connectObserver != nil {
 		obs.End = time.Now()
 		obs.Err = err
 		s.connectObserver.ObserveConnect(obs)
 	}
 
+	owned = true
 	return conn, err
 }
 
@@ -351,6 +361,35 @@ func (s *Session) dialWithoutObserver(ctx context.Context, host *HostInfo, cfg *
 	if err != nil {
 		return nil, err
 	}
+
+	// Armed from the first successful acquisition of the transport until an owner
+	// takes it. Between those two points the application's RemoteAddr and its
+	// AuthProvider both run, and a panic in either unwinds past hostConnPool.connect
+	// and controlConn.dialCandidate alike, leaving a live transport nobody holds.
+	//
+	// It closes the transport directly while no *Conn exists yet, and cancels the
+	// derived context independently: that context is created below, before
+	// dialedHost.Conn.RemoteAddr() is called inside the composite literal, so a
+	// panic there would otherwise leave a live derived context with no *Conn whose
+	// Close could cancel it. Once c exists, both duties are c.Close()'s.
+	var (
+		c      *Conn
+		cancel context.CancelFunc
+		owned  bool
+	)
+	defer func() {
+		if owned {
+			return
+		}
+		if c != nil {
+			c.Close()
+			return
+		}
+		if cancel != nil {
+			cancel()
+		}
+		dialedHost.Conn.Close()
+	}()
 
 	writeTimeout := cfg.Timeout
 	if cfg.WriteTimeout > 0 {
@@ -365,9 +404,9 @@ func (s *Session) dialWithoutObserver(ctx context.Context, host *HostInfo, cfg *
 		}
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel = context.WithCancel(ctx)
 	streamGen := streams.New(cfg.ProtoVersion, cfg.MaxStreams)
-	c := &Conn{
+	c = &Conn{
 		r: &connReader{
 			conn: dialedHost.Conn,
 			r:    bufio.NewReader(dialedHost.Conn),
@@ -398,10 +437,13 @@ func (s *Session) dialWithoutObserver(ctx context.Context, host *HostInfo, cfg *
 
 	if err := c.init(ctx, dialedHost); err != nil {
 		cancel()
+		// The deferred cleanup above would call c.Close() on its own; keeping this
+		// explicit pair makes the error return read as it always has.
 		c.Close()
 		return nil, err
 	}
 
+	owned = true
 	return c, nil
 }
 

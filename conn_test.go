@@ -2537,3 +2537,176 @@ func TestSession_ControlErrorLogPanicDoesNotAbortClose(t *testing.T) {
 		}
 	}
 }
+
+// trackedTransport is a transport the test keeps an inventory of. RemoteAddr panics
+// once when the dialer that handed it out is armed for that.
+type trackedTransport struct {
+	net.Conn
+	dialer *inventoryDialer
+	closed atomic.Bool
+}
+
+func (c *trackedTransport) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+func (c *trackedTransport) RemoteAddr() net.Addr {
+	if c.dialer != nil && c.dialer.panicOnRemoteAddr.CompareAndSwap(true, false) {
+		panic("test: the supplied transport panicked in RemoteAddr")
+	}
+	return c.Conn.RemoteAddr()
+}
+
+// inventoryDialer records every transport it hands out, so a test can assert what was
+// closed without sleeping.
+type inventoryDialer struct {
+	inner             HostDialer
+	panicOnRemoteAddr atomic.Bool
+
+	mu    sync.Mutex
+	conns []*trackedTransport
+}
+
+func (d *inventoryDialer) DialHost(ctx context.Context, host *HostInfo) (*DialedHost, error) {
+	dialed, err := d.inner.DialHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	tracked := &trackedTransport{Conn: dialed.Conn, dialer: d}
+	d.mu.Lock()
+	d.conns = append(d.conns, tracked)
+	d.mu.Unlock()
+	dialed.Conn = tracked
+	return dialed, nil
+}
+
+func (d *inventoryDialer) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.conns)
+}
+
+// newest returns the transport handed out last.
+func (d *inventoryDialer) newest(t *testing.T) *trackedTransport {
+	t.Helper()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	require.NotEmpty(t, d.conns, "no transport was dialled")
+	return d.conns[len(d.conns)-1]
+}
+
+// newInventoryHarness returns a one-connection harness whose transports come from
+// dialer. The harness constructor returns with every pool filled, so the inventory is
+// settled before a test arms anything.
+func newInventoryHarness(t *testing.T, dialer *inventoryDialer, tune func(*ClusterConfig)) *fillHarness {
+	t.Helper()
+
+	return newFillHarnessOpts(t, 1, fillHarnessOpts{
+		tune: func(c *ClusterConfig) {
+			dialer.inner = &defaultHostDialer{dialer: &net.Dialer{Timeout: 5 * time.Second}}
+			c.HostDialer = dialer
+			c.NumConns = 1
+			if tune != nil {
+				tune(c)
+			}
+		},
+	})
+}
+
+// TestSession_ConnectObserverPanicClosesTheConn covers E1's first three boundaries —
+// F-conn-4, N12, N13 and N14. dialWithoutObserver returns a connection whose serve and
+// heartbeat goroutines are already running, and between the first successful
+// acquisition of a transport and the moment an owner takes it several application
+// callbacks run with no cleanup armed. A panic at any of them unwinds past both
+// owners-to-be, leaving a healthy orphan that Session.Close cannot find: it is in no
+// pool and no candidate set.
+func TestSession_ConnectObserverPanicClosesTheConn(t *testing.T) {
+	dialOne := func(t *testing.T, harness *fillHarness) {
+		t.Helper()
+
+		cfg := *harness.session.connCfg
+		_, _ = harness.session.dial(harness.session.ctx, harness.hosts[0], &cfg,
+			connErrorHandlerFn(func(*Conn, error, bool) {}))
+	}
+
+	t.Run("a panicking ConnectObserver", func(t *testing.T) {
+		observer := &armableConnectObserver{}
+		dialer := &inventoryDialer{}
+		harness := newInventoryHarness(t, dialer, func(c *ClusterConfig) { c.ConnectObserver = observer })
+
+		before := dialer.count()
+		observer.armed.Store(true)
+		require.Panics(t, func() { dialOne(t, harness) }, "the observer's panic must still reach the caller")
+
+		require.Equal(t, before+1, dialer.count(), "exactly one transport was dialled")
+		require.True(t, dialer.newest(t).closed.Load(),
+			"transport still open after the ConnectObserver panicked")
+	})
+
+	t.Run("a panicking RemoteAddr", func(t *testing.T) {
+		dialer := &inventoryDialer{}
+		harness := newInventoryHarness(t, dialer, nil)
+
+		before := dialer.count()
+		dialer.panicOnRemoteAddr.Store(true)
+		require.Panics(t, func() { dialOne(t, harness) }, "the transport's panic must still reach the caller")
+
+		require.Equal(t, before+1, dialer.count(), "exactly one transport was dialled")
+		require.True(t, dialer.newest(t).closed.Load(),
+			"transport still open after RemoteAddr panicked")
+	})
+
+	t.Run("a panicking AuthProvider", func(t *testing.T) {
+		var armed atomic.Bool
+		dialer := &inventoryDialer{}
+		harness := newInventoryHarness(t, dialer, func(c *ClusterConfig) {
+			c.AuthProvider = func(*HostInfo) (Authenticator, error) {
+				if armed.CompareAndSwap(true, false) {
+					panic("test: the application's AuthProvider panicked")
+				}
+				return nil, nil
+			}
+		})
+
+		before := dialer.count()
+		armed.Store(true)
+		require.Panics(t, func() { dialOne(t, harness) }, "the AuthProvider's panic must still reach the caller")
+
+		require.Equal(t, before+1, dialer.count(), "exactly one transport was dialled")
+		require.True(t, dialer.newest(t).closed.Load(),
+			"transport still open after the AuthProvider panicked")
+	})
+
+	// WrapTLS is exported, so the cleanup is armed there rather than in
+	// defaultHostDialer: a third-party HostDialer that calls it gets it too.
+	t.Run("a panicking TLS verification", func(t *testing.T) {
+		srv := NewSSLTestServer(t, defaultProto, t.Context())
+		defer srv.Stop()
+
+		raw, err := net.DialTimeout("tcp", srv.Address, 5*time.Second)
+		require.NoError(t, err, "dial the TLS fixture server")
+		tracked := &trackedTransport{Conn: raw}
+
+		cfg := &tls.Config{
+			InsecureSkipVerify: true, //nolint:gosec // the fixture's certificate is not the subject
+			VerifyPeerCertificate: func([][]byte, [][]*x509.Certificate) error {
+				panic("test: the application's certificate verification panicked")
+			},
+		}
+		require.Panics(t, func() { _, _ = WrapTLS(t.Context(), tracked, srv.Address, cfg) },
+			"the verifier's panic must still reach the caller")
+		require.True(t, tracked.closed.Load(),
+			"transport still open after the TLS verification panicked")
+	})
+}
+
+// armableConnectObserver panics from ObserveConnect once armed, on a successful dial.
+type armableConnectObserver struct{ armed atomic.Bool }
+
+func (o *armableConnectObserver) ObserveConnect(oc ObservedConnect) {
+	if oc.Err == nil && o.armed.CompareAndSwap(true, false) {
+		panic("test: the application's ConnectObserver panicked on a successful dial")
+	}
+}

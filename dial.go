@@ -118,11 +118,22 @@ func WrapTLS(ctx context.Context, conn net.Conn, addr string, tlsConfig *tls.Con
 	if tlsConfig != nil {
 		tlsConfig := tlsConfigForAddr(tlsConfig, addr)
 		tconn := tls.Client(conn, tlsConfig)
+		// The handshake runs the application's certificate verification. A panic
+		// there unwinds past every owner-to-be, leaving a transport nobody holds:
+		// it is in no pool and no candidate set, so Session.Close cannot find it.
+		// The cleanup is armed here rather than in defaultHostDialer so that a
+		// third-party HostDialer calling this exported function gets it too.
+		owned := false
+		defer func() {
+			if !owned {
+				conn.Close()
+			}
+		}()
 		if err := tconn.HandshakeContext(ctx); err != nil {
-			conn.Close()
 			return nil, err
 		}
 		conn = tconn
+		owned = true
 	}
 
 	return &DialedHost{
