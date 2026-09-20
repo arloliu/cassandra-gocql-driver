@@ -285,6 +285,28 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	}
 	s.schemaDescriber = newSchemaDescriber(s, newRefreshDebouncer(schemaDebounce, s.runSchemaRefresh, s.logger))
 
+	// From here on a worker exists, so every non-success exit owes a Close. Only an
+	// error return from init() had one: a panic — out of policy.Init, out of
+	// buildPool, or out of init itself — unwound NewSession with the debouncers, the
+	// scheduler and the pools running and no handle returned, so nothing could ever
+	// close them.
+	//
+	// The cleanup is isolated, not the original panic: safely absorbs only a panic
+	// raised by Close itself, and the shared recovery handler cannot propagate, so
+	// the value the caller sees is still the one init raised. What this guarantees is
+	// that the cleanup is attempted, not that every resource is released — a
+	// transport whose own Close panics, and one stranded before any owner registered
+	// it, are both outside what Session.Close can reach.
+	//
+	// The explicit s.Close() on init's error return below stays: it is benign,
+	// because this guard's second call returns at isClosing.
+	ok := false
+	defer func() {
+		if !ok {
+			safely(s.logger, "NewSession.cleanup", s.Close)
+		}
+	}()
+
 	// The overflow callback is a method value, not s.ringRefresher.trigger: the
 	// refresher is not built until the next statement, so binding its method here
 	// would capture a nil receiver and panic on the first overflow.
@@ -317,6 +339,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		}
 	}
 
+	ok = true
 	return s, nil
 }
 
