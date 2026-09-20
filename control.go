@@ -97,14 +97,18 @@ func createControlConn(session *Session) *controlConn {
 }
 
 func (c *controlConn) heartBeat() {
-	// Plain log-and-exit teardown. Do NOT transition state on recovered
-	// panic: controlConnClosing is the terminal Session.Close sentinel
-	// and reconnect() short-circuits when state == Closing, so reusing
-	// that state here would permanently disable reconnection. The
-	// buffered c.quit chan independently guarantees close() does not
-	// block if the heartbeat goroutine has exited via recovery. The
-	// session continues in a degraded state (no heartbeat) until
-	// Session.Close, but reconnects still work.
+	// Plain log-and-exit teardown for anything that escapes the loop itself. Do NOT
+	// transition state on recovered panic: controlConnClosing is the terminal
+	// Session.Close sentinel and reconnect() short-circuits when state == Closing, so
+	// reusing that state here would permanently disable reconnection. The buffered
+	// c.quit chan independently guarantees close() does not block if the heartbeat
+	// goroutine has exited via recovery.
+	//
+	// A panicking round does not end the goroutine: the round is abandoned, reported,
+	// and the next one runs a second later. This goroutine is the only thing that
+	// retries a control reconnect after one has failed — HandleError reconnects once,
+	// and acquireConn only while no connection is published — so ending it on one
+	// recovered panic left the control connection with no retry owner at all.
 	defer recoverGoroutine(c.session.logger, "controlConn.heartBeat", nil)
 
 	// If close() latched controlConnClosing before this goroutine started, the
@@ -120,36 +124,49 @@ func (c *controlConn) heartBeat() {
 	for {
 		timer.Reset(sleepTime)
 
+		// The quit arm stays in the loop, outside the isolation below: a return
+		// inside the closure would only return from the closure.
 		select {
 		case <-c.quit:
 			return
 		case <-timer.C:
 		}
 
-		resp, err := c.writeFrame(&writeOptionsFrame{})
-		if err != nil {
-			c.session.logger.Debug("Control connection failed to send heartbeat.", NewLogFieldError("err", err))
-			goto reconn
-		}
-
-		switch actualResp := resp.(type) {
-		case *supportedFrame:
-			// Everything ok
-			sleepTime = 5 * time.Second
-			continue
-		case error:
-			c.session.logger.Debug("Control connection heartbeat failed.", NewLogFieldError("err", actualResp))
-			goto reconn
-		default:
-			c.session.logger.Error("Unknown frame in response to options.", NewLogFieldString("frame_type", fmt.Sprintf("%T", resp)))
-		}
-
-	reconn:
-		// try to connect a bit faster
-		sleepTime = 1 * time.Second
-		c.reconnect()
-		continue
+		// A panicking round is a failed round: retry on the fast rhythm.
+		next := 1 * time.Second
+		safely(c.session.logger, "controlConn.heartBeat.round", func() {
+			next = c.heartBeatRound()
+		})
+		sleepTime = next
 	}
+}
+
+// heartBeatRound runs one heartbeat exchange and reconnects if it failed.
+//
+// Returns:
+//   - time.Duration: how long to wait before the next round — 5 s after a healthy
+//     exchange, 1 s on every path that reconnected
+func (c *controlConn) heartBeatRound() time.Duration {
+	resp, err := c.writeFrame(&writeOptionsFrame{})
+	if err != nil {
+		c.session.logger.Debug("Control connection failed to send heartbeat.", NewLogFieldError("err", err))
+		// try to connect a bit faster
+		c.reconnect()
+		return 1 * time.Second
+	}
+
+	switch actualResp := resp.(type) {
+	case *supportedFrame:
+		// Everything ok
+		return 5 * time.Second
+	case error:
+		c.session.logger.Debug("Control connection heartbeat failed.", NewLogFieldError("err", actualResp))
+	default:
+		c.session.logger.Error("Unknown frame in response to options.", NewLogFieldString("frame_type", fmt.Sprintf("%T", resp)))
+	}
+
+	c.reconnect()
+	return 1 * time.Second
 }
 
 var hostLookupPreferV4 = os.Getenv("GOCQL_HOST_LOOKUP_PREFER_V4") == "true"

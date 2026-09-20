@@ -102,6 +102,10 @@ type localHostServer struct {
 	// and a reconnect's own startup OPTIONS still succeeds.
 	failHeartbeatOptions atomic.Bool
 
+	// heartbeatOptions counts the post-startup OPTIONS requests the server has been
+	// offered, which is one per heartbeat round that reached the server.
+	heartbeatOptions atomic.Int32
+
 	// hangQuery, when set, makes a query whose text contains it never answered:
 	// the server signals hangEntered and blocks on its context, so the client
 	// query waits for a response that never comes until the connection is closed.
@@ -132,6 +136,10 @@ func (s *localHostServer) setHangQuery(substr string) <-chan struct{} {
 // Returns:
 //   - bool: true if it wrote a response (the caller must not write another)
 func (s *localHostServer) heartbeatOptionsResp(respFrame *framer, stream int) bool {
+	// The server calls this only after that connection completed startup, so every
+	// call is a heartbeat's OPTIONS and nothing else. A test that must know a
+	// heartbeat round completed counts these rather than waiting out an interval.
+	s.heartbeatOptions.Add(1)
 	if !s.failHeartbeatOptions.Load() {
 		return false
 	}
