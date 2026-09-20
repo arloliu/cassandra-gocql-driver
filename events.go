@@ -178,29 +178,45 @@ func (e *eventDebouncer) flush() {
 }
 
 func (e *eventDebouncer) debounce(frame frame) {
-	e.mu.Lock()
-	now := time.Now()
-	if e.firstPending.IsZero() {
-		e.firstPending = now
-	}
-	e.resetTimerLocked(nextDebounceDeadline(now, e.firstPending))
-
-	// TODO: probably need a warning to track if this threshold is too low
+	// The decision is taken under the lock and nothing else is: the report and the
+	// compensation below both run outside it. The critical section is scoped with a
+	// deferred unlock so that neither a panicking logger nor anything else can leave
+	// e.mu held — a stranded e.mu blocks the flusher, every later event, and, because
+	// stop() waits on the flusher, Session.Close.
 	var overflowed bool
-	if len(e.events) < eventBufferSize {
-		e.events = append(e.events, frame)
-	} else {
-		overflowed = true
+	func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+
+		now := time.Now()
+		if e.firstPending.IsZero() {
+			e.firstPending = now
+		}
+		e.resetTimerLocked(nextDebounceDeadline(now, e.firstPending))
+
+		// TODO: probably need a warning to track if this threshold is too low
+		if len(e.events) < eventBufferSize {
+			e.events = append(e.events, frame)
+		} else {
+			overflowed = true
+		}
+	}()
+
+	if !overflowed {
+		return
+	}
+
+	// Isolated, so that a panicking logger costs the report and not the compensation
+	// below it.
+	safely(e.logger, "eventDebouncer.debounce.overflow", func() {
 		e.logger.Warning("Event buffer full, dropping event frame.",
 			NewLogFieldString("event_name", e.name), NewLogFieldStringer("frame", frame))
-	}
-
-	e.mu.Unlock()
+	})
 
 	// A dropped event is a topology or status change nothing else will report, so the
 	// drop has to be compensated for. Called with mu released: it reaches components
 	// that take locks of their own.
-	if overflowed && e.onOverflow != nil {
+	if e.onOverflow != nil {
 		e.onOverflow()
 	}
 }
