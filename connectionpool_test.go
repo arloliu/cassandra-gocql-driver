@@ -28,6 +28,7 @@
 package gocql
 
 import (
+	"context"
 	"crypto/tls"
 	"sync/atomic"
 	"testing"
@@ -283,4 +284,63 @@ func TestPool_HandleErrorLoggerPanicDoesNotStrandDeadConn(t *testing.T) {
 	awaitConnGoneFromPool(t, pool, conn)
 	require.NoError(t, awaitQuery(t, harness.query(t.Context(), nil)),
 		"the pool must serve queries again once it has replaced the dead connection")
+}
+
+// armOnConnectObserver arms a stream observer from ObserveConnect, which Session.dial
+// calls after a successful dial and immediately before connect goes on to UseKeyspace.
+// Arming there rather than globally keeps the panic off connection setup.
+type armOnConnectObserver struct {
+	enabled atomic.Bool
+	target  *oneShotStreamContextObserver
+}
+
+func (a *armOnConnectObserver) ObserveConnect(oc ObservedConnect) {
+	if oc.Err == nil && a.enabled.CompareAndSwap(true, false) {
+		a.target.armed.Store(true)
+	}
+}
+
+// oneShotStreamContextObserver panics from StreamContext once armed.
+type oneShotStreamContextObserver struct {
+	armed  atomic.Bool
+	panics atomic.Int32
+}
+
+func (o *oneShotStreamContextObserver) StreamContext(context.Context) StreamObserverContext {
+	if o.armed.CompareAndSwap(true, false) {
+		o.panics.Add(1)
+		panic("test: the application's StreamObserver panicked in StreamContext")
+	}
+	return nil
+}
+
+// TestPool_UseKeyspaceObserverPanicClosesTheConn covers E1's fourth boundary, F-conn-5.
+// hostConnPool.connect set the keyspace before the append, with cleanup only on an
+// ordinary error return, so a StreamObserver panic inside that exec unwound connect past
+// both the close and the append and left a live connection in no pool.
+func TestPool_UseKeyspaceObserverPanicClosesTheConn(t *testing.T) {
+	observer := &oneShotStreamContextObserver{}
+	arm := &armOnConnectObserver{target: observer}
+	dialer := &inventoryDialer{}
+	harness := newInventoryHarness(t, dialer, func(c *ClusterConfig) {
+		c.StreamObserver = observer
+		c.ConnectObserver = arm
+	})
+	pool := harness.pool(t, harness.hosts[0])
+
+	// The keyspace is set on the pool after the session is up. The fixture server's
+	// USE handler is not needed: the observer panics in exec before the frame is
+	// written, which is the ClusterConfig.Keyspace path from connect's point of view.
+	pool.keyspace = "test_ks"
+
+	before := dialer.count()
+	arm.enabled.Store(true)
+	err := pool.connectMany(1)
+	require.Error(t, err, "the worker's recovery must report the panic as the cycle's error")
+	require.EqualValues(t, 1, observer.panics.Load(), "the observer panicked exactly once, inside UseKeyspace")
+
+	require.Equal(t, before+1, dialer.count(), "exactly one transport was dialled by the panicking connect")
+	require.True(t, dialer.newest(t).closed.Load(),
+		"transport still open after the UseKeyspace StreamObserver panicked")
+	require.Equal(t, 1, pool.Size(), "the orphan must not have been appended")
 }

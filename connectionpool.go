@@ -1293,10 +1293,19 @@ func (pool *hostConnPool) connect() (err error) {
 		return err
 	}
 
+	// Armed from here until the connection reaches an owner. UseKeyspace below runs
+	// the application's StreamObserver, and a panic there unwinds past the append,
+	// leaving a live connection in no pool: Session.Close cannot find it.
+	owned := false
+	defer func() {
+		if !owned {
+			conn.Close()
+		}
+	}()
+
 	if pool.keyspace != "" {
 		// set the keyspace
 		if err = conn.UseKeyspace(pool.keyspace); err != nil {
-			conn.Close()
 			return err
 		}
 	}
@@ -1308,7 +1317,6 @@ func (pool *hostConnPool) connect() (err error) {
 
 	if pool.closed {
 		pool.mu.Unlock()
-		conn.Close()
 		return nil
 	}
 
@@ -1319,10 +1327,12 @@ func (pool *hostConnPool) connect() (err error) {
 	if conn.Closed() {
 		pool.refillPending = true
 		pool.mu.Unlock()
+		owned = true // already dead; there is nothing left to close
 		return nil
 	}
 
 	pool.conns = append(pool.conns, conn)
+	owned = true
 	pool.mu.Unlock()
 
 	pool.testHook(poolConnAppended)
