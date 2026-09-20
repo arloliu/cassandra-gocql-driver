@@ -2435,3 +2435,105 @@ func TestConn_TransportClosePanicStillReportsTheError(t *testing.T) {
 		}
 	})
 }
+
+// errTestTransportClose is what a supplied transport returns from Close, standing in
+// for a transport that reports a flush or shutdown failure.
+var errTestTransportClose = errors.New("gocql: transport close failed in the test")
+
+// errorOnCloseDialer wraps every transport it hands out so that Close reports an
+// error. That is the arm on which Conn.Close reaches its error handler at all.
+type errorOnCloseDialer struct {
+	inner HostDialer
+}
+
+type errorOnCloseTransport struct{ net.Conn }
+
+func (c *errorOnCloseTransport) Close() error {
+	_ = c.Conn.Close()
+	return errTestTransportClose
+}
+
+func (d *errorOnCloseDialer) DialHost(ctx context.Context, host *HostInfo) (*DialedHost, error) {
+	dialed, err := d.inner.DialHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	dialed.Conn = &errorOnCloseTransport{Conn: dialed.Conn}
+	return dialed, nil
+}
+
+// controlWarnPanicLogger panics once armed, on the control connection's error line.
+type controlWarnPanicLogger struct {
+	StructuredLogger
+	armed  atomic.Bool
+	panics atomic.Int32
+}
+
+func (l *controlWarnPanicLogger) Warning(msg string, fields ...LogField) {
+	if msg == "Control connection error." && l.armed.CompareAndSwap(true, false) {
+		l.panics.Add(1)
+		panic("test: logger panic on the control connection's error line")
+	}
+	l.StructuredLogger.Warning(msg, fields...)
+}
+
+// TestSession_ControlErrorLogPanicDoesNotAbortClose covers N8, and with it the half of
+// N3 that WS2-input-F-sess-2-guard.md needs established before the ownership guard is
+// written.
+//
+// Session.Close closes the control connection before it closes the pools and stops the
+// three workers. A transport that reports an error from Close takes controlConn
+// .HandleError down to the application logger's warning, which was not isolated: one
+// panic there abandoned everything after it, and because Close latches isClosing on
+// entry, no later Close call would pick the work up either.
+func TestSession_ControlErrorLogPanicDoesNotAbortClose(t *testing.T) {
+	logger := &controlWarnPanicLogger{StructuredLogger: newTestLogger(LogLevelDebug)}
+	harness := newFillHarnessOpts(t, 1, fillHarnessOpts{
+		tune: func(c *ClusterConfig) {
+			c.HostDialer = &errorOnCloseDialer{inner: &defaultHostDialer{dialer: &net.Dialer{Timeout: 5 * time.Second}}}
+			c.Logger = logger
+		},
+	})
+	session := harness.session
+
+	// The fixture server answers no system.local rows, so a control connection
+	// cannot come up through CreateSession here. One is built over a real dialled
+	// connection to the same server and published instead: from Session.Close's
+	// point of view — latchAndSnapshot, then closeSnapshot, then Conn.Close, then
+	// controlConn.HandleError — this is the production chain.
+	require.Nil(t, session.control, "the harness leaves the control connection disabled")
+	control := createControlConn(session)
+	cfg := *session.connCfg
+	conn, err := session.dial(session.ctx, harness.hosts[0], &cfg, control)
+	require.NoError(t, err, "dial the connection the control connection will own")
+	control.conn.Store(&connHost{conn: conn, host: harness.hosts[0]})
+	session.control = control
+
+	logger.armed.Store(true)
+	func() {
+		// Whether the panic escapes Close is not the subject: what matters is what
+		// Close had still to do when it got there.
+		defer func() {
+			if r := recover(); r != nil {
+				t.Logf("Session.Close propagated the logger panic: %v", r)
+			}
+		}()
+		session.Close()
+	}()
+	require.EqualValues(t, 1, logger.panics.Load(), "the control error line must have been reached exactly once")
+
+	if !session.Closed() {
+		t.Fatal("Session.Close did not complete: isClosed false")
+	}
+	for name, done := range map[string]chan struct{}{
+		"the schema refresher": session.schemaDescriber.schemaRefresher.done,
+		"the event debouncer":  session.nodeEvents.done,
+		"the ring refresher":   session.ringRefresher.done,
+	} {
+		select {
+		case <-done:
+		default:
+			t.Fatalf("%s was never stopped", name)
+		}
+	}
+}

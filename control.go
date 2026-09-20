@@ -715,10 +715,20 @@ func (c *controlConn) HandleError(conn *Conn, err error, closed bool) {
 		return
 	}
 
-	c.session.logger.Warning("Control connection error.",
-		NewLogFieldIP("host_addr", conn.host.ConnectAddress()),
-		NewLogFieldString("host_id", conn.host.HostID()),
-		NewLogFieldError("err", err))
+	// Isolated: this is reached from Session.Close, through closeSnapshot and
+	// Conn.Close, whenever the transport reports an error from Close. A panic here
+	// abandoned the rest of Session.Close — the pools and the three workers — and
+	// Close latches isClosing on entry, so no later call picks that work up. It also
+	// loses the reconnect below, which the heartbeat repairs.
+	//
+	// The missing closing() check is deliberate: reconnect checks it itself, and a
+	// second check here is F-ctrl-3's territory.
+	safely(c.session.logger, "controlConn.HandleError.log", func() {
+		c.session.logger.Warning("Control connection error.",
+			NewLogFieldIP("host_addr", conn.host.ConnectAddress()),
+			NewLogFieldString("host_id", conn.host.HostID()),
+			NewLogFieldError("err", err))
+	})
 
 	c.reconnect()
 }
