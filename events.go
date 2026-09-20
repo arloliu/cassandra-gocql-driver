@@ -494,10 +494,33 @@ func (s *Session) handleNodeConnected(host *HostInfo, from *hostConnPool) {
 		// open for a host that nothing is waiting to reconnect.
 		s.outageRemove(host.HostID())
 
+		// Armed before the filter and the policy, both of which are application
+		// code. The round-robin policies remove a host from their list on DOWN and
+		// HostUp is the only thing that puts it back, so a panic here leaves a host
+		// that is UP, holds a full pool, and is in no policy list — which nothing
+		// repairs: the executor only sees candidates Pick offers, the DOWN sweep
+		// skips it because it is UP, a full pool does not refill, and
+		// completeAdmission skips AddHost while this record names this object.
+		//
+		// Retiring the record is the repair, not re-calling the callback: the next
+		// ring-refresh round is an independently scheduled retry owner, which a
+		// second call from this frame would not be. AddHost would be the wrong
+		// method as well, since token-aware AddHost rebuilds the token ring and
+		// HostUp deliberately does not.
+		//
+		// The defer runs under hostPublishMu, which withOwnedHost still holds.
+		published := false
+		defer func() {
+			if !published && s.publishedHosts[host.HostID()] == host {
+				delete(s.publishedHosts, host.HostID())
+			}
+		}()
+
 		if s.cfg.filterHost(host) {
 			return false
 		}
 		s.policy.HostUp(host)
+		published = true
 		return true
 	}) {
 		s.hostListeners.OnHostUp(HostUpEvent{Host: host})

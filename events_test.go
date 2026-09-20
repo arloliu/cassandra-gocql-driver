@@ -29,10 +29,14 @@ package gocql
 
 import (
 	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestEventDebounce(t *testing.T) {
@@ -199,4 +203,142 @@ func TestEventDebouncer_OverflowLogPanicDoesNotStrandMutex(t *testing.T) {
 			t.Fatalf("the overflow line was not reached")
 		}
 	})
+}
+
+// onHandleNodeConnected reports whether the caller runs inside handleNodeConnected.
+// The injection has to be keyed on the call site, not on "the first call": the
+// reconnect sweep consults the filter while collecting DOWN hosts, and
+// completeAdmission consults it again, both before the transition under test.
+func onHandleNodeConnected() bool {
+	buf := make([]byte, 16<<10)
+	buf = buf[:runtime.Stack(buf, false)]
+	return strings.Contains(string(buf), "(*Session).handleNodeConnected")
+}
+
+// hostUpPanicPolicy panics once from HostUp, when the caller is handleNodeConnected.
+// armed and panics are the test's, so the filter variant and the policy variant share
+// one arming protocol.
+type hostUpPanicPolicy struct {
+	HostSelectionPolicy
+	armed  *atomic.Bool
+	panics *atomic.Int32
+	active bool
+}
+
+func (p *hostUpPanicPolicy) HostUp(h *HostInfo) {
+	if p.active && p.armed.Load() && onHandleNodeConnected() && p.armed.CompareAndSwap(true, false) {
+		p.panics.Add(1)
+		panic("test: policy HostUp panic")
+	}
+	p.HostSelectionPolicy.HostUp(h)
+}
+
+// policyOffers reports whether the policy's iterator offers hostID.
+func policyOffers(policy HostSelectionPolicy, hostID string) bool {
+	for next := policy.Pick(nil); ; {
+		selected := next()
+		if selected == nil {
+			return false
+		}
+		if selected.Info().HostID() == hostID {
+			return true
+		}
+	}
+}
+
+// TestSession_HostUpPanicLeavesThePublicationRetryable covers N11.
+//
+// handleNodeConnected sets the host UP and then calls the application's filter and
+// policy. Both round-robin policies remove a host from their list on DOWN and HostUp
+// is the only thing that puts it back, so one panic there left a host that is UP,
+// holds a full pool, and is in no policy list. Nothing repaired it: the executor only
+// sees what Pick offers, the DOWN sweep skips it because it is UP, a full pool does
+// not refill, completeAdmission skipped AddHost while the publication record still
+// named the object, and the fill worker's recovery absorbed the panic.
+func TestSession_HostUpPanicLeavesThePublicationRetryable(t *testing.T) {
+	run := func(t *testing.T, inPolicy bool) {
+		var armed atomic.Bool
+		var panics atomic.Int32
+		var holdRefresh atomic.Bool
+		var releaseOnce sync.Once
+		refreshGate := make(chan struct{})
+		connected := make(chan struct{}, 8)
+
+		release := func() {
+			holdRefresh.Store(false)
+			releaseOnce.Do(func() { close(refreshGate) })
+		}
+		t.Cleanup(release)
+
+		policy := &hostUpPanicPolicy{armed: &armed, panics: &panics, active: inPolicy}
+		f := newTickFixture(t, func(cluster *ClusterConfig) {
+			// The fixture installs its state collector as the selection policy and
+			// waits on it, so this wraps it rather than replacing it.
+			policy.HostSelectionPolicy = cluster.PoolConfig.HostSelectionPolicy
+			cluster.PoolConfig.HostSelectionPolicy = policy
+			if !inPolicy {
+				cluster.HostFilter = HostFilterFunc(func(*HostInfo) bool {
+					if armed.Load() && onHandleNodeConnected() && armed.CompareAndSwap(true, false) {
+						panics.Add(1)
+						panic("test: HostFilter panic")
+					}
+					return true
+				})
+			}
+			// An automatic refresh can republish between the panic and the
+			// intermediate assertion and hide the defect, so it is held.
+			prev := cluster.testRingRefreshHook
+			cluster.testRingRefreshHook = func() {
+				if prev != nil {
+					prev()
+				}
+				if holdRefresh.Load() {
+					<-refreshGate
+				}
+			}
+		})
+		f.session.testAfterNodeConnected = func(*HostInfo) {
+			select {
+			case connected <- struct{}{}:
+			default:
+			}
+		}
+
+		hostID := f.host.HostID()
+		require.True(t, policyOffers(policy, hostID), "precondition: the policy offers the host")
+		f.driveDown(t)
+		require.False(t, policyOffers(policy, hostID), "precondition: a DOWN host is not offered")
+
+		holdRefresh.Store(true)
+		armed.Store(true)
+		f.gate.open()
+		sweepDownedHostsOnce(f.session)
+
+		select {
+		case <-connected:
+		case <-time.After(fillEventBudget):
+			t.Fatal("the refill never reached handleNodeConnected")
+		}
+		require.EqualValues(t, 1, panics.Load(), "the injected panic must have fired inside handleNodeConnected")
+
+		require.Equal(t, NodeUp, f.host.State(), "the host is UP")
+		pool, ok := f.session.pool.getPoolFor(f.host)
+		require.True(t, ok, "and holds a registered pool")
+		require.Positive(t, pool.Size(), "which is filled")
+		require.False(t, policyOffers(policy, hostID),
+			"the lost publication must leave the host out of the policy")
+
+		// One ring-refresh round is the retry owner. completeAdmission is what that
+		// round does for the canonical object (host_source.go:1772 is its only
+		// caller), and it is driven directly here because this fixture runs with the
+		// control connection disabled, so refreshRing itself returns errNoControl.
+		release()
+		f.session.completeAdmission(f.host)
+		if !policyOffers(policy, hostID) {
+			t.Fatal("host not offered by Pick after a ring-refresh round")
+		}
+	}
+
+	t.Run("a panicking HostFilter", func(t *testing.T) { run(t, false) })
+	t.Run("a panicking policy HostUp", func(t *testing.T) { run(t, true) })
 }
