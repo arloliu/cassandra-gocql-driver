@@ -35,6 +35,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The notifications that the panicking round skipped are not made again.
   A panicking logger reporting a failed round no longer stops schema refreshes either.
 
+- **A panicking application callback could leave a dead connection registered in its pool**,
+  where it was handed to queries until the process restarted.
+  The paths were a `StreamObserver`, the pool's error-handler log, a cancellation-arm log,
+  and the `Close` of a connection returned by a custom `HostDialer`.
+
+- **A panicking logger could strand the token-aware policy's mutex or the event debouncer's mutex**,
+  and a panicking `hostpool.HostPool` could strand the `HostPoolHostPolicy` adapter's mutex,
+  stopping every later topology change.
+  For the event debouncer this could also hang `Session.Close`.
+  The adapter also recorded a host before `HostPool.SetHosts` accepted it,
+  so after a panic there every later attempt to add that host was skipped;
+  it now records the host only once `SetHosts` returns.
+
+- **A panic anywhere in the control connection's heartbeat round ended the goroutine that owned retrying a failed control reconnect.**
+  `HandleError` reconnects once too, but nothing retried after it, so the driver could stop learning about the cluster.
+
+- **`Session.removeHost` could leave a host's connection pool registered and serving after the host had left the ring.**
+
+- **A panicking `HostFilter` or `HostSelectionPolicy.HostUp` during a scheduled reconnect could leave a host up, with a full pool, and in no selection policy's list**,
+  so it was never queried again.
+
+- **A panicking `ConnectObserver`, `AuthProvider`, TLS verification callback or `HostDialer` transport,
+  or a panicking `StreamObserver` during the `USE` that sets a new pool connection's keyspace,
+  could leave a live connection that nothing owned**
+  and `Session.Close` could not find.
+
+- **A panic during session initialisation left a fully running session that nothing could close.**
+  `NewSession` still panics; it now attempts the session's cleanup before propagating the panic.
+
+### Changed
+
+- **A panicking application callback no longer propagates from seven places.**
+  The driver now logs the panic and carries on at:
+  the per-call stream notification and the close of the underlying connection inside `Conn.Close`;
+  the connection pool's and the control connection's error-handler logs;
+  the event debouncer's buffer-overflow warning;
+  the token-aware policy's token-ring warning;
+  and one iteration of the control connection's heartbeat.
+  Previously each of these reached the caller — `Session.Close`, `NewSession`, or a driver goroutine's recovery boundary —
+  and abandoned the work that followed it.
+  Apart from these places and the fixes listed above, panics from callbacks still propagate, unchanged;
+  in particular a panicking `HostSelectionPolicy` still reaches the caller of `NewSession`
+  and still fails a ring-refresh round.
+
+### Documentation
+
+- A new `doc.go` section, "Application callbacks and panics",
+  describing where a panicking callback propagates, where the driver isolates it,
+  and which losses remain.
+
 ## [2.7.3-otter] - 2026-09-17
 
 Patch release for one connection-pool defect that never repaired itself:

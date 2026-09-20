@@ -920,4 +920,48 @@
 // if you need to have multiple listeners for the same event.
 //
 // See [ClusterConfig.Metadata] for more details and Example_eventListeners for a complete implementation example.
+//
+// # Application callbacks and panics
+//
+// The driver calls into application code in many places: the logger, the connect,
+// stream and frame observers, the query and batch observers, the tracer, the host
+// filter, the dialer, the address translator, the selection, conviction, reconnection,
+// retry and speculative-execution policies, the authenticator, and the session, host and
+// schema listeners. These should not panic.
+//
+// What happens when one does depends on where it runs. On a goroutine the driver owns,
+// the panic is recovered at that goroutine's boundary and logged, and the driver
+// continues. On a synchronous API path — [NewSession], query and batch execution — it
+// propagates to the caller, which is expected to recover it. [Session.Close] is a
+// synchronous path too, but every callback it reaches is one of the isolated ones below.
+//
+// There are a few places where the driver isolates the call instead, logging the panic
+// and carrying on, because the work that follows the callback is work the driver owes
+// and nothing else would do: the per-call stream notification and the close of the
+// underlying connection when a connection is torn down; the connection pool's and the
+// control connection's error-handler logs; the event debouncer's buffer-overflow
+// warning; the token-aware policy's token-ring warning; and one iteration of the control
+// connection's heartbeat.
+//
+// Recovering a panic is not the same as completing the work it interrupted. Where a
+// panicking callback would otherwise discard cleanup or leave a retry with no owner, the
+// driver has closed those paths one by one; it makes no general promise about them, and
+// these are the ones that remain:
+//
+//   - A panic in the logger on the event-dispatch path discards that event. For a schema
+//     change, that event is the only trigger of a schema refresh, so an enabled schema
+//     cache can stay stale until later schema activity or a control reconnect.
+//   - A panic in a schema-change listener, or in KeyspaceChanged, discards the created,
+//     dropped and updated notifications for that refresh round. They are computed by
+//     comparing against metadata the driver has already stored, so a later round does not
+//     recompute them.
+//   - A panic in a topology listener discards the OnNewHost or OnRemovedHost notification
+//     it was called with, and the notifications for the listeners after it. The
+//     membership change itself is not lost.
+//   - A panic in a [HostSelectionPolicy] wrapped by [TokenAwareHostPolicy] can leave the
+//     wrapped policy listing a host the wrapper has removed.
+//   - A panic in the [io.Writer] given to [NewTraceWriter] can leave that tracer unusable.
+//   - A panic in a [ConvictionPolicy]'s AddFailure discards the host-down transition it
+//     was being consulted for; the reconnect sweep and the control heartbeat re-attempt
+//     it.
 package gocql // import "github.com/apache/cassandra-gocql-driver/v2"
