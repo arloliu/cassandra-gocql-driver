@@ -36,6 +36,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1623,6 +1624,153 @@ func BenchmarkTokenAwareHostPolicy_PickShuffleDCAwareParallel(b *testing.B) {
 		for pb.Next() {
 			iter := policy.Pick(iq)
 			iter()
+		}
+	})
+}
+
+// reproArmableWarnPanicLogger is a logger whose first Warning after arming panics.
+// It models an application logger that fails on one call and not on the next.
+type armableWarnPanicLogger struct {
+	StructuredLogger
+	armed  atomic.Bool
+	panics atomic.Int32
+}
+
+func (l *armableWarnPanicLogger) Warning(msg string, fields ...LogField) {
+	if l.armed.CompareAndSwap(true, false) {
+		l.panics.Add(1)
+		panic("test: logger panic in resetTokenRing")
+	}
+	l.StructuredLogger.Warning(msg, fields...)
+}
+
+// lockOrderFallbackPolicy records whether the token-aware policy's mutex was held
+// when the fallback policy was entered. The token-aware policy has always called
+// its fallback outside t.mu; a function-level deferred unlock would invert that.
+type lockOrderFallbackPolicy struct {
+	HostSelectionPolicy
+	policy *tokenAwareHostPolicy
+	under  atomic.Bool
+	calls  atomic.Int32
+}
+
+func (f *lockOrderFallbackPolicy) observe() {
+	f.calls.Add(1)
+	if f.policy.mu.TryLock() {
+		f.policy.mu.Unlock()
+		return
+	}
+	f.under.Store(true)
+}
+
+func (f *lockOrderFallbackPolicy) AddHost(host *HostInfo) {
+	f.observe()
+	f.HostSelectionPolicy.AddHost(host)
+}
+
+func (f *lockOrderFallbackPolicy) RemoveHost(host *HostInfo) {
+	f.observe()
+	f.HostSelectionPolicy.RemoveHost(host)
+}
+
+// newPanicLoggerTokenAwarePolicy builds a token-aware policy over fallback with an
+// unsupported partitioner already set, so that every later resetTokenRing reaches
+// the failure Warning. The logger is returned disarmed.
+func newPanicLoggerTokenAwarePolicy(fallback HostSelectionPolicy) (*tokenAwareHostPolicy, *armableWarnPanicLogger) {
+	logger := &armableWarnPanicLogger{StructuredLogger: &defaultLogger{}}
+	p := TokenAwareHostPolicy(fallback).(*tokenAwareHostPolicy)
+	p.logger = logger
+	p.SetPartitioner("com.example.UnsupportedPartitioner")
+	return p, logger
+}
+
+// mustReturnWithin runs fn on its own goroutine and fails the test if it has not
+// returned within the bounded wait. A goroutine left blocked on a stranded mutex
+// is leaked deliberately: the test has already failed at that point.
+func mustReturnWithin(t *testing.T, name string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s blocked for 2s after the logger panicked", name)
+	}
+}
+
+// TestTokenAware_LogPanicDoesNotStrandPolicyMutex is the inversion of
+// _repro/zz_repro_round6_test.go's TestRepro_TokenAwareLogPanicStrandsPolicyMutex
+// (F-pol-1). AddHost, AddHosts and RemoveHost called resetTokenRing under t.mu and
+// released it with a plain Unlock, so one panic out of the failure Warning stranded
+// the mutex and every later topology update blocked forever.
+func TestTokenAware_LogPanicDoesNotStrandPolicyMutex(t *testing.T) {
+	h1 := (&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"00"}}).withIdentity("h1", "", "")
+	h2 := (&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"25"}}).withIdentity("h2", "", "")
+
+	t.Run("the mutex survives a panicking warning", func(t *testing.T) {
+		p, logger := newPanicLoggerTokenAwarePolicy(RoundRobinHostPolicy())
+
+		logger.armed.Store(true)
+		func() {
+			// Whether the panic escapes AddHost is the next sub-test's subject;
+			// this one is only about what the mutex is in afterwards.
+			defer func() {
+				if r := recover(); r != nil {
+					t.Logf("AddHost propagated the logger panic: %v", r)
+				}
+			}()
+			p.AddHost(h1)
+		}()
+		if got := logger.panics.Load(); got != 1 {
+			t.Fatalf("the logger panicked %d times, want exactly 1", got)
+		}
+
+		mustReturnWithin(t, "a later AddHost", func() { p.AddHost(h2) })
+		mustReturnWithin(t, "a later RemoveHost", func() { p.RemoveHost(h1) })
+		mustReturnWithin(t, "a later SetPartitioner", func() { p.SetPartitioner("com.example.OtherUnsupportedPartitioner") })
+
+		// The ledger's split: these three never took t.mu and are the control.
+		mustReturnWithin(t, "HostUp/HostDown/Pick", func() {
+			p.HostUp(h2)
+			p.HostDown(h2)
+			_ = p.Pick(nil)
+		})
+	})
+
+	t.Run("the panicking warning is isolated", func(t *testing.T) {
+		p, logger := newPanicLoggerTokenAwarePolicy(RoundRobinHostPolicy())
+
+		logger.armed.Store(true)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("AddHosts panicked: %v", r)
+				}
+			}()
+			p.AddHosts([]*HostInfo{h1, h2})
+		}()
+		if got := logger.panics.Load(); got != 1 {
+			t.Fatalf("the logger panicked %d times, want exactly 1", got)
+		}
+	})
+
+	t.Run("the fallback is still called outside t.mu", func(t *testing.T) {
+		fallback := &lockOrderFallbackPolicy{HostSelectionPolicy: RoundRobinHostPolicy()}
+		p, _ := newPanicLoggerTokenAwarePolicy(fallback)
+		fallback.policy = p
+
+		p.AddHost(h1)
+		p.AddHosts([]*HostInfo{h2})
+		p.RemoveHost(h1)
+
+		if got := fallback.calls.Load(); got != 3 {
+			t.Fatalf("the fallback was entered %d times, want 3", got)
+		}
+		if fallback.under.Load() {
+			t.Fatal("fallback called under t.mu")
 		}
 	})
 }

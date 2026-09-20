@@ -660,35 +660,43 @@ func (t *tokenAwareHostPolicy) SetPartitioner(partitioner string) {
 }
 
 func (t *tokenAwareHostPolicy) AddHost(host *HostInfo) {
-	t.mu.Lock()
-	if t.hosts.add(host) {
+	// The critical section is scoped rather than deferred at function level so
+	// that the fallback policy is still entered without t.mu held, as it always
+	// has been. resetTokenRing calls the application's logger, which may panic.
+	func() {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+
+		if t.hosts.add(host) {
+			meta := t.getMetadataForUpdate()
+			meta.resetTokenRing(t.partitioner, t.hosts.get(), t.logger)
+			if t.getSchemaMeta != nil {
+				t.updateAllReplicas(meta, t.getSchemaMeta())
+			}
+			t.metadata.Store(meta)
+		}
+	}()
+
+	t.fallback.AddHost(host)
+}
+
+func (t *tokenAwareHostPolicy) AddHosts(hosts []*HostInfo) {
+	// Scoped, not function level: see AddHost.
+	func() {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+
+		for _, host := range hosts {
+			t.hosts.add(host)
+		}
+
 		meta := t.getMetadataForUpdate()
 		meta.resetTokenRing(t.partitioner, t.hosts.get(), t.logger)
 		if t.getSchemaMeta != nil {
 			t.updateAllReplicas(meta, t.getSchemaMeta())
 		}
 		t.metadata.Store(meta)
-	}
-	t.mu.Unlock()
-
-	t.fallback.AddHost(host)
-}
-
-func (t *tokenAwareHostPolicy) AddHosts(hosts []*HostInfo) {
-	t.mu.Lock()
-
-	for _, host := range hosts {
-		t.hosts.add(host)
-	}
-
-	meta := t.getMetadataForUpdate()
-	meta.resetTokenRing(t.partitioner, t.hosts.get(), t.logger)
-	if t.getSchemaMeta != nil {
-		t.updateAllReplicas(meta, t.getSchemaMeta())
-	}
-	t.metadata.Store(meta)
-
-	t.mu.Unlock()
+	}()
 
 	for _, host := range hosts {
 		t.fallback.AddHost(host)
@@ -696,16 +704,20 @@ func (t *tokenAwareHostPolicy) AddHosts(hosts []*HostInfo) {
 }
 
 func (t *tokenAwareHostPolicy) RemoveHost(host *HostInfo) {
-	t.mu.Lock()
-	if t.hosts.remove(host.ConnectAddress()) {
-		meta := t.getMetadataForUpdate()
-		meta.resetTokenRing(t.partitioner, t.hosts.get(), t.logger)
-		if t.getSchemaMeta != nil {
-			t.updateAllReplicas(meta, t.getSchemaMeta())
+	// Scoped, not function level: see AddHost.
+	func() {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+
+		if t.hosts.remove(host.ConnectAddress()) {
+			meta := t.getMetadataForUpdate()
+			meta.resetTokenRing(t.partitioner, t.hosts.get(), t.logger)
+			if t.getSchemaMeta != nil {
+				t.updateAllReplicas(meta, t.getSchemaMeta())
+			}
+			t.metadata.Store(meta)
 		}
-		t.metadata.Store(meta)
-	}
-	t.mu.Unlock()
+	}()
 
 	t.fallback.RemoveHost(host)
 }
@@ -750,7 +762,11 @@ func (m *clusterMeta) resetTokenRing(partitioner string, hosts []*HostInfo, logg
 	// create a new token ring
 	tokenRing, err := newTokenRing(partitioner, hosts)
 	if err != nil {
-		logger.Warning("Unable to update the token ring due to error.", NewLogFieldError("err", err))
+		// Isolated: this runs under t.mu on three paths whose callers unwind into
+		// Session.init, and a lost warning is the whole cost of a panicking logger.
+		safely(logger, "clusterMeta.resetTokenRing", func() {
+			logger.Warning("Unable to update the token ring due to error.", NewLogFieldError("err", err))
+		})
 		return
 	}
 
