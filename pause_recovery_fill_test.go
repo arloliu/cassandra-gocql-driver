@@ -627,6 +627,13 @@ type fillHarnessOpts struct {
 	// handling is skipped; returning false falls through, so a fixture only has
 	// to answer the requests it cares about.
 	respHook func(ip string, srv *TestServer, req, resp *framer) bool
+	// rawRespHook, when set, is offered every post-startup request of every test
+	// server before respHook and before the default handling; ip is the server's
+	// loopback address without the port.
+	// Returning true means the request is answered — including by not answering it
+	// at all, which is the only way to leave a call outstanding without blocking the
+	// server's receive loop, and so the only way to leave several outstanding at once.
+	rawRespHook func(ip string, conn net.Conn, req *framer) bool
 
 	// proto selects the protocol version for both the servers and the cluster.
 	// Zero means defaultProto. Setting it on the cluster alone would not do:
@@ -685,11 +692,18 @@ func newFillHarnessOpts(t testing.TB, hosts int, opts fillHarnessOpts) *fillHarn
 				return opts.respHook(ip, srv, req, resp)
 			}
 		}
+		var rawRespFn func(conn net.Conn, req *framer) bool
+		if opts.rawRespHook != nil {
+			rawRespFn = func(conn net.Conn, req *framer) bool {
+				return opts.rawRespHook(ip, conn, req)
+			}
+		}
 		srv := newTestServerOpts{
-			addr:     addr,
-			protocol: uint8(proto),
-			recvHook: recvHook,
-			respFn:   respFn,
+			addr:      addr,
+			protocol:  uint8(proto),
+			recvHook:  recvHook,
+			respFn:    respFn,
+			rawRespFn: rawRespFn,
 		}.newServer(t, testServerContext(t))
 		t.Cleanup(srv.Stop)
 		return srv

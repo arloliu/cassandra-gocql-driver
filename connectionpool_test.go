@@ -30,6 +30,9 @@ package gocql
 import (
 	"crypto/tls"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/apache/cassandra-gocql-driver/v2/internal/streams"
 )
@@ -177,5 +180,64 @@ func TestSetupTLSConfig(t *testing.T) {
 					test.expectedInsecureSkipVerify)
 			}
 		})
+	}
+}
+
+// TestPool_StreamObserverPanicDoesNotAbortPoolClose is the inversion of
+// _repro/zz_repro_conn_stranded_test.go's
+// TestRepro_C1b_PanickingStreamObserverAbortsPoolClose, the second face of F-conn-1:
+// hostConnPool.Close closes its connections in a loop with no isolation, so an
+// observer panic on the first one left the rest open forever — live sockets with a
+// serve and a heartbeat goroutine each, in a pool nothing references any more.
+func TestPool_StreamObserverPanicDoesNotAbortPoolClose(t *testing.T) {
+	observer := &oneShotAbandonObserver{}
+	gate := newRequestGate()
+	harness := newFillHarnessOpts(t, 1, fillHarnessOpts{
+		recvHook: gate.hook,
+		tune: func(c *ClusterConfig) {
+			c.NumConns = 2
+			c.StreamObserver = observer
+		},
+	})
+	host := harness.hosts[0]
+	pool := harness.pool(t, host)
+
+	gate.arm(host.ConnectAddress().String())
+	inflight := harness.query(t.Context(), nil)
+	gate.awaitStarted(t, "the query to be parked at the server")
+
+	// Put the connection carrying the parked query first, so Close reaches it first.
+	pool.mu.Lock()
+	require.Len(t, pool.conns, 2)
+	if len(pool.conns[0].calls.snapshot()) == 0 {
+		pool.conns[0], pool.conns[1] = pool.conns[1], pool.conns[0]
+	}
+	conns := append([]*Conn(nil), pool.conns...)
+	pool.mu.Unlock()
+	require.NotEmpty(t, conns[0].calls.snapshot(), "the parked query must be in flight on the first connection")
+
+	observer.armed.Store(true)
+	// What closeAsync does: Close under a recoverGoroutine.
+	func() {
+		defer recoverGoroutine(harness.session.logger, "test.hostConnPool.Close", nil)
+		pool.Close()
+	}()
+	gate.releaseAll()
+	<-inflight
+
+	require.EqualValues(t, 1, observer.panics.Load(), "the panic site must have been reached exactly once")
+
+	time.Sleep(fillAbsenceWindow)
+	var open int
+	for _, c := range conns {
+		if !c.Closed() {
+			open++
+		}
+	}
+	if open > 0 {
+		t.Fatalf("%d of %d conns left open", open, len(conns))
+	}
+	for _, c := range conns {
+		require.Error(t, c.ctx.Err(), "every closed connection's teardown must have run")
 	}
 }

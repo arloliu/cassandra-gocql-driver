@@ -769,7 +769,15 @@ func (c *Conn) closeWithError(err error) {
 				hooks.closerAfterSend()
 			}
 		}
-		c.notifyStreamEnd(req, streamAbandoned)
+		// Isolated at this call site only: the statements after this loop are the
+		// connection's whole teardown — cancel, reader close, call clear and the
+		// error handler — and c.closed is already latched, so the recovering
+		// caller's re-entry returns at once and nothing else ever runs them. The
+		// other notifyStreamEnd call sites keep today's propagation: releaseStream
+		// reaches it from the synchronous query caller.
+		safely(c.logger, "Conn.closeWithError.notify", func() {
+			c.notifyStreamEnd(req, streamAbandoned)
+		})
 	}
 
 	if hooks := c.hooks(); hooks != nil && hooks.closerBeforeCancel != nil {

@@ -2084,3 +2084,230 @@ func TestBatchFastPathStmt(t *testing.T) {
 		})
 	}
 }
+
+// oneShotAbandonObserver panics from the first StreamAbandoned it sees after it was
+// armed, and counts every terminal notification it received, including that one.
+type oneShotAbandonObserver struct {
+	armed     atomic.Bool
+	abandoned atomic.Int32
+	panics    atomic.Int32
+}
+
+var (
+	_ StreamObserver        = (*oneShotAbandonObserver)(nil)
+	_ StreamObserverContext = (*oneShotAbandonObserver)(nil)
+)
+
+func (o *oneShotAbandonObserver) StreamContext(context.Context) StreamObserverContext { return o }
+func (o *oneShotAbandonObserver) StreamStarted(ObservedStream)                        {}
+func (o *oneShotAbandonObserver) StreamFinished(ObservedStream)                       {}
+
+func (o *oneShotAbandonObserver) StreamAbandoned(ObservedStream) {
+	o.abandoned.Add(1)
+	if o.armed.CompareAndSwap(true, false) {
+		o.panics.Add(1)
+		panic("test: StreamAbandoned panic injected by the application observer")
+	}
+}
+
+// requestSwallower answers post-startup requests by not answering them: while it is
+// armed the server reads the frame, records it and writes nothing, so the driver's
+// call stays outstanding and the server's receive loop keeps running. Parking in the
+// receive hook instead would hold the whole connection, so only one call could ever
+// be outstanding, and the parked responses would later be written to a socket the
+// test has deliberately killed — which the fixture server reports as a test failure.
+// It is pinned to one driver connection: the control connection talks to the same
+// fixture server, and swallowing its ring queries would both inflate the count this
+// test uses as a barrier and leave the control connection to time out mid-test.
+type requestSwallower struct {
+	// pinned is the server-side remote address of the connection to swallow for,
+	// which is that connection's local address on the driver's side.
+	pinned    atomic.Pointer[string]
+	armed     atomic.Bool
+	swallowed atomic.Int32
+}
+
+// pin binds the swallower to conn and nothing else.
+func (s *requestSwallower) pin(conn *Conn) {
+	addr := conn.r.(*connReader).conn.LocalAddr().String()
+	s.pinned.Store(&addr)
+}
+
+func (s *requestSwallower) hook(_ string, conn net.Conn, req *framer) bool {
+	if !s.armed.Load() {
+		return false
+	}
+	// Heartbeats are left to the server: they are this connection's own traffic, not
+	// the test's, and answering them keeps the count below an exact barrier.
+	if req.header.op == opOptions {
+		return false
+	}
+	if pinned := s.pinned.Load(); pinned == nil || *pinned != conn.RemoteAddr().String() {
+		return false
+	}
+	s.swallowed.Add(1)
+	return true
+}
+
+// killPooledConnWithOutstandingCalls leaves outstanding queries unanswered on the
+// pool's only connection and then breaks that connection's socket underneath the
+// driver, as a network reset would, so that the driver runs its own
+// closeWithError(err) path with those calls outstanding. arm runs immediately before
+// the kill. The swallower is disarmed afterwards, so the pool can refill.
+//
+// Returns:
+//   - *Conn: the connection that was killed
+//   - int32: how many calls were outstanding on it at the moment of the kill, which
+//     is how many terminal notifications the driver then owes
+func killPooledConnWithOutstandingCalls(t *testing.T, harness *fillHarness, swallower *requestSwallower, outstanding int, arm func()) (*Conn, int32) {
+	t.Helper()
+
+	pool := harness.pool(t, harness.hosts[0])
+	conn := harness.pickAnyConn(t, pool)
+
+	swallower.pin(conn)
+	swallower.armed.Store(true)
+	inflight := make([]<-chan error, 0, outstanding)
+	for i := 0; i < outstanding; i++ {
+		inflight = append(inflight, harness.query(t.Context(), nil))
+	}
+	// While the swallower is armed nothing is answered, so outstanding calls only
+	// accumulate; the count can exceed outstanding when a heartbeat is swallowed too.
+	//
+	// The server's own count is part of the barrier: a call is registered on the Conn
+	// before its frame is written, so waiting on registration alone can kill the
+	// socket with a write still in flight. That write then fails, and closeWithError
+	// runs on the query's own goroutine — which has no recovery, so the panic under
+	// test would take the test binary down instead of being recovered where
+	// production recovers it.
+	require.Eventually(t, func() bool {
+		return len(conn.calls.snapshot()) >= outstanding && int(swallower.swallowed.Load()) >= outstanding
+	}, fillEventBudget, time.Millisecond,
+		"all %d queries must have reached the server and be outstanding before the connection is killed", outstanding)
+	owed := int32(len(conn.calls.snapshot()))
+
+	arm()
+	// Break the socket without going through Conn.Close, so serve's read fails.
+	require.NoError(t, conn.r.(*connReader).conn.Close())
+	swallower.armed.Store(false)
+
+	// Not awaited: with the defect present the notification loop panics on the first
+	// call, so the others are never sent their error and only time out. Their fate is
+	// the observer's count, not a barrier this test can block on.
+	for _, result := range inflight {
+		go func(result <-chan error) { <-result }(result)
+	}
+
+	require.Eventually(t, conn.Closed, fillEventBudget, time.Millisecond,
+		"the killed connection must be marked closed")
+	return conn, owed
+}
+
+// awaitConnGoneFromPool waits until conn is no longer registered in pool.
+func awaitConnGoneFromPool(t *testing.T, pool *hostConnPool, conn *Conn) {
+	t.Helper()
+
+	deadline := time.Now().Add(fillEventBudget)
+	for {
+		pool.mu.RLock()
+		var registered bool
+		for _, c := range pool.conns {
+			if c == conn {
+				registered = true
+				break
+			}
+		}
+		pool.mu.RUnlock()
+		if !registered {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("conn still registered in pool after close")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestConn_StreamObserverPanicDoesNotStrandDeadConn is the inversion of
+// _repro/zz_repro_conn_stranded_test.go's
+// TestRepro_C1_PanickingStreamObserverStrandsDeadConn (F-conn-1). closeWithError
+// latched c.closed and then notified every in-flight call of streamAbandoned, with
+// c.cancel(), c.r.Close(), c.calls.clear() and errorHandler.HandleError all after that
+// loop. One observer panic skipped all of them, and the recovering caller's re-entry
+// returned at once because closed was already true: the corpse stayed the pool's only
+// member, the host stayed UP, nothing was scheduled, and every later query failed.
+func TestConn_StreamObserverPanicDoesNotStrandDeadConn(t *testing.T) {
+	newHarness := func(t *testing.T, observer *oneShotAbandonObserver, swallower *requestSwallower) *fillHarness {
+		t.Helper()
+		return newFillHarnessOpts(t, 1, fillHarnessOpts{
+			rawRespHook: swallower.hook,
+			tune:        func(c *ClusterConfig) { c.StreamObserver = observer },
+		})
+	}
+
+	t.Run("the dead connection is torn down and removed", func(t *testing.T) {
+		observer := &oneShotAbandonObserver{}
+		swallower := &requestSwallower{}
+		harness := newHarness(t, observer, swallower)
+		pool := harness.pool(t, harness.hosts[0])
+
+		conn, _ := killPooledConnWithOutstandingCalls(t, harness, swallower, 1, func() {
+			observer.armed.Store(true)
+		})
+		require.Eventually(t, func() bool { return observer.panics.Load() == 1 }, fillEventBudget, time.Millisecond,
+			"the panic site must have been reached exactly once")
+
+		awaitConnGoneFromPool(t, pool, conn)
+		require.Error(t, conn.ctx.Err(), "the connection context was never cancelled")
+		require.NoError(t, awaitQuery(t, harness.query(t.Context(), nil)),
+			"the pool must serve queries again once it has replaced the dead connection")
+	})
+
+	// Q7's stated purpose: every in-flight call still gets its terminal notification.
+	// Removal and cancellation do not establish that per-call obligation, so it is
+	// asserted on its own connection rather than after them.
+	t.Run("every outstanding call is still notified", func(t *testing.T) {
+		const parked = 4
+
+		observer := &oneShotAbandonObserver{}
+		swallower := &requestSwallower{}
+		harness := newHarness(t, observer, swallower)
+
+		_, owed := killPooledConnWithOutstandingCalls(t, harness, swallower, parked, func() {
+			observer.armed.Store(true)
+		})
+		require.Eventually(t, func() bool { return observer.panics.Load() == 1 }, fillEventBudget, time.Millisecond,
+			"the panic site must have been reached exactly once")
+
+		// c.closed is latched before the notification loop, so Closed() is not a
+		// barrier for the notifications themselves.
+		deadline := time.Now().Add(fillEventBudget)
+		for observer.abandoned.Load() < owed {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d of %d calls never notified", owed-observer.abandoned.Load(), owed)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+}
+
+// TestConn_DeadPooledConnIsReplaced is the non-panicking pooled baseline, promoted
+// from the repro's TestRepro_C1_Control: it shows the oracle above discriminates.
+func TestConn_DeadPooledConnIsReplaced(t *testing.T) {
+	observer := &oneShotAbandonObserver{}
+	swallower := &requestSwallower{}
+	harness := newFillHarnessOpts(t, 1, fillHarnessOpts{
+		rawRespHook: swallower.hook,
+		tune:        func(c *ClusterConfig) { c.StreamObserver = observer },
+	})
+	pool := harness.pool(t, harness.hosts[0])
+
+	conn, owed := killPooledConnWithOutstandingCalls(t, harness, swallower, 1, func() {})
+	require.Zero(t, observer.panics.Load(), "the baseline observer never panics")
+	require.Eventuallyf(t, func() bool { return observer.abandoned.Load() >= owed }, fillEventBudget, time.Millisecond,
+		"the notification path must have been reached for all %d outstanding calls", owed)
+
+	awaitConnGoneFromPool(t, pool, conn)
+	require.Error(t, conn.ctx.Err(), "the dead connection's context is cancelled")
+	require.NoError(t, awaitQuery(t, harness.query(t.Context(), nil)))
+}
