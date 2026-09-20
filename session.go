@@ -1498,6 +1498,14 @@ func (s *Session) outageRemove(id string) {
 //   - h: the ring object to remove
 func (s *Session) removeHost(h *HostInfo) {
 	s.logger.Warning("Removing host.", NewLogFieldIP("host_addr", h.ConnectAddress()), NewLogFieldString("host_id", h.HostID()))
+	// Armed before the policy call below and run outside hostPublishMu, because the
+	// inner func's own defer unwinds first. The pool removal is this function's
+	// obligation and nothing retries it: the ring entry is gone by then, so the
+	// object is in no later snapshot's previous set and the DOWN-host sweep, which
+	// walks the ring, never sees it either. A panicking policy.RemoveHost would
+	// otherwise leave a host that is out of the ring, still registered in the pool,
+	// still UP, and still handing out connections.
+	defer s.pool.removeHost(h)
 	func() {
 		// The unlock is deferred: the policy is application code, and a panic
 		// in it is recovered by the calling goroutine's recoverGoroutine, which
@@ -1509,7 +1517,6 @@ func (s *Session) removeHost(h *HostInfo) {
 		}
 		s.unpublishHostLocked(h)
 	}()
-	s.pool.removeHost(h)
 }
 
 // unpublishHostLocked retires h's publication record and removes it from the

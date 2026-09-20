@@ -33,6 +33,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -203,4 +204,79 @@ func debouncerWorkersSince(before map[string]string) []string {
 		started = append(started, id+": "+debouncerWorkerCreator.FindString(block))
 	}
 	return started
+}
+
+// removePanicPolicy panics once in RemoveHost, before delegating.
+type removePanicPolicy struct {
+	HostSelectionPolicy
+	armed  atomic.Bool
+	panics atomic.Int32
+}
+
+func (p *removePanicPolicy) RemoveHost(h *HostInfo) {
+	if p.armed.CompareAndSwap(true, false) {
+		p.panics.Add(1)
+		panic("test: policy RemoveHost panic")
+	}
+	p.HostSelectionPolicy.RemoveHost(h)
+}
+
+// TestSession_RemoveHostPolicyPanicStillRemovesThePool is the inversion of
+// _repro/zz_repro_round3_test.go's TestRepro_RemoveHostPolicyPanicStrandsPool (F-sess-1).
+//
+// removeHost took the host out of the ring, then called the application's RemoveHost,
+// then removed the pool. runRingRefresh's guard turns a policy panic into a failed round,
+// and no later round retries: the object is no longer in the ring, so it is in no
+// snapshot's previous set and the DOWN-host sweep, which walks the ring, never reaches
+// it. The departed host kept a registered pool that was still handing out a live
+// connection.
+func TestSession_RemoveHostPolicyPanicStillRemovesThePool(t *testing.T) {
+	const departingHostID = "dddddddd-0000-4000-8000-00000000beef"
+	const departingAddr = "127.0.0.2"
+
+	inner := RoundRobinHostPolicy()
+	policy := &removePanicPolicy{HostSelectionPolicy: inner}
+	var listener *stateListener
+	script, _, _, session := startLocalHostFixture(t, "", func(cluster *ClusterConfig, _ string) {
+		cluster.PoolConfig.HostSelectionPolicy = policy
+		listener = newStateListener(cluster)
+	})
+
+	script.setPeers([]peerRow{newPeerRow(departingHostID, departingAddr)})
+	require.NoError(t, session.refreshRing(), "adopt the peer")
+	select {
+	case <-listener.up:
+	case <-time.After(fillEventBudget):
+		t.Fatal("the peer never came up")
+	}
+	host, ok := session.ring.getHost(departingHostID)
+	require.True(t, ok, "the peer must be in the ring")
+	pool, ok := session.pool.getPoolFor(host)
+	require.True(t, ok, "the peer must have a pool")
+	require.Eventually(t, func() bool { return pool.Size() == 1 }, fillEventBudget, 5*time.Millisecond,
+		"the peer's pool must be filled before the removal")
+	departing := pool.Pick()
+	require.NotNil(t, departing, "the peer's pool must hand out a connection before the removal")
+
+	// The peer leaves the ring and the application's RemoveHost panics once.
+	policy.armed.Store(true)
+	script.setPeers(nil)
+	err := session.refreshRing()
+	require.Error(t, err, "the panicking round must still be reported as failed")
+	require.EqualValues(t, 1, policy.panics.Load(), "the policy panic was not reached")
+
+	_, inRing := session.ring.getHost(departingHostID)
+	require.False(t, inRing, "the host left the ring")
+	if _, registered := session.pool.getPoolByHostID(departingHostID); registered {
+		t.Fatal("pool still registered after the panicking round")
+	}
+
+	// The physical close is asynchronous — removeHostPool schedules it — so this
+	// waits for evidence rather than reading the flag straight after unregistration.
+	//
+	// The connection itself is the oracle, not pool.Pick(): Pick stops handing out
+	// connections as soon as the pool is marked closed, which is before the loop that
+	// closes them, so a teardown that never closed anything would satisfy it.
+	require.Eventually(t, departing.Closed, fillEventBudget, 5*time.Millisecond,
+		"the removed pool's connection must be closed")
 }
