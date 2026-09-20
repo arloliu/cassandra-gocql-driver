@@ -64,10 +64,17 @@ func (r *hostPoolHostPolicy) SetHosts(hosts []*gocql.HostInfo) {
 		hostMap[ip] = host
 	}
 
+	// The pool is the application's and may panic. The unlock is deferred rather
+	// than the call moved out: the session publishes through AddHost, RemoveHost
+	// and SetHosts concurrently, and Pick reads the pool and hostMap under one
+	// read lock, so either write outside the section loses an update the adapter
+	// would never recompute. The panic itself is left to propagate: what this
+	// adapter owes is its mutex and its ordering, not the pool's success.
 	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.hp.SetHosts(peers)
 	r.hostMap = hostMap
-	r.mu.Unlock()
 }
 
 func (r *hostPoolHostPolicy) AddHost(host *gocql.HostInfo) {
@@ -80,15 +87,24 @@ func (r *hostPoolHostPolicy) AddHost(host *gocql.HostInfo) {
 	if h, ok := r.hostMap[ip]; ok && h != nil {
 		return
 	}
-	// otherwise, add the host to the map
-	r.hostMap[ip] = host
-	// and construct a new peer list to give to the HostPool
-	hosts := make([]string, 0, len(r.hostMap))
+	// otherwise, construct the prospective peer list
+	hosts := make([]string, 0, len(r.hostMap)+1)
 	for addr := range r.hostMap {
 		hosts = append(hosts, addr)
 	}
+	if _, ok := r.hostMap[ip]; !ok {
+		// The early return above lets a nil-valued entry through, and that entry is
+		// already in the loop: appending unconditionally would hand the pool the
+		// same address twice.
+		hosts = append(hosts, ip)
+	}
 
 	r.hp.SetHosts(hosts)
+
+	// and record the host only once the pool has accepted it. Recording first
+	// would make the early return above swallow every later attempt, so a panic
+	// here would leave the host recorded, unpublished and never selectable.
+	r.hostMap[ip] = host
 }
 
 func (r *hostPoolHostPolicy) RemoveHost(host *gocql.HostInfo) {
