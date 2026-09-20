@@ -229,6 +229,13 @@ type connTestHooks struct {
 	// and before the connection context is cancelled.
 	closerBeforeCancel func()
 
+	// readerBeforeLoadAndDelete runs on the receive side after it has observed the
+	// connection as open and before it claims the call for a stream. Parking here is
+	// what lets a test place a caller's cancellation, and a closer's snapshot,
+	// between the two. stream identifies the response, so a test can ignore the
+	// connection-setup traffic that runs through the same path.
+	readerBeforeLoadAndDelete func(stream int)
+
 	// onFramerRelease counts response framers returned to the pool by a drain.
 	onFramerRelease func()
 
@@ -1113,6 +1120,9 @@ func (c *Conn) processFrame(ctx context.Context, r io.Reader) error {
 		return ErrConnectionClosed
 	}
 	c.mu.Unlock()
+	if hooks := c.hooks(); hooks != nil && hooks.readerBeforeLoadAndDelete != nil {
+		hooks.readerBeforeLoadAndDelete(head.stream)
+	}
 	call, ok := c.calls.loadAndDelete(head.stream)
 	if call == nil || !ok {
 		c.logger.Warning("Received response for stream which has no handler.", NewLogFieldString("header", head.String()))
@@ -2021,17 +2031,22 @@ func (c *Conn) execInternal(ctx context.Context, req frameBuilder, tracer Tracer
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()))
 		return nil, ErrTimeoutNoResponse
 	case <-ctxDone:
+		// Abandon first, log second, as the timeout arm above already does. The
+		// logger is the application's: a panic between the two leaves the call
+		// registered with its timeout channel open, which is a send the closer can
+		// block on for good.
+		c.abandonCall(call)
 		c.logger.Debug("Request failed because context elapsed out on connection.",
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()),
 			NewLogFieldError("ctx_err", ctx.Err()))
-		c.abandonCall(call)
 		// Returned unwrapped: query_executor classifies context errors by equality,
 		// so wrapping one turns a caller giving up into a host failure.
 		return nil, ctx.Err()
 	case <-c.ctx.Done():
+		// Abandon first, log second: see the arm above.
+		c.abandonCall(call)
 		c.logger.Debug("Request failed because connection closed.",
 			NewLogFieldString("host_id", c.host.HostID()), NewLogFieldIP("addr", c.host.ConnectAddress()))
-		c.abandonCall(call)
 		return nil, ErrConnectionClosed
 	}
 }

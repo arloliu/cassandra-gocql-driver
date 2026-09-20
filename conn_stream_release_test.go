@@ -626,3 +626,260 @@ func TestConn_EndCallOnResponseJudgesTheValueNotTheConnection(t *testing.T) {
 		require.Equal(t, int64(0), rec.finished.Load())
 	})
 }
+
+// debugOncePanicLogger panics on the first Debug line whose message matches, and
+// works afterwards. It stands in for an application logger that fails once on one of
+// execInternal's cancellation arms.
+type debugOncePanicLogger struct {
+	StructuredLogger
+	match  string
+	armed  atomic.Bool
+	panics atomic.Int32
+}
+
+func (l *debugOncePanicLogger) Debug(msg string, fields ...LogField) {
+	if msg == l.match && l.armed.CompareAndSwap(true, false) {
+		l.panics.Add(1)
+		panic("test: logger panic on a cancellation arm")
+	}
+	l.StructuredLogger.Debug(msg, fields...)
+}
+
+// fconn3Schedule holds the barriers the F-conn-3 race is built from.
+type fconn3Schedule struct {
+	target        atomic.Int32
+	readerParked  chan struct{}
+	readerRelease chan struct{}
+	delivered     chan struct{}
+	closerArmed   atomic.Bool
+	closerParked  chan struct{}
+	closerRelease chan struct{}
+}
+
+func newFconn3Schedule() *fconn3Schedule {
+	s := &fconn3Schedule{
+		readerParked:  make(chan struct{}, 1),
+		readerRelease: make(chan struct{}),
+		delivered:     make(chan struct{}, 1),
+		closerParked:  make(chan struct{}, 1),
+		closerRelease: make(chan struct{}),
+	}
+	s.target.Store(-1)
+	return s
+}
+
+func (s *fconn3Schedule) hooks() *connTestHooks {
+	signal := func(ch chan struct{}) {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	return &connTestHooks{
+		// Once the fix has closed call.timeout the receive side may legally take
+		// the abandonment arm instead, never reach afterDeliver, and leave the test
+		// waiting on a hook that will not fire. Forcing delivery removes that.
+		forceDeliverArm: true,
+		readerBeforeLoadAndDelete: func(stream int) {
+			if int32(stream) != s.target.Load() {
+				return
+			}
+			signal(s.readerParked)
+			<-s.readerRelease
+		},
+		afterDeliver: func(op frameOp) {
+			if op != opResult {
+				return // connection setup uses this path too
+			}
+			signal(s.delivered)
+		},
+		closerAfterSnapshot: func() {
+			if !s.closerArmed.CompareAndSwap(true, false) {
+				return // the harness's own teardown closes connections too
+			}
+			signal(s.closerParked)
+			<-s.closerRelease
+		},
+	}
+}
+
+func (s *fconn3Schedule) await(t *testing.T, ch chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(fillEventBudget):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// TestConn_CancellationArmAbandonsBeforeLogging covers F-conn-3. Two of
+// execInternal's three cancellation arms logged through the application's logger
+// before calling abandonCall, where the timeout arm already did the opposite. A panic
+// between the two leaves the call registered with call.timeout open, and that is what
+// a closer's send blocks on for good: the reader fills the call's one-slot resp
+// buffer, the closer then reaches its own send with the buffer full and the timeout
+// channel never to be closed, and drainAbandoned cannot help because it gates on
+// call.timeout. The closer's select has no context arm, so the connection's teardown
+// never finishes: no socket close, no HandleError.
+func TestConn_CancellationArmAbandonsBeforeLogging(t *testing.T) {
+	t.Run("the caller's context arm", func(t *testing.T) {
+		testCancellationArmAbandons(t, "Request failed because context elapsed out on connection.", false)
+	})
+	t.Run("the connection's context arm", func(t *testing.T) {
+		testCancellationArmAbandons(t, "Request failed because connection closed.", true)
+	})
+
+	// A cheaper oracle for the same reorder, without the race: after a panicking
+	// logger on a cancellation arm, the stream id must come back.
+	t.Run("the stream id still comes back", func(t *testing.T) {
+		testCancellationArmReleasesTheStream(t)
+	})
+}
+
+func testCancellationArmAbandons(t *testing.T, logLine string, useConnCtx bool) {
+	schedule := newFconn3Schedule()
+	logger := &debugOncePanicLogger{StructuredLogger: newTestLogger(LogLevelDebug), match: logLine}
+
+	gate := newAbandonGate()
+	h := newFillHarnessOpts(t, 1, fillHarnessOpts{
+		recvHook: gate.hook,
+		hooks:    schedule.hooks(),
+		tune: func(cfg *ClusterConfig) {
+			cfg.NumConns = 1
+			cfg.Logger = logger
+		},
+	})
+	conn := h.pickAnyConn(t, h.pool(t, h.hosts[0]))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	queryDone := make(chan struct{})
+	go func() {
+		defer close(queryDone)
+		// The panic is the defect's mechanism; production recovers it one frame up,
+		// in the query executor's own goroutine.
+		defer func() { _ = recover() }()
+		_ = h.session.Query("void").WithContext(ctx).Exec()
+	}()
+
+	// The request is parked at the server: the call is registered, so its stream is
+	// the one the receive side will claim.
+	gate.awaitParked(t, 0)
+	calls := conn.calls.snapshot()
+	require.Len(t, calls, 1, "exactly one call must be outstanding")
+	call := calls[0]
+	schedule.target.Store(int32(call.streamID))
+
+	// 1. The response is released and the receive side parks before it claims the
+	//    call, with the connection still observed as open.
+	gate.release <- struct{}{}
+	schedule.await(t, schedule.readerParked, "the receive side to park before it claims the call")
+
+	// 2. The caller gives up and its logger panics before abandonCall would run.
+	logger.armed.Store(true)
+	if useConnCtx {
+		conn.cancel()
+	} else {
+		cancel()
+	}
+	schedule.await(t, queryDone, "the caller to leave its cancellation arm")
+	require.EqualValues(t, 1, logger.panics.Load(), "the cancellation arm's log must have panicked exactly once")
+
+	// 3. A closer latches closed and snapshots the call, which is still registered.
+	schedule.closerArmed.Store(true)
+	closerDone := make(chan struct{})
+	go func() {
+		defer close(closerDone)
+		conn.closeWithError(errFillTestConnClosed)
+	}()
+	schedule.await(t, schedule.closerParked, "the closer to snapshot the outstanding call")
+
+	// 4. The receive side takes the call and fills its one-slot buffer.
+	close(schedule.readerRelease)
+	schedule.await(t, schedule.delivered, "the receive side to finish delivering")
+
+	// 5. The closer's send now finds the buffer full and the timeout channel open.
+	close(schedule.closerRelease)
+	select {
+	case <-closerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closer still blocked after 2s")
+	}
+	require.Error(t, conn.ctx.Err(), "the teardown must have reached the connection's cancel")
+}
+
+func testCancellationArmReleasesTheStream(t *testing.T) {
+	logger := &debugOncePanicLogger{
+		StructuredLogger: newTestLogger(LogLevelDebug),
+		match:            "Request failed because context elapsed out on connection.",
+	}
+	delivered := make(chan struct{}, 1)
+	hooks := &connTestHooks{
+		forceDeliverArm: true,
+		afterDeliver: func(op frameOp) {
+			if op != opResult {
+				return
+			}
+			select {
+			case delivered <- struct{}{}:
+			default:
+			}
+		},
+	}
+
+	gate := newAbandonGate()
+	h := newFillHarnessOpts(t, 1, fillHarnessOpts{
+		recvHook: gate.hook,
+		hooks:    hooks,
+		tune: func(cfg *ClusterConfig) {
+			cfg.NumConns = 1
+			cfg.Logger = logger
+		},
+	})
+	conn := h.pickAnyConn(t, h.pool(t, h.hosts[0]))
+	before := conn.streams.Available()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	queryDone := make(chan struct{})
+	go func() {
+		defer close(queryDone)
+		defer func() { _ = recover() }()
+		_ = h.session.Query("void").WithContext(ctx).Exec()
+	}()
+
+	gate.awaitParked(t, 0)
+	logger.armed.Store(true)
+	cancel()
+	select {
+	case <-queryDone:
+	case <-time.After(fillEventBudget):
+		t.Fatal("the caller never left its cancellation arm")
+	}
+	require.EqualValues(t, 1, logger.panics.Load(), "the cancellation arm's log must have panicked exactly once")
+
+	// Cancellation alone deliberately leaves the id reserved: abandonCall closes the
+	// timeout channel, and an id comes back only when a real response is drained. The
+	// response is therefore delivered and its drain awaited before the assertion.
+	gate.release <- struct{}{}
+	select {
+	case <-delivered:
+	case <-time.After(fillEventBudget):
+		t.Fatal("the response was never delivered")
+	}
+
+	deadline := time.Now().Add(fillEventBudget)
+	for {
+		leaked := before - conn.streams.Available()
+		if leaked == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d stream id leaked, want 0", leaked)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
