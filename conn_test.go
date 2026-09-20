@@ -2311,3 +2311,127 @@ func TestConn_DeadPooledConnIsReplaced(t *testing.T) {
 	require.Error(t, conn.ctx.Err(), "the dead connection's context is cancelled")
 	require.NoError(t, awaitQuery(t, harness.query(t.Context(), nil)))
 }
+
+// panicOnCloseTransport is the net.Conn a custom HostDialer supplied, whose Close
+// panics once armed.
+type panicOnCloseTransport struct {
+	net.Conn
+	dialer *panicOnCloseDialer
+}
+
+func (c *panicOnCloseTransport) Close() error {
+	if c.dialer.armed.CompareAndSwap(true, false) {
+		c.dialer.panics.Add(1)
+		panic("test: the supplied transport panicked in Close")
+	}
+	return c.Conn.Close()
+}
+
+// panicOnCloseDialer wraps every transport it hands out so that exactly one Close
+// panics, once armed.
+type panicOnCloseDialer struct {
+	inner  HostDialer
+	armed  atomic.Bool
+	panics atomic.Int32
+}
+
+func (d *panicOnCloseDialer) DialHost(ctx context.Context, host *HostInfo) (*DialedHost, error) {
+	dialed, err := d.inner.DialHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	dialed.Conn = &panicOnCloseTransport{Conn: dialed.Conn, dialer: d}
+	return dialed, nil
+}
+
+// newPanicOnCloseHarness returns a harness whose transports come from dialer.
+func newPanicOnCloseHarness(t *testing.T, dialer *panicOnCloseDialer) *fillHarness {
+	t.Helper()
+
+	return newFillHarnessOpts(t, 1, fillHarnessOpts{
+		tune: func(c *ClusterConfig) {
+			dialer.inner = &defaultHostDialer{dialer: &net.Dialer{Timeout: 5 * time.Second}, tlsConfig: nil}
+			c.HostDialer = dialer
+		},
+	})
+}
+
+// closeTolerantOfPanic closes conn and absorbs a panic out of Conn.Close. Whether the
+// transport's panic reaches the caller is not what these sub-tests are about: without
+// the fix it does, and the assertions that follow are about what the driver failed to
+// do before it got there.
+func closeTolerantOfPanic(t *testing.T, conn *Conn) {
+	t.Helper()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Logf("Conn.Close propagated the transport panic: %v", r)
+		}
+	}()
+	conn.Close()
+}
+
+// TestConn_TransportClosePanicStillReportsTheError covers N15. closeWithError read
+// cerr from c.r.Close(), which reaches the net.Conn a custom HostDialer supplied. A
+// panic there skipped c.calls.clear() and both errorHandler.HandleError arms, and
+// c.closed was already latched, so the recovering caller's re-entry returned at once:
+// F-conn-1's end state, through a callback that fix does not cover.
+//
+// Both sub-tests use Conn.Close(), the nil-error arm, which is the harder one: there
+// HandleError is reached only when the transport close reported an error, so merely
+// swallowing the panic would leave the connection registered.
+func TestConn_TransportClosePanicStillReportsTheError(t *testing.T) {
+	t.Run("the dead connection is still removed from its pool", func(t *testing.T) {
+		dialer := &panicOnCloseDialer{}
+		harness := newPanicOnCloseHarness(t, dialer)
+		pool := harness.pool(t, harness.hosts[0])
+		conn := harness.pickAnyConn(t, pool)
+
+		dialer.armed.Store(true)
+		closeTolerantOfPanic(t, conn)
+		require.EqualValues(t, 1, dialer.panics.Load(), "the transport must have panicked exactly once")
+
+		deadline := time.Now().Add(fillEventBudget)
+		for {
+			pool.mu.RLock()
+			var registered bool
+			for _, c := range pool.conns {
+				if c == conn {
+					registered = true
+					break
+				}
+			}
+			pool.mu.RUnlock()
+			if !registered {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("HandleError not called; conn still in pool")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+
+	t.Run("the error handler receives the recovered panic", func(t *testing.T) {
+		dialer := &panicOnCloseDialer{}
+		harness := newPanicOnCloseHarness(t, dialer)
+
+		reported := make(chan error, 4)
+		cfg := *harness.session.connCfg
+		conn, err := harness.session.dial(harness.session.ctx, harness.hosts[0], &cfg,
+			connErrorHandlerFn(func(_ *Conn, err error, _ bool) { reported <- err }))
+		require.NoError(t, err)
+
+		dialer.armed.Store(true)
+		closeTolerantOfPanic(t, conn)
+		require.EqualValues(t, 1, dialer.panics.Load(), "the transport must have panicked exactly once")
+
+		select {
+		case err := <-reported:
+			require.ErrorContains(t, err, "the supplied transport panicked in Close",
+				"the panic must be reported as the close error, not swallowed")
+		case <-time.After(fillEventBudget):
+			t.Fatal("HandleError not called; the panic was swallowed")
+		}
+	})
+}

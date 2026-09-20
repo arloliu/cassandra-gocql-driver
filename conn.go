@@ -786,7 +786,34 @@ func (c *Conn) closeWithError(err error) {
 
 	// if error was nil then unblock the quit channel
 	c.cancel()
-	cerr := c.r.Close()
+
+	// The transport is the application's when a custom HostDialer supplied it, and
+	// its Close can panic. Everything below — the call clear and both HandleError
+	// arms — would be skipped, and c.closed is already latched, so the recovering
+	// caller's re-entry returns at once.
+	//
+	// safely is the wrong tool here. On the nil-error arm, which is an ordinary
+	// Conn.Close, HandleError is reached only when cerr != nil, so swallowing the
+	// panic would leave cerr nil and the connection registered: the defect, with the
+	// panic hidden. The panic becomes the error instead.
+	//
+	// The recover is inline rather than recoverGoroutine because recover() only
+	// works when called directly by the deferred function, and the teardown has to
+	// assign cerr.
+	var cerr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				handleRecoveredPanic(c.logger, "Conn.closeWithError.transportClose", r, func(panicErr error) {
+					if cerr == nil {
+						cerr = panicErr
+					}
+				})
+			}
+		}()
+		cerr = c.r.Close()
+	}()
+
 	if err != nil && c.calls != nil {
 		c.calls.clear()
 	}
