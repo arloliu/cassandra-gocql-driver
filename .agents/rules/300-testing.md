@@ -284,14 +284,7 @@ from one side alone proves nothing about which side introduced it.
 
 | Test | Rate | Measured | Mechanism |
 |---|---|---|---|
-| `TestReconnectSkipsFilteredHosts` | 1/20 under `-race` | 2026-09-07 | the opening `refreshRing()`'s async fill can land `handleNodeConnected` after the test's `setState(NodeDown)`, so the peer is UP again when the sweep runs |
 | `TestCAS` (integration, `cassandra` lane) | seen once in four runs | 2026-09-08 | CQL timestamps are millisecond-resolution; when the two `TOTIMESTAMP(NOW())` calls land in the same millisecond the LWT applies and the "not applied" assertion trips |
-
-`TestReconnectSkipsFilteredHosts` scanned **0/20 under `-race` on 2026-09-14**.
-That is consistent with the 2026-09-07 rate, not evidence it is fixed: for a 5%
-flake in independent trials, 0 failures in 20 runs happens **35.8%** of the time
-(0.95²⁰). Do not remove it from this table on that basis — a scan large enough
-to distinguish "fixed" from "5%" is the evidence that would.
 
 `TestCAS` is **not idempotent within a process**: `-count=N` fails from the
 second iteration on rows the first left behind, so repeated runs are not a way
@@ -402,6 +395,23 @@ error: a short read mid-frame is a framing bug, not a disconnect.
 
 Any test that closes a session mid-request was exposed to this in proportion to
 how often it lost that race.
+
+`TestReconnectSkipsFilteredHosts` was a **fixture** defect too, and its old row here named only half of it.
+`refreshRing()` returns before the peer's initial fill has announced itself:
+`handleNodeConnected` runs on a goroutine of its own,
+and under `hostPublishMu` it checks that its pool is registered and then sets UP.
+The test built its "DOWN with no pool" state with a bare `pool.removeHost` and `setState(NodeDown)`,
+neither of which takes that mutex,
+so both could land between the check and the UP and leave the peer UP with no pool.
+The second sweep then skipped it: "an accepted host must still be admitted by the reconnect tick", at 0.00s.
+The two lines now run inside one `withOwnedHost` section, which is how `markHostDownFromPool` does the same transition.
+Measured with a prebuilt `-race` binary, 600 single-test processes 16 at a time:
+**1/600 before, 0/600 after**, minutes apart (2/600 and 6/600 at `673b49b` and `82befed` on the same day).
+A rate that low cannot tell "fixed" from "rare", so the proof is a forced interleaving instead:
+a logger parked at the handler's `"Pool connected to node."` Debug call, which sits between the check and the UP,
+fails the original lines every time and passes the locked ones.
+It is kept under `tmp/correctness-review-2026-09-18/_repro/`, not as a package test,
+because it duplicates the fixture lines and would stay green if the real fixture were reverted.
 
 ## Test Patterns
 **Table-Driven** — Use ONLY for multiple cases:

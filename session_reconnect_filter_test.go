@@ -66,8 +66,18 @@ func TestReconnectSkipsFilteredHosts(t *testing.T) {
 
 	// A host the filter now rejects, sitting DOWN in the ring with no pool: exactly
 	// the state the reconnect tick exists to act on.
-	session.pool.removeHost(peer)
-	peer.setState(NodeDown)
+	//
+	// The removal and the DOWN are one hostPublishMu section, as they are in markHostDownFromPool.
+	// refreshRing returns before the peer's initial fill has announced itself:
+	// handleNodeConnected runs on a goroutine of its own,
+	// and it checks for the pool and then sets UP under this mutex.
+	// Done outside it, both lines could land between the check and the UP,
+	// leaving the peer UP with no pool, so the second sweep below would skip it.
+	require.True(t, session.withOwnedHost(peer, func() bool {
+		session.pool.removeHost(peer)
+		peer.setState(NodeDown)
+		return true
+	}), "the ring must still own the peer")
 	rejected := peerHostID
 	filter.reject.Store(&rejected)
 
