@@ -941,15 +941,28 @@ func refreshSchemas(session *Session) error {
 // the refreshed schema is published before the policy and the listeners are told,
 // so the next round may see nothing left to announce.
 //
+// It is also the only writer of the session's schema debt:
+// a failed round records that a refresh is owed, and the host scheduler serves the debt,
+// because nothing else would ever request the round a failure consumed.
+// The round is marked running before the deferred function is armed,
+// and its outcome is recorded as soon as the round is classified,
+// before anything that can run application code:
+// formatting a panic value calls its methods, and the recovery handler and the reports call the logger.
+//
 // Returns:
 //   - error: refreshSchemas's error, or the recovered panic as an error, after logging it
 func (s *Session) runSchemaRefresh() (err error) {
+	s.schemaDebt.begin()
 	defer func() {
-		if r := recover(); r != nil {
+		r := recover()
+		// Classified by comparison only, and recorded before any user code below:
+		// recording before recover would record a panicking round as a success.
+		s.schemaDebt.finish(r != nil || err != nil)
+		if r != nil {
+			err = fmt.Errorf("gocql: schema refresh panicked: %v", r)
 			// The shared handler logs with the original stack and has its own
 			// outermost barrier, so it cannot propagate.
 			handleRecoveredPanic(s.logger, "Session.runSchemaRefresh", r, nil)
-			err = fmt.Errorf("gocql: schema refresh panicked: %v", r)
 		}
 		// Reporting the outcome calls user code twice, inside the handler that just produced err.
 		// handleRecoveredPanic's barrier covers only its own call, not the statements after it,

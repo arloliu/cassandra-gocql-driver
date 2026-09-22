@@ -157,6 +157,11 @@ type Session struct {
 	// already recorded.
 	outage outageState
 
+	// schemaDebt records whether a schema refresh is owed after a failed round.
+	// runSchemaRefresh is its only writer, and the host scheduler serves it.
+	// Its nudge channel is allocated in NewSession and never replaced.
+	schemaDebt schemaRefreshDebt
+
 	// Per-instance test hooks, invoked immediately after ring.owns returned true
 	// in handleHostDown / handleNodeConnected so tests can replace the ring entry
 	// inside the check-to-mutation window.
@@ -223,6 +228,9 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		outage: outageState{
 			downSet: make(map[string]struct{}),
 			nudge:   make(chan struct{}, 1),
+		},
+		schemaDebt: schemaRefreshDebt{
+			nudge: make(chan struct{}, 1),
 		},
 	}
 	if cfg.RegisteredTypes == nil {
@@ -535,8 +543,10 @@ func (s *Session) init() error {
 	}
 
 	// The scheduler always runs: the periodic ring refresh is its own safety net
-	// and is not something ReconnectInterval turns off. With ReconnectInterval at
-	// zero the worker serves that refresh and nothing else.
+	// and is not something ReconnectInterval turns off.
+	// With ReconnectInterval at zero the worker still serves that refresh
+	// and the schema refresh retry;
+	// only DOWN-host reconnection is off.
 	go s.reconnectDownedHosts(s.cfg.ReconnectInterval)
 
 	if s.pool.Size() == 0 {
@@ -597,6 +607,14 @@ const ringFullRefreshInterval = 5 * time.Minute
 // floor is still served on time.
 const ringRefreshRetryDelay = time.Second
 
+// schemaRetryFallbackCap caps the schema-retry phase's backoff when ReconnectInterval is not positive.
+//
+// The phase exists whatever ReconnectInterval says:
+// a zero interval hands the recovery of DOWN hosts to something outside the driver,
+// but nothing outside the driver can re-run a schema refresh.
+// With no positive interval to cap by, the cap is ReconnectInterval's documented default.
+const schemaRetryFallbackCap = 60 * time.Second
+
 // schedulerClock supplies the host scheduler with its notion of time.
 //
 // Tests replace it to drive deadlines without waiting on a wall clock, and to
@@ -646,11 +664,12 @@ func (realSchedulerClock) newTimer(d time.Duration) (<-chan time.Time, func()) {
 // Every field is worker local. Nothing else reads or writes them, so the loop
 // needs no lock of its own.
 //
-// The two phases are independent by construction (I3): each has its own
-// deadline, its own recovery boundary, and its own rule for advancing after a
-// failure. A panic out of one phase must never be able to stop or delay the
-// other, because the ring refresh is the session's safety net and the reconnect
-// sweep is the phase that calls application code.
+// The three phases are independent by construction (I3):
+// each has its own deadline, its own recovery boundary, and its own rule for advancing after a failure.
+// A panic out of one phase must never be able to stop or delay the others,
+// because the ring refresh is the session's safety net,
+// the schema retry is the only thing that repairs a failed schema refresh,
+// and the reconnect sweep is the phase that calls application code.
 type hostScheduler struct {
 	// session owns the ring, the pool and the refresh debouncer this loop drives.
 	session *Session
@@ -688,6 +707,26 @@ type hostScheduler struct {
 	// new outage - which resets the backoff and arms an absolute deadline from
 	// the outage's own start - from another host joining the one under way.
 	observedGen uint64
+
+	// schemaDeadline is when the schema-retry phase next requests a round.
+	// The zero value means the phase has no deadline: nothing is owed,
+	// or the phase is waiting for the outcome of a round that is running or that it requested.
+	schemaDeadline time.Time
+
+	// schemaBackoff is the delay the schema-retry phase last armed.
+	// It is reset to the base by a discharge and doubled towards the cap by each failure the phase observes.
+	schemaBackoff time.Duration
+
+	// schemaSeenGen is the schema debt's failGen as the phase last observed it.
+	schemaSeenGen uint64
+
+	// schemaSeenOkGen is the schema debt's okGen as the phase last observed it.
+	schemaSeenOkGen uint64
+
+	// requestSchemaRefresh is the schema-retry phase's only way to ask for a round.
+	// newHostScheduler sets it to the schema refresher's trigger;
+	// tests replace it to count the requests the phase makes.
+	requestSchemaRefresh func()
 }
 
 // newHostScheduler builds the scheduler the reconnect goroutine runs.
@@ -705,6 +744,9 @@ func (s *Session) newHostScheduler(intv time.Duration) *hostScheduler {
 		session:           s,
 		clock:             realSchedulerClock{},
 		reconnectInterval: intv,
+		// Never refreshNow: the scheduler must not wait on the schema flusher,
+		// whose round can reconnect the control connection synchronously.
+		requestSchemaRefresh: s.schemaDescriber.schemaRefresher.trigger,
 	}
 	w.fullRefreshDeadline = w.clock.now().Add(ringFullRefreshInterval)
 	return w
@@ -748,6 +790,10 @@ func (s *Session) reconnectDownedHosts(intv time.Duration) {
 // like any other, because the channel keeps no history and a receive is no
 // evidence of an unseen generation. A scheduler with no reconnect phase never
 // receives one, so it cannot swallow an announcement it would not act on.
+//
+// The schema debt's nudge is different:
+// the schema-retry phase exists for every ReconnectInterval, so its case is always armed.
+// Without it, a failure recorded while the loop sleeps towards the five-minute ring deadline would wait that long for its first retry.
 func (w *hostScheduler) run() {
 	if w.session.cfg.testSchedulerStarted != nil {
 		w.session.cfg.testSchedulerStarted(w.reconnectInterval)
@@ -760,6 +806,7 @@ func (w *hostScheduler) run() {
 	if w.reconnectEnabled() {
 		nudged = w.session.outage.nudge
 	}
+	schemaNudged := w.session.schemaDebt.nudge
 
 	for {
 		wait, armed := w.nextWait(w.clock.now())
@@ -777,6 +824,8 @@ func (w *hostScheduler) run() {
 			stop()
 			return
 		case <-nudged:
+			stop()
+		case <-schemaNudged:
 			stop()
 		case <-fired:
 			stop()
@@ -799,7 +848,7 @@ func (w *hostScheduler) run() {
 //   - bool: false when no phase is armed, in which case the delay is meaningless
 func (w *hostScheduler) nextWait(now time.Time) (time.Duration, bool) {
 	var earliest time.Time
-	for _, deadline := range []time.Time{w.reconnectDeadline, w.refreshWakeAt()} {
+	for _, deadline := range []time.Time{w.reconnectDeadline, w.refreshWakeAt(), w.schemaDeadline} {
 		if deadline.IsZero() {
 			continue
 		}
@@ -838,9 +887,12 @@ func (w *hostScheduler) refreshWakeAt() time.Time {
 // calls application code, while the reconnect sweep does both. Ordering it
 // after the sweep would make the safety net's liveness depend on the phase most
 // likely to fail.
+// The schema retry goes second for the same reason:
+// it neither dials nor calls application code other than the logger.
 func (w *hostScheduler) serve() {
 	now := w.clock.now()
 	w.serveRingRefresh(now)
+	w.serveSchemaRetry(now)
 	w.serveReconnect(now)
 }
 
@@ -872,6 +924,104 @@ func (w *hostScheduler) serveRingRefresh(now time.Time) {
 
 	w.session.ringRefresher.trigger()
 	delivered = true
+}
+
+// serveSchemaRetry requests a schema round while one is owed after a failure.
+//
+// It reads the schema debt as one snapshot and applies the first rule that matches:
+//  1. nothing is owed: the phase clears its deadline and backoff and takes the debt's generations;
+//  2. a round failed since the phase last looked: the phase steps its backoff and arms a deadline, requesting nothing yet;
+//  3. a round is running: the phase clears its deadline, because that round's outcome will be recorded;
+//  4. the deadline is due: the phase requests a round and clears the deadline, waiting for that round's outcome;
+//  5. otherwise nothing changes.
+//
+// The backoff is measured from the end of a failed round, never from the start of one,
+// so a round slower than the step never collects a queue of follow-ups.
+// The request goes through the refresher's trigger, which never waits:
+// a schema round can reconnect the control connection synchronously on the flusher's goroutine,
+// and the scheduler must not queue behind that.
+//
+// A panic before the phase has decided leaves a deadline one step out,
+// because an owed debt with no deadline and no round running would otherwise wait for an event nothing will produce.
+//
+// Parameters:
+//   - now: the round's reference time
+func (w *hostScheduler) serveSchemaRetry(now time.Time) {
+	decided := false
+	defer func() {
+		if !decided {
+			w.schemaDeadline = w.clock.now().Add(max(w.schemaBackoff, w.schemaRetryBase()))
+		}
+	}()
+	defer recoverGoroutine(w.session.logger, "Session.hostScheduler.schemaRetry", nil)
+
+	debt := w.session.schemaDebt.snapshot()
+	switch {
+	case !debt.owed:
+		w.schemaDeadline = time.Time{}
+		w.schemaBackoff = 0
+		w.schemaSeenGen = debt.failGen
+		w.schemaSeenOkGen = debt.okGen
+	case debt.failGen != w.schemaSeenGen:
+		w.stepSchemaBackoff(debt.okGen != w.schemaSeenOkGen)
+		w.schemaSeenGen = debt.failGen
+		w.schemaSeenOkGen = debt.okGen
+		w.schemaDeadline = now.Add(w.schemaBackoff)
+	case debt.running:
+		w.schemaDeadline = time.Time{}
+	case !w.schemaDeadline.IsZero() && !now.Before(w.schemaDeadline):
+		// Logged before the request and before the deadline is cleared,
+		// so a panicking logger leaves the due deadline for the floor above to replace.
+		w.session.logger.Debug("Retrying a failed schema refresh.",
+			NewLogFieldString("backoff", w.schemaBackoff.String()))
+		w.requestSchemaRefresh()
+		w.schemaDeadline = time.Time{}
+	}
+	decided = true
+}
+
+// stepSchemaBackoff moves the schema-retry phase to its next step after an observed failure.
+//
+// The step starts at the base after a discharge, observed or not, and doubles towards the cap otherwise.
+// The cap is applied by comparison, as advanceReconnect applies its own,
+// so a cap past half of time.Duration's range cannot overflow into a negative delay.
+//
+// Parameters:
+//   - discharged: whether a discharge happened since the phase last looked
+func (w *hostScheduler) stepSchemaBackoff(discharged bool) {
+	if w.schemaBackoff == 0 || discharged {
+		w.schemaBackoff = w.schemaRetryBase()
+		return
+	}
+	limit := w.schemaRetryCap()
+	if w.schemaBackoff > limit/2 {
+		w.schemaBackoff = limit
+	} else {
+		w.schemaBackoff *= 2
+	}
+}
+
+// schemaRetryCap is the longest step of the schema-retry phase.
+//
+// Returns:
+//   - time.Duration: ReconnectInterval when positive, else schemaRetryFallbackCap
+func (w *hostScheduler) schemaRetryCap() time.Duration {
+	if w.reconnectInterval > 0 {
+		return w.reconnectInterval
+	}
+	return schemaRetryFallbackCap
+}
+
+// schemaRetryBase is the first step of the schema-retry phase.
+//
+// It is strictly positive for every configuration.
+// It is deliberately not baseRetryInterval, which is zero exactly when the reconnect phase does not exist,
+// and a zero step would arm a deadline that is already due and spin the loop.
+//
+// Returns:
+//   - time.Duration: one second, or the cap when that is shorter
+func (w *hostScheduler) schemaRetryBase() time.Duration {
+	return min(time.Second, w.schemaRetryCap())
 }
 
 // baseRetryInterval is the first delay a new outage waits before its hosts are
@@ -1487,6 +1637,115 @@ func (s *Session) outageRemove(id string) {
 	defer s.outage.mu.Unlock()
 
 	delete(s.outage.downSet, id)
+}
+
+// schemaRefreshDebt records whether the session owes itself a schema refresh.
+//
+// A schema round that fails consumes the request that started it,
+// and nothing else asks for another one:
+// the schema refresher has no periodic request, unlike the ring refresher,
+// so a failure that no later schema event or control reconnect happens to follow would leave the schema stale,
+// or missing, for the rest of the session.
+// The debt is that missing request, kept where the host scheduler can serve it.
+//
+// It has exactly one writer, runSchemaRefresh, which runs only on the schema flusher's goroutine.
+// The scheduler reads it through snapshot and never writes it,
+// so an outcome recorded while the scheduler is deciding can never be lost to a correction.
+//
+// It carries no timestamp.
+// The scheduler arms its retry from its own clock when it observes a new failure,
+// so the writer and the scheduler never have to share a time base.
+//
+// mu is a leaf lock.
+// Nothing runs under it but field writes and one non-blocking send:
+// no application callback, no logging, no other lock.
+type schemaRefreshDebt struct {
+	mu sync.Mutex
+
+	// running is true while a round is between its start and its recorded outcome.
+	running bool
+
+	// owed is true when the last round to finish failed.
+	owed bool
+
+	// failGen counts failed rounds.
+	// It is never reset.
+	failGen uint64
+
+	// okGen counts discharges: rounds that succeeded while the debt was owed.
+	// It is never reset.
+	// It is what lets the scheduler tell a discharge it never saw,
+	// followed by a new failure, from nothing but more failures.
+	okGen uint64
+
+	// nudge carries at most one pending "a round failed" hint.
+	//
+	// Like outageState.nudge it is a hint and nothing more:
+	// the reader must re-read the debt every time it wakes.
+	// A nil channel, which a session not built by NewSession has, simply drops the hint.
+	nudge chan struct{}
+}
+
+// schemaDebtSnapshot is one consistent reading of a schemaRefreshDebt.
+//
+// It is taken in one lock acquisition.
+// Reading okGen separately could pair a later discharge with an earlier failure.
+type schemaDebtSnapshot struct {
+	running bool
+	owed    bool
+	failGen uint64
+	okGen   uint64
+}
+
+// begin marks a round as running.
+//
+// runSchemaRefresh calls it before it arms the deferred function that records the outcome,
+// so no exit path can skip the matching finish.
+func (d *schemaRefreshDebt) begin() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.running = true
+}
+
+// finish records the outcome of the round begin started.
+//
+// A failed round leaves the debt owed, advances failGen and nudges the scheduler.
+// A successful round discharges a debt that was owed, advancing okGen, and does nothing else.
+//
+// Parameters:
+//   - failed: whether the round returned an error or panicked
+func (d *schemaRefreshDebt) finish(failed bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.running = false
+	if failed {
+		d.owed = true
+		d.failGen++
+		// A non-blocking send on a buffered channel cannot block,
+		// which is what makes it safe under the lock.
+		select {
+		case d.nudge <- struct{}{}:
+		default:
+		}
+		return
+	}
+	if d.owed {
+		d.okGen++
+	}
+	d.owed = false
+}
+
+// snapshot reads the debt as one consistent value.
+//
+// Returns:
+//   - schemaDebtSnapshot: running, owed, failGen and okGen, read under one acquisition of mu
+func (d *schemaRefreshDebt) snapshot() schemaDebtSnapshot {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return schemaDebtSnapshot{running: d.running, owed: d.owed, failGen: d.failGen, okGen: d.okGen}
 }
 
 // removeHost takes h out of the ring, the outage ledger, the selection policy

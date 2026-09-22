@@ -252,6 +252,7 @@ func TestHostScheduler_NextWaitPicksEarliestArmedDeadline(t *testing.T) {
 		reconnect time.Time
 		refresh   time.Time
 		floor     time.Time
+		schema    time.Time
 		wantWait  time.Duration
 		wantArmed bool
 	}{
@@ -303,6 +304,27 @@ func TestHostScheduler_NextWaitPicksEarliestArmedDeadline(t *testing.T) {
 			floor:     now.Add(time.Second),
 			wantArmed: false,
 		},
+		{
+			name:      "only schema",
+			schema:    now.Add(3 * time.Second),
+			wantWait:  3 * time.Second,
+			wantArmed: true,
+		},
+		{
+			name:      "schema is earliest",
+			reconnect: now.Add(time.Minute),
+			refresh:   now.Add(2 * time.Minute),
+			schema:    now.Add(time.Second),
+			wantWait:  time.Second,
+			wantArmed: true,
+		},
+		{
+			name:      "a zero schema deadline takes no part",
+			reconnect: now.Add(time.Minute),
+			refresh:   now.Add(2 * time.Minute),
+			wantWait:  time.Minute,
+			wantArmed: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -311,6 +333,7 @@ func TestHostScheduler_NextWaitPicksEarliestArmedDeadline(t *testing.T) {
 				reconnectDeadline:   tc.reconnect,
 				fullRefreshDeadline: tc.refresh,
 				refreshRetryFloor:   tc.floor,
+				schemaDeadline:      tc.schema,
 			}
 
 			wait, armed := w.nextWait(now)

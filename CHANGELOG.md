@@ -64,6 +64,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A panic during session initialisation left a fully running session that nothing could close.**
   `NewSession` still panics; it now attempts the session's cleanup before propagating the panic.
 
+- **A schema refresh that failed was never retried.**
+  If the schema metadata could not be read —
+  for example because its queries timed out during session start-up on a large cluster —
+  the session kept the schema it had, or none, until a schema change event or a control-connection reconnect happened to request another refresh.
+  With no replica information, token-aware routing fell back to its fallback policy for the rest of the session.
+  A failed refresh is now retried in the background until one succeeds,
+  with a backoff that starts at one second (or at `ReconnectInterval`, if that is shorter)
+  and doubles up to `ReconnectInterval` (60 s when it is not positive).
+  Notifications that a failed round skipped are not made again.
+
 ### Changed
 
 - **A panicking application callback no longer propagates from seven places.**

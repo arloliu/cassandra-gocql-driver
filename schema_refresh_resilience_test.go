@@ -22,6 +22,7 @@
 package gocql
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -152,4 +153,136 @@ func schemaRefreshRound(t *testing.T, refresher *refreshDebouncer) error {
 		t.Fatalf("a requested schema refresh round did not resolve within %v", schemaRefreshRoundBudget)
 		return nil
 	}
+}
+
+// TestRunSchemaRefresh_RecordsTheOutcomeBeforeReporting pins the schema debt's writer:
+// runSchemaRefresh marks a round running before anything can observe it,
+// and records its outcome before any application code in its deferred function runs.
+//
+// Every observation is taken from inside a hook the round itself calls,
+// so the order is decided on the flusher's goroutine and not by a race against the test.
+// The panic is only the injection that reaches the recovery log and the panic value's methods;
+// the ordinary-error path through the production writer is pinned by the schema refresh retry tests.
+// The assertions do not stop the test, so a mutation that breaks several orderings reports each of them.
+func TestRunSchemaRefresh_RecordsTheOutcomeBeforeReporting(t *testing.T) {
+	var atHook, atLog, atDone debtProbe
+	logger := &errorObservingLogger{StructuredLogger: &defaultLogger{}}
+	session, refresher := newSchemaRefreshFixture(t, logger)
+	debt := &session.schemaDebt
+	logger.onError = func() { atLog.observe(debt) }
+
+	// Each injected panic fires in one round only: the hook takes it.
+	var panicWith atomic.Pointer[scriptedPanic]
+	session.cfg.testSchemaRefreshHook = func() {
+		atHook.observe(debt)
+		if p := panicWith.Swap(nil); p != nil {
+			panic(p.value)
+		}
+	}
+	session.cfg.testSchemaRefreshDone = func(error) { atDone.observe(debt) }
+
+	// 1. A failed round: running inside the round, owed before the recovery log and the done hook.
+	panicWith.Store(&scriptedPanic{value: "scripted panic from the schema refresh"})
+	assert.ErrorContains(t, schemaRefreshRound(t, refresher), "schema refresh panicked")
+	hook, log, done := atHook.take(), atLog.take(), atDone.take()
+	assert.True(t, hook.running, "testSchemaRefreshHook saw running == false")
+	assert.True(t, log.owed, "the recovery log saw owed == false")
+	assert.EqualValues(t, 1, log.failGen, "the recovery log saw failGen %d, want 1", log.failGen)
+	assert.True(t, done.owed, "testSchemaRefreshDone saw owed == false")
+	assert.EqualValues(t, 1, done.failGen, "testSchemaRefreshDone saw failGen %d, want 1", done.failGen)
+
+	// 2. A success while owed discharges the debt.
+	assert.NoError(t, schemaRefreshRound(t, refresher))
+	done = atDone.take()
+	assert.False(t, done.owed, "testSchemaRefreshDone saw owed == true after a success")
+	assert.False(t, done.running, "testSchemaRefreshDone saw running == true after a success")
+	assert.EqualValues(t, 1, done.okGen, "testSchemaRefreshDone saw okGen %d after the discharge, want 1", done.okGen)
+
+	// 3. okGen counts discharges, not successes.
+	assert.NoError(t, schemaRefreshRound(t, refresher))
+	done = atDone.take()
+	assert.EqualValues(t, 1, done.okGen, "a second success advanced okGen to %d, want 1", done.okGen)
+
+	// 4. Formatting the panic value runs its methods, which are application code too.
+	value := &debtStringer{debt: debt}
+	panicWith.Store(&scriptedPanic{value: value})
+	assert.ErrorContains(t, schemaRefreshRound(t, refresher), "schema refresh panicked")
+	if assert.NotNil(t, value.first, "the panic value's String was never called") {
+		assert.True(t, value.first.owed, "the panic value's String saw owed == false")
+		assert.EqualValues(t, 2, value.first.failGen, "the panic value's String saw failGen %d, want 2", value.first.failGen)
+		assert.False(t, value.first.running, "the panic value's String saw running == true")
+	}
+}
+
+// scriptedPanic carries the value a hook is to panic with.
+type scriptedPanic struct {
+	value any
+}
+
+// debtProbe keeps the last snapshot of a schema debt taken from inside a hook.
+//
+// The hooks run on the flusher's goroutine and the test reads the probe after the round resolves,
+// so the mutex is what makes the hand-over visible to the race detector.
+type debtProbe struct {
+	mu   sync.Mutex
+	last schemaDebtSnapshot
+}
+
+// observe snapshots the debt.
+//
+// Parameters:
+//   - debt: the debt to read
+func (p *debtProbe) observe(debt *schemaRefreshDebt) {
+	snap := debt.snapshot()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.last = snap
+}
+
+// take returns the last snapshot observed.
+//
+// Returns:
+//   - schemaDebtSnapshot: the snapshot, or the zero value if nothing was observed
+func (p *debtProbe) take() schemaDebtSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.last
+}
+
+// errorObservingLogger calls onError before every Error it forwards.
+//
+// handleRecoveredPanic reports through Error, so this is the recovery log's view of the round.
+type errorObservingLogger struct {
+	StructuredLogger
+	onError func()
+}
+
+// Error runs onError and forwards the call.
+func (l *errorObservingLogger) Error(msg string, fields ...LogField) {
+	if l.onError != nil {
+		l.onError()
+	}
+	l.StructuredLogger.Error(msg, fields...)
+}
+
+// debtStringer is a panic value whose String method snapshots the debt on its first call only.
+//
+// The round formats the value more than once;
+// the first call is the one that decides whether any of them ran before the record.
+type debtStringer struct {
+	debt  *schemaRefreshDebt
+	once  sync.Once
+	first *schemaDebtSnapshot
+}
+
+// String snapshots the debt the first time it is called.
+//
+// Returns:
+//   - string: a fixed description of the scripted panic
+func (v *debtStringer) String() string {
+	v.once.Do(func() {
+		snap := v.debt.snapshot()
+		v.first = &snap
+	})
+	return "scripted panic value that reads the schema debt"
 }
