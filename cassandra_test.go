@@ -462,6 +462,10 @@ func TestCAS(t *testing.T) {
 		t.Skip("lightweight transactions not supported. Please use Cassandra >= 2.0")
 	}
 
+	// The keyspace is created once per process, so -count=N would otherwise find the previous iteration's table.
+	if err := createTable(session, `DROP TABLE IF EXISTS gocql_test.cas_table`); err != nil {
+		t.Fatal("drop:", err)
+	}
 	if err := createTable(session, `CREATE TABLE gocql_test.cas_table (
 			title         varchar,
 			revid   	  timeuuid,
@@ -542,15 +546,24 @@ func TestCAS(t *testing.T) {
 
 	failBatch := session.Batch(LoggedBatch)
 	failBatch.Query("INSERT INTO cas_table (title, revid, last_modified) VALUES (?, ?, ?) IF NOT EXISTS", title, revid, modified)
-	if applied, _, err := successBatch.ExecCAS(&titleCAS, &revidCAS, &modifiedCAS); err != nil {
+	if applied, _, err := failBatch.ExecCAS(&titleCAS, &revidCAS, &modifiedCAS); err != nil {
 		t.Fatal("insert:", err)
 	} else if applied {
 		t.Fatalf("insert should have not been applied: title=%v revID=%v modified=%v", titleCAS, revidCAS, modifiedCAS)
 	}
 
+	// A fixed past timestamp, so the conditions below can never hold.
+	// With TOTIMESTAMP(NOW()) here the test raced the clock:
+	// timestamps have millisecond resolution,
+	// and the conditional batch often evaluated its own TOTIMESTAMP(NOW()) in the same millisecond, so it applied.
+	fooModified := time.Date(2015, 10, 15, 0, 0, 0, 0, time.UTC)
+	fooRevids := map[string]bool{
+		"2c3af400-73a4-11e5-9381-29463d90c3f0": true,
+		"3e4ad2f1-73a4-11e5-9381-29463d90c3f0": true,
+	}
 	insertBatch := session.Batch(LoggedBatch)
-	insertBatch.Query("INSERT INTO cas_table (title, revid, last_modified) VALUES ('_foo', 2c3af400-73a4-11e5-9381-29463d90c3f0, TOTIMESTAMP(NOW()))")
-	insertBatch.Query("INSERT INTO cas_table (title, revid, last_modified) VALUES ('_foo', 3e4ad2f1-73a4-11e5-9381-29463d90c3f0, TOTIMESTAMP(NOW()))")
+	insertBatch.Query("INSERT INTO cas_table (title, revid, last_modified) VALUES ('_foo', 2c3af400-73a4-11e5-9381-29463d90c3f0, '2015-10-15 00:00:00+0000')")
+	insertBatch.Query("INSERT INTO cas_table (title, revid, last_modified) VALUES ('_foo', 3e4ad2f1-73a4-11e5-9381-29463d90c3f0, '2015-10-15 00:00:00+0000')")
 	if err := insertBatch.Exec(); err != nil {
 		t.Fatal("insert:", err)
 	}
@@ -563,13 +576,27 @@ func TestCAS(t *testing.T) {
 	} else if applied {
 		t.Fatalf("insert should have not been applied: title=%v revID=%v modified=%v", titleCAS, revidCAS, modifiedCAS)
 	} else {
+		// Both rows come back, each with the value its condition was checked against.
+		seen := map[string]bool{}
+		checkFooRow := func() {
+			t.Helper()
+			if titleCAS != "_foo" || !fooRevids[revidCAS.String()] || !modifiedCAS.Equal(fooModified) {
+				t.Fatalf("unexpected row: title=%v revID=%v modified=%v", titleCAS, revidCAS, modifiedCAS)
+			}
+			seen[revidCAS.String()] = true
+		}
+		checkFooRow()
 		if scan := iter.Scan(&applied, &titleCAS, &revidCAS, &modifiedCAS); scan && applied {
 			t.Fatalf("insert should have been applied: title=%v revID=%v modified=%v", titleCAS, revidCAS, modifiedCAS)
 		} else if !scan {
 			t.Fatal("should have scanned another row")
 		}
+		checkFooRow()
 		if err := iter.Close(); err != nil {
 			t.Fatal("scan:", err)
+		}
+		if len(seen) != len(fooRevids) {
+			t.Fatalf("expected both _foo rows, got %v", seen)
 		}
 	}
 

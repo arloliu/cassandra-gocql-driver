@@ -282,13 +282,11 @@ make test-flake-scan FLAKE_RUN='TestFoo|TestBar' FLAKE_COUNT=20 FLAKE_RACE=race
 Comparing a branch against its base means scanning **both** the same way. A rate
 from one side alone proves nothing about which side introduced it.
 
+No test is listed at the moment.
+A new one goes in this table with its rate, the date it was measured, and its mechanism.
+
 | Test | Rate | Measured | Mechanism |
 |---|---|---|---|
-| `TestCAS` (integration, `cassandra` lane) | seen once in four runs | 2026-09-08 | CQL timestamps are millisecond-resolution; when the two `TOTIMESTAMP(NOW())` calls land in the same millisecond the LWT applies and the "not applied" assertion trips |
-
-`TestCAS` is **not idempotent within a process**: `-count=N` fails from the
-second iteration on rows the first left behind, so repeated runs are not a way
-to reproduce it.
 
 **A lone failure here does not establish a regression — and does not rule one
 out either.** A new defect can surface in exactly one listed test. Before
@@ -395,6 +393,19 @@ error: a short read mid-frame is a framing bug, not a disconnect.
 
 Any test that closes a session mid-request was exposed to this in proportion to
 how often it lost that race.
+
+`TestCAS` (the `cassandra` lane) was a **test** defect: it raced the wall clock.
+It inserted two rows with `last_modified = TOTIMESTAMP(NOW())` and then expected a batch conditioned on `IF last_modified=TOTIMESTAMP(NOW())` not to apply.
+Timestamps have millisecond resolution and the insert took about 0.6 ms on the local cluster,
+so the condition was often evaluated in the insert's millisecond, held, and the batch applied.
+The rows now carry a fixed 2015 timestamp, which no `NOW()` can equal,
+and the failed batch's returned rows are checked by identity and value.
+Measured with the full proto-5 `go test -tags "cassandra gocql_debug" ... -run '^TestCAS$' -count=1` command, 30 runs each:
+**16/30 before, 0/30 after**.
+The cause was shown by a differential, not only the rate: a 2 ms sleep between the insert and the conditional batch took the same binary from 16/50 to 0/50.
+The same change fixed two things found on the way.
+The `IF NOT EXISTS` failure case re-executed an earlier batch instead of the `failBatch` it had just built, so it hit the wrong row.
+And the test did not drop `cas_table`, so `-count=N` failed from the second iteration at `CREATE TABLE`; it passes at `-count=3` now.
 
 `TestReconnectSkipsFilteredHosts` was a **fixture** defect too, and its old row here named only half of it.
 `refreshRing()` returns before the peer's initial fill has announced itself:
