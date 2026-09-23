@@ -111,6 +111,10 @@ func (c *controlConn) heartBeat() {
 	// recovered panic left the control connection with no retry owner at all.
 	defer recoverGoroutine(c.session.logger, "controlConn.heartBeat", nil)
 
+	if c.session.cfg.testControlBeforeHeartbeatStart != nil {
+		c.session.cfg.testControlBeforeHeartbeatStart()
+	}
+
 	// If close() latched controlConnClosing before this goroutine started, the
 	// CAS fails and the heartbeat exits at once; the terminal state stands.
 	if !atomic.CompareAndSwapInt32(&c.state, controlConnStarting, controlConnStarted) {
@@ -719,6 +723,19 @@ func (c *controlConn) convictOnDialFailure(host *HostInfo, err error) {
 	}
 }
 
+// HandleError reconnects the control connection when the published one closes.
+//
+// An error that did not close conn is ignored.
+// So is the closure of any connection that is not the published control connection:
+// a connection not yet published belongs to the setup that dialled it,
+// which closes it and tries the next host, or reports the failure.
+// Before the first publish, a reconnect from here would race init's connect loop
+// and could publish a second connection that nothing closes.
+//
+// Parameters:
+//   - conn: the connection that reported the error
+//   - err: the error it reported
+//   - closed: whether the error closed conn
 func (c *controlConn) HandleError(conn *Conn, err error, closed bool) {
 	if !closed {
 		return
@@ -726,9 +743,19 @@ func (c *controlConn) HandleError(conn *Conn, err error, closed bool) {
 
 	oldConn := c.getConn()
 
-	// If connection has long gone, and not been attempted for awhile,
-	// it's possible to have oldConn as nil here (#1297).
+	// The snapshot is nil only before the first publish: publish never stores nil,
+	// and nothing else stores into c.conn after construction.
+	// closeWithError latches conn closed before it calls this,
+	// so a nil snapshot means conn was not the published connection when it closed:
+	// it is an init candidate, or one about to be published dead.
+	// The snapshot can be stale by the time the warning below returns,
+	// with another connection published meanwhile.
+	// Dropping the reconnect is still correct: conn was not the published connection when it closed,
+	// and replacing it is not this handler's job.
 	if oldConn != nil && oldConn.conn != conn {
+		if c.session.cfg.testControlHandleErrorDecision != nil {
+			c.session.cfg.testControlHandleErrorDecision(conn, false)
+		}
 		return
 	}
 
@@ -738,8 +765,8 @@ func (c *controlConn) HandleError(conn *Conn, err error, closed bool) {
 	// Close latches isClosing on entry, so no later call picks that work up. It also
 	// loses the reconnect below, which the heartbeat repairs.
 	//
-	// The missing closing() check is deliberate: reconnect checks it itself, and a
-	// second check here is F-ctrl-3's territory.
+	// The missing closing() check is deliberate: reconnect checks it itself.
+	// The check after the warning is the published-connection rule, not a shutdown check.
 	safely(c.session.logger, "controlConn.HandleError.log", func() {
 		c.session.logger.Warning("Control connection error.",
 			NewLogFieldIP("host_addr", conn.host.ConnectAddress()),
@@ -747,6 +774,17 @@ func (c *controlConn) HandleError(conn *Conn, err error, closed bool) {
 			NewLogFieldError("err", err))
 	})
 
+	// Nothing was published when conn closed: its setup owns it.
+	if oldConn == nil {
+		if c.session.cfg.testControlHandleErrorDecision != nil {
+			c.session.cfg.testControlHandleErrorDecision(conn, false)
+		}
+		return
+	}
+
+	if c.session.cfg.testControlHandleErrorDecision != nil {
+		c.session.cfg.testControlHandleErrorDecision(conn, true)
+	}
 	c.reconnect()
 }
 

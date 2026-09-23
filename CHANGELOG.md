@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and serves each address from the host admitted there last.
   Custom policies should key membership by `HostID()`, not by `ConnectAddress()` or `HostInfo.Equal`.
 
+### Fixed
+
+- **`NewSession` no longer opens a second control connection when a candidate fails during its setup.**
+  If a control connection candidate failed during its initial setup, before it became the control connection,
+  the driver could open a second control connection beside the one `NewSession` was setting up.
+  With two or more contact points, `NewSession` could succeed with an extra connection
+  that stayed open, registered for events, after `Session.Close`.
+  With one, `NewSession` could leave the extra connection open whether it succeeded or failed,
+  and an application that retried `NewSession` leaked one connection per failure.
+  Only the failure of the established control connection now starts a reconnect.
+  A candidate that fails is left to the connection attempt that made it.
+
 ## [2.7.4-otter] - 2026-09-22
 
 Patch release for a correctness review of v2.7.3-otter:

@@ -494,6 +494,17 @@ type ClusterConfig struct {
 	// (internal, for testing); nil in production.
 	testControlAfterSetupFailure func()
 
+	// testControlHandleErrorDecision is called by controlConn.HandleError
+	// on every path after the error was found to have closed conn,
+	// with whether it is about to reconnect (internal, for testing); nil in production.
+	// It must return promptly: the reconnect it reports runs after it returns.
+	testControlHandleErrorDecision func(conn *Conn, reconnect bool)
+
+	// testControlBeforeHeartbeatStart is called by controlConn.heartBeat
+	// before its Starting to Started CAS, so a test can hold the state at Starting
+	// (internal, for testing); nil in production.
+	testControlBeforeHeartbeatStart func()
+
 	// testSchedulerStarted is called by the host scheduler's goroutine before its
 	// first round, with the reconnect interval it was given, so a test can assert
 	// that the scheduler runs even when scheduled reconnects are disabled.
