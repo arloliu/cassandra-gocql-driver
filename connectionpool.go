@@ -336,7 +336,8 @@ func (p *policyConnPool) closeAsync(pool *hostConnPool, site string) {
 // The count and the policy's host set can still differ for a moment -
 // a host that reached UP but is not yet published to the policy,
 // a host joining or leaving between a Pick and this snapshot -
-// and two host IDs behind one connect address are one host to the policies but two pools here;
+// and hostpool.HostPoolHostPolicy serves a connect address from the host admitted there last,
+// so of two host IDs behind one address it can pick only one while both have pools here;
 // hostSelector bounds what such a mismatch can cost.
 //
 // Returns:

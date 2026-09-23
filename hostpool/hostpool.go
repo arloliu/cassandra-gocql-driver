@@ -19,6 +19,7 @@
 package hostpool
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/hailocab/go-hostpool"
@@ -39,6 +40,16 @@ import (
 //	cluster.PoolConfig.HostSelectionPolicy = HostPoolHostPolicy(
 //	    hostpool.NewEpsilonGreedy(nil, 0, &hostpool.LinearEpsilonValueCalculator{}),
 //	)
+//
+// The pool's host strings are connect addresses, while the policy tracks hosts by host_id.
+// When a second host takes an address, the address is served by the host admitted there last.
+// Every membership change resets the pool's statistics, as it always has.
+//
+// Parameters:
+//   - hp: the pool to select from; the policy replaces its hosts
+//
+// Returns:
+//   - *hostPoolHostPolicy: the host selection policy
 func HostPoolHostPolicy(hp hostpool.HostPool) *hostPoolHostPolicy {
 	return &hostPoolHostPolicy{hostMap: map[string]*gocql.HostInfo{}, hp: hp}
 }
@@ -46,7 +57,22 @@ func HostPoolHostPolicy(hp hostpool.HostPool) *hostPoolHostPolicy {
 type hostPoolHostPolicy struct {
 	hp      hostpool.HostPool
 	mu      sync.RWMutex
-	hostMap map[string]*gocql.HostInfo
+	members []*gocql.HostInfo          // admission order; no two share an identity
+	hostMap map[string]*gocql.HostInfo // address -> the last-admitted member at it; derived from members
+}
+
+// sameHostIdentity reports whether a and b describe the same node.
+// A host is identified by its host_id when it carries one and by its connect address when it does not.
+// A host with a host_id and one without are never the same node.
+func sameHostIdentity(a, b *gocql.HostInfo) bool {
+	if a == b {
+		return true
+	}
+	ida, idb := a.HostID(), b.HostID()
+	if ida != "" || idb != "" {
+		return ida == idb
+	}
+	return a.ConnectAddress().Equal(b.ConnectAddress())
 }
 
 func (r *hostPoolHostPolicy) Init(*gocql.Session)                       {}
@@ -55,13 +81,12 @@ func (r *hostPoolHostPolicy) SetPartitioner(string)                     {}
 func (r *hostPoolHostPolicy) IsLocal(*gocql.HostInfo) bool              { return true }
 
 func (r *hostPoolHostPolicy) SetHosts(hosts []*gocql.HostInfo) {
-	peers := make([]string, len(hosts))
-	hostMap := make(map[string]*gocql.HostInfo, len(hosts))
-
-	for i, host := range hosts {
-		ip := host.ConnectAddress().String()
-		peers[i] = ip
-		hostMap[ip] = host
+	// The first occurrence of an identity wins; a later one is the same host.
+	members := make([]*gocql.HostInfo, 0, len(hosts))
+	for _, host := range hosts {
+		if !slices.ContainsFunc(members, func(m *gocql.HostInfo) bool { return sameHostIdentity(host, m) }) {
+			members = append(members, host)
+		}
 	}
 
 	// The pool is the application's and may panic. The unlock is deferred rather
@@ -73,57 +98,34 @@ func (r *hostPoolHostPolicy) SetHosts(hosts []*gocql.HostInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.hp.SetHosts(peers)
-	r.hostMap = hostMap
+	r.publish(members)
 }
 
 func (r *hostPoolHostPolicy) AddHost(host *gocql.HostInfo) {
-	ip := host.ConnectAddress().String()
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// If the host addr is present and isn't nil return
-	if h, ok := r.hostMap[ip]; ok && h != nil {
+	// A member with host's identity is host, and keeps its place.
+	// Moving it to newest would let a stale AddHost take its address back from a host admitted there since,
+	// and the newer host would go unpicked until the stale one was removed.
+	if slices.ContainsFunc(r.members, func(m *gocql.HostInfo) bool { return sameHostIdentity(host, m) }) {
 		return
 	}
-	// otherwise, construct the prospective peer list
-	hosts := make([]string, 0, len(r.hostMap)+1)
-	for addr := range r.hostMap {
-		hosts = append(hosts, addr)
-	}
-	if _, ok := r.hostMap[ip]; !ok {
-		// The early return above lets a nil-valued entry through, and that entry is
-		// already in the loop: appending unconditionally would hand the pool the
-		// same address twice.
-		hosts = append(hosts, ip)
-	}
 
-	r.hp.SetHosts(hosts)
-
-	// and record the host only once the pool has accepted it. Recording first
-	// would make the early return above swallow every later attempt, so a panic
-	// here would leave the host recorded, unpublished and never selectable.
-	r.hostMap[ip] = host
+	r.publish(append(slices.Clone(r.members), host))
 }
 
 func (r *hostPoolHostPolicy) RemoveHost(host *gocql.HostInfo) {
-	ip := host.ConnectAddress().String()
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if _, ok := r.hostMap[ip]; !ok {
+	same := func(m *gocql.HostInfo) bool { return sameHostIdentity(host, m) }
+	if !slices.ContainsFunc(r.members, same) {
 		return
 	}
 
-	delete(r.hostMap, ip)
-	hosts := make([]string, 0, len(r.hostMap))
-	for _, host := range r.hostMap {
-		hosts = append(hosts, host.ConnectAddress().String())
-	}
-
-	r.hp.SetHosts(hosts)
+	// Another member at the same address keeps it: only host's identity leaves.
+	r.publish(slices.DeleteFunc(slices.Clone(r.members), same))
 }
 
 func (r *hostPoolHostPolicy) HostUp(host *gocql.HostInfo) {
@@ -186,10 +188,41 @@ func (host selectedHostPoolHost) Mark(err error) {
 	host.policy.mu.RLock()
 	defer host.policy.mu.RUnlock()
 
-	if _, ok := host.policy.hostMap[ip]; !ok {
-		// host was removed between pick and mark
+	if current, ok := host.policy.hostMap[ip]; !ok || !sameHostIdentity(current, host.info) {
+		// host was removed, or replaced at its address, between pick and mark:
+		// what happened on it is not to be charged to the address's current host
 		return
 	}
 
 	host.hostR.Mark(err)
+}
+
+// publish hands the pool the distinct addresses of members,
+// then records members and the address map derived from them.
+//
+// The pool is called first and the record written second.
+// Recording first would make AddHost's membership check swallow every later attempt,
+// so a panic in the pool would leave the host recorded, unpublished and never selectable.
+//
+// The caller must hold r.mu.
+//
+// Parameters:
+//   - members: the prospective members, in admission order
+func (r *hostPoolHostPolicy) publish(members []*gocql.HostInfo) {
+	peers := make([]string, 0, len(members))
+	hostMap := make(map[string]*gocql.HostInfo, len(members))
+	for _, member := range members {
+		ip := member.ConnectAddress().String()
+		if _, ok := hostMap[ip]; !ok {
+			peers = append(peers, ip)
+		}
+		// A later member overwrites an earlier one:
+		// an address is served by the member admitted there last.
+		hostMap[ip] = member
+	}
+
+	r.hp.SetHosts(peers)
+
+	r.members = members
+	r.hostMap = hostMap
 }

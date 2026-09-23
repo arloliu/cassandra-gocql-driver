@@ -32,7 +32,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,7 +56,21 @@ func (c *cowHostList) get() []*HostInfo {
 	return *l
 }
 
-// add will add a host if it not already in the list
+// sameHostIdentity reports whether a and b describe the same node.
+// A host is identified by its host_id when it carries one and by its connect address when it does not.
+// A host with a host_id and one without are never the same node.
+func sameHostIdentity(a, b *HostInfo) bool {
+	if a == b {
+		return true
+	}
+	ida, idb := a.HostID(), b.HostID()
+	if ida != "" || idb != "" {
+		return ida == idb
+	}
+	return a.ConnectAddress().Equal(b.ConnectAddress())
+}
+
+// add will add a host if no host with its identity is already in the list
 func (c *cowHostList) add(host *HostInfo) bool {
 	c.mu.Lock()
 	l := c.get()
@@ -67,7 +80,7 @@ func (c *cowHostList) add(host *HostInfo) bool {
 	} else {
 		newL := make([]*HostInfo, n+1)
 		for i := 0; i < n; i++ {
-			if host.Equal(l[i]) {
+			if sameHostIdentity(host, l[i]) {
 				c.mu.Unlock()
 				return false
 			}
@@ -82,7 +95,8 @@ func (c *cowHostList) add(host *HostInfo) bool {
 	return true
 }
 
-func (c *cowHostList) remove(ip net.IP) bool {
+// remove removes every host with host's identity from the list
+func (c *cowHostList) remove(host *HostInfo) bool {
 	c.mu.Lock()
 	l := c.get()
 	size := len(l)
@@ -94,7 +108,7 @@ func (c *cowHostList) remove(ip net.IP) bool {
 	found := false
 	newL := make([]*HostInfo, 0, size)
 	for i := 0; i < len(l); i++ {
-		if !l[i].ConnectAddress().Equal(ip) {
+		if !sameHostIdentity(host, l[i]) {
 			newL = append(newL, l[i])
 		} else {
 			found = true
@@ -106,7 +120,9 @@ func (c *cowHostList) remove(ip net.IP) bool {
 		return false
 	}
 
-	newL = newL[: size-1 : size-1]
+	// More than one entry can match:
+	// a listed id-less host whose id is filled in place changes its key.
+	// newL holds exactly the survivors.
 	c.list.Store(&newL)
 	c.mu.Unlock()
 
@@ -335,10 +351,43 @@ func (e *ExponentialBackoffRetryPolicy) napTime(attempts int) time.Duration {
 // HostStateNotifier is an interface for notifying about host state changes.
 // It allows host selection policies to be informed when hosts are added, removed,
 // or change their availability status.
+//
+// The driver identifies a host by its HostID.
+// Two HostInfo values with different host ids are different hosts even at one ConnectAddress,
+// because a node can be replaced at an address, or pods can recycle addresses.
+// The driver can then hold both for a while, the newcomer published before the departed host is removed.
+// RemoveHost for one must not remove the other.
+// Implementations that keep membership should key it by HostID,
+// not by ConnectAddress or HostInfo.Equal.
 type HostStateNotifier interface {
+	// AddHost is called when a host joins the hosts the policy selects from.
+	//
+	// A host with the HostID of a host already held is that host,
+	// whatever its ConnectAddress.
+	//
+	// Parameters:
+	//   - host: the host to add
 	AddHost(host *HostInfo)
+
+	// RemoveHost is called when a host leaves the hosts the policy selects from.
+	//
+	// It must remove only the host with host's HostID,
+	// even when another held host has the same ConnectAddress.
+	//
+	// Parameters:
+	//   - host: the host to remove
 	RemoveHost(host *HostInfo)
+
+	// HostUp is called when a host the driver holds comes up.
+	//
+	// Parameters:
+	//   - host: the host that came up
 	HostUp(host *HostInfo)
+
+	// HostDown is called when a host the driver holds goes down.
+	//
+	// Parameters:
+	//   - host: the host that went down
 	HostDown(host *HostInfo)
 }
 
@@ -454,7 +503,7 @@ func (r *roundRobinHostPolicy) AddHost(host *HostInfo) {
 }
 
 func (r *roundRobinHostPolicy) RemoveHost(host *HostInfo) {
-	r.hosts.remove(host.ConnectAddress())
+	r.hosts.remove(host)
 }
 
 func (r *roundRobinHostPolicy) HostUp(host *HostInfo) {
@@ -709,7 +758,7 @@ func (t *tokenAwareHostPolicy) RemoveHost(host *HostInfo) {
 		t.mu.Lock()
 		defer t.mu.Unlock()
 
-		if t.hosts.remove(host.ConnectAddress()) {
+		if t.hosts.remove(host) {
 			meta := t.getMetadataForUpdate()
 			meta.resetTokenRing(t.partitioner, t.hosts.get(), t.logger)
 			if t.getSchemaMeta != nil {
@@ -963,9 +1012,9 @@ func (d *dcAwareRR) AddHost(host *HostInfo) {
 
 func (d *dcAwareRR) RemoveHost(host *HostInfo) {
 	if d.IsLocal(host) {
-		d.localHosts.remove(host.ConnectAddress())
+		d.localHosts.remove(host)
 	} else {
-		d.remoteHosts.remove(host.ConnectAddress())
+		d.remoteHosts.remove(host)
 	}
 }
 
@@ -1082,7 +1131,7 @@ func (d *rackAwareRR) AddHost(host *HostInfo) {
 
 func (d *rackAwareRR) RemoveHost(host *HostInfo) {
 	dist := d.HostTier(host)
-	d.hosts[dist].remove(host.ConnectAddress())
+	d.hosts[dist].remove(host)
 }
 
 func (d *rackAwareRR) HostUp(host *HostInfo)   { d.AddHost(host) }

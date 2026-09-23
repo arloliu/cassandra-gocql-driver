@@ -22,12 +22,14 @@
 package hostpool
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/hailocab/go-hostpool"
+	"github.com/stretchr/testify/require"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
@@ -243,4 +245,302 @@ func TestHostPoolPolicy_AddHostPanicLeavesTheRetryOpen(t *testing.T) {
 		}
 		selected.Mark(nil)
 	})
+}
+
+// recordingPool is a hostpool.HostPool that records what the adapter hands it.
+//
+// Get answers with the address in next when one is set,
+// so a test can read which host the adapter serves an address from.
+// Marks are recorded on the response,
+// because a response marks the pool that issued it through methods a wrapper outside go-hostpool cannot override.
+type recordingPool struct {
+	hostpool.HostPool
+	setHostsCalls int
+	lastHosts     []string
+	next          string
+	marks         []error
+}
+
+// recordingResponse is the response recordingPool hands out.
+type recordingResponse struct {
+	hostpool.HostPoolResponse
+	host string
+	pool *recordingPool
+}
+
+func newRecordingPool() *recordingPool {
+	return &recordingPool{HostPool: hostpool.New(nil)}
+}
+
+func (p *recordingPool) SetHosts(hosts []string) {
+	p.setHostsCalls++
+	p.lastHosts = append([]string(nil), hosts...)
+	p.HostPool.SetHosts(hosts)
+}
+
+func (p *recordingPool) Get() hostpool.HostPoolResponse {
+	for range len(p.lastHosts) + 1 {
+		inner := p.HostPool.Get()
+		if inner == nil {
+			break
+		}
+		if p.next == "" || inner.Host() == p.next {
+			return &recordingResponse{HostPoolResponse: inner, host: inner.Host(), pool: p}
+		}
+	}
+	return &recordingResponse{host: p.next, pool: p}
+}
+
+func (r *recordingResponse) Host() string { return r.host }
+
+func (r *recordingResponse) Mark(err error) {
+	r.pool.marks = append(r.pool.marks, err)
+	if r.HostPoolResponse != nil {
+		r.HostPoolResponse.Mark(err)
+	}
+}
+
+// pickAt picks through the policy with the pool answering addr,
+// and returns the selection, or nil when the policy selected nothing.
+func pickAt(policy *hostPoolHostPolicy, pool *recordingPool, addr string) gocql.SelectedHost {
+	pool.next = addr
+	return policy.Pick(nil)()
+}
+
+// pickedInfo is pickAt's host, or nil.
+func pickedInfo(policy *hostPoolHostPolicy, pool *recordingPool, addr string) *gocql.HostInfo {
+	if selected := pickAt(policy, pool, addr); selected != nil {
+		return selected.Info()
+	}
+	return nil
+}
+
+// anonHost builds a host with no host_id at addr.
+func anonHost(t *testing.T, addr string) *gocql.HostInfo {
+	t.Helper()
+	host, err := gocql.NewTestHostInfoFromRow(map[string]any{
+		"peer":        net.ParseIP(addr),
+		"native_port": 9042,
+	})
+	require.NoError(t, err, "NewTestHostInfoFromRow")
+	require.Empty(t, host.HostID(), "an id-less host must carry no host_id")
+	return host
+}
+
+const (
+	hostIDX = "aaaaaaaa-0000-4000-8000-0000000000a1"
+	hostIDY = "bbbbbbbb-0000-4000-8000-0000000000b2"
+	hostIDZ = "cccccccc-0000-4000-8000-0000000000c3"
+)
+
+// TestHostPoolPolicy_ReplacedAtSameAddress covers F-ring-1's replacement:
+// B takes A's address under a new host_id, then A is swept.
+// The address must be served by B from its admission on, and removing A must not remove B.
+func TestHostPoolPolicy_ReplacedAtSameAddress(t *testing.T) {
+	const addr = "10.0.0.1"
+	pool := newRecordingPool()
+	policy := HostPoolHostPolicy(pool)
+	a := testHost(t, addr, hostIDX)
+	b := testHost(t, addr, hostIDY)
+
+	policy.AddHost(a)
+	policy.AddHost(b)
+	got := pickedInfo(policy, pool, addr)
+	require.NotNil(t, got, "Pick after AddHost(B) returned nil")
+	require.Same(t, b, got, "Pick after AddHost(B) returned A: the replacement does not serve its address")
+
+	policy.RemoveHost(a)
+	got = pickedInfo(policy, pool, addr)
+	require.NotNil(t, got, "Pick after RemoveHost(A) returned nil: removing A removed B")
+	require.Same(t, b, got, "Pick after RemoveHost(A) must return B")
+	require.Equal(t, []string{addr}, pool.Hosts(), "the pool must hold the address once")
+}
+
+// TestHostPoolPolicy_StaleAddAfterReplacement covers an UP handler that resolved A,
+// paused while the refresh admitted B, and resumed:
+// its AddHost(A) must not take the address back,
+// or B would go unpicked until the sweep's RemoveHost(A).
+func TestHostPoolPolicy_StaleAddAfterReplacement(t *testing.T) {
+	const addr = "10.0.0.1"
+	pool := newRecordingPool()
+	policy := HostPoolHostPolicy(pool)
+	a := testHost(t, addr, hostIDX)
+	b := testHost(t, addr, hostIDY)
+
+	policy.AddHost(a)
+	policy.AddHost(b)
+	policy.AddHost(a)
+	require.Same(t, b, pickedInfo(policy, pool, addr), "the stale add of A took the address back")
+
+	policy.RemoveHost(a)
+	require.Same(t, b, pickedInfo(policy, pool, addr), "Pick after RemoveHost(A) must still return B")
+}
+
+// TestHostPoolPolicy_AddressRotation covers F-ring-1's recycling:
+// X moves .2 -> .3, Y .3 -> .4 and Z .4 -> .2,
+// reconciled one host at a time as refreshRing does, remove-old-then-add-new.
+func TestHostPoolPolicy_AddressRotation(t *testing.T) {
+	pool := newRecordingPool()
+	policy := HostPoolHostPolicy(pool)
+	x0, y0, z0 := testHost(t, "10.0.0.2", hostIDX), testHost(t, "10.0.0.3", hostIDY), testHost(t, "10.0.0.4", hostIDZ)
+	x1, y1, z1 := testHost(t, "10.0.0.3", hostIDX), testHost(t, "10.0.0.4", hostIDY), testHost(t, "10.0.0.2", hostIDZ)
+
+	policy.AddHost(x0)
+	policy.AddHost(y0)
+	policy.AddHost(z0)
+
+	policy.RemoveHost(x0)
+	policy.AddHost(x1)
+	policy.RemoveHost(y0)
+	policy.AddHost(y1)
+	policy.RemoveHost(z0)
+	policy.AddHost(z1)
+
+	require.Same(t, z1, pickedInfo(policy, pool, "10.0.0.2"), "10.0.0.2 must be served by Z")
+	require.Same(t, x1, pickedInfo(policy, pool, "10.0.0.3"), "10.0.0.3 must be served by X")
+	require.Same(t, y1, pickedInfo(policy, pool, "10.0.0.4"), "10.0.0.4 must be served by Y")
+	require.ElementsMatch(t, []string{"10.0.0.2", "10.0.0.3", "10.0.0.4"}, pool.Hosts(),
+		"the pool must hold every address once")
+}
+
+// TestHostPoolPolicy_ReplacementResetsPool pins that B taking A's address republishes the peer list:
+// go-hostpool rebuilds every entry on SetHosts,
+// so A's dead mark and statistics do not carry over to B.
+func TestHostPoolPolicy_ReplacementResetsPool(t *testing.T) {
+	const addr = "10.0.0.1"
+	pool := newRecordingPool()
+	policy := HostPoolHostPolicy(pool)
+
+	policy.AddHost(testHost(t, addr, hostIDX))
+	before := pool.setHostsCalls
+	policy.AddHost(testHost(t, addr, hostIDY))
+	require.Equal(t, before+1, pool.setHostsCalls,
+		"AddHost(B) over A made no SetHosts call: A's pool state carries over to B")
+}
+
+// TestHostPoolPolicy_MarkIdentity pins that a response picked for A and marked after B replaced A is not charged to B,
+// while B's own mark still is.
+func TestHostPoolPolicy_MarkIdentity(t *testing.T) {
+	const addr = "10.0.0.1"
+	pool := newRecordingPool()
+	policy := HostPoolHostPolicy(pool)
+	a := testHost(t, addr, hostIDX)
+	b := testHost(t, addr, hostIDY)
+
+	policy.AddHost(a)
+	pickedA := pickAt(policy, pool, addr)
+	require.NotNil(t, pickedA, "Pick returned nil")
+	require.Same(t, a, pickedA.Info(), "Pick before the replacement must return A")
+
+	policy.AddHost(b)
+	pickedB := pickAt(policy, pool, addr)
+	require.NotNil(t, pickedB, "Pick returned nil")
+	require.Same(t, b, pickedB.Info(), "Pick after the replacement must return B")
+
+	errA := errors.New("A's stale mark")
+	errB := errors.New("B's mark")
+	pickedA.Mark(errA)
+	pickedB.Mark(errB)
+	require.Contains(t, pool.marks, errB, "the recorder did not see B's mark")
+	require.NotContains(t, pool.marks, errA, "the recorder saw A's stale mark")
+}
+
+// TestHostPoolPolicy_AddressKeyAndMixed pins the copied identity predicate on hosts without a host_id:
+// they are identified by address, and never match a host that has one.
+func TestHostPoolPolicy_AddressKeyAndMixed(t *testing.T) {
+	const addrA, addrB = "10.0.0.1", "10.0.0.2"
+
+	t.Run("id-less hosts at one address are one member", func(t *testing.T) {
+		pool := newRecordingPool()
+		policy := HostPoolHostPolicy(pool)
+		first, second := anonHost(t, addrA), anonHost(t, addrA)
+
+		policy.AddHost(first)
+		before := pool.setHostsCalls
+		policy.AddHost(second)
+		require.Equal(t, before, pool.setHostsCalls, "the second id-less host at one address was added")
+		require.Same(t, first, pickedInfo(policy, pool, addrA), "the second id-less host at one address was added")
+
+		policy.RemoveHost(second)
+		require.Empty(t, pool.Hosts(), "removing an id-less host must remove the one at its address")
+	})
+
+	t.Run("id-less hosts at different addresses are two members", func(t *testing.T) {
+		pool := newRecordingPool()
+		policy := HostPoolHostPolicy(pool)
+
+		policy.AddHost(anonHost(t, addrA))
+		policy.AddHost(anonHost(t, addrB))
+		require.ElementsMatch(t, []string{addrA, addrB}, pool.Hosts(),
+			"the id-less host at a different address was not added")
+	})
+
+	t.Run("a mixed pair at one address is two members", func(t *testing.T) {
+		pool := newRecordingPool()
+		policy := HostPoolHostPolicy(pool)
+		identified, anon := testHost(t, addrA, hostIDY), anonHost(t, addrA)
+
+		policy.AddHost(identified)
+		policy.AddHost(anon)
+		require.Same(t, anon, pickedInfo(policy, pool, addrA), "the mixed pair is one member")
+
+		policy.RemoveHost(anon)
+		require.Same(t, identified, pickedInfo(policy, pool, addrA),
+			"removing the id-less host emptied the address")
+	})
+
+	t.Run("an id-less removal leaves the identified host", func(t *testing.T) {
+		pool := newRecordingPool()
+		policy := HostPoolHostPolicy(pool)
+		identified := testHost(t, addrA, hostIDY)
+
+		policy.AddHost(identified)
+		policy.RemoveHost(anonHost(t, addrA))
+		require.Same(t, identified, pickedInfo(policy, pool, addrA),
+			"removing the id-less host emptied the address")
+	})
+}
+
+// TestHostPoolPolicy_SameIdDistinctObject pins that the host_id decides:
+// a distinct object with a member's id at another address is that member.
+func TestHostPoolPolicy_SameIdDistinctObject(t *testing.T) {
+	const addrA, addrB = "10.0.0.1", "10.0.0.2"
+	pool := newRecordingPool()
+	policy := HostPoolHostPolicy(pool)
+
+	policy.AddHost(testHost(t, addrA, hostIDX))
+	before := pool.setHostsCalls
+	policy.AddHost(testHost(t, addrB, hostIDX))
+	require.Equal(t, []string{addrA}, pool.Hosts(), "AddHost(A') added b")
+	require.Equal(t, before, pool.setHostsCalls, "AddHost(A') republished the pool")
+
+	policy.RemoveHost(testHost(t, addrB, hostIDX))
+	require.Empty(t, pool.Hosts(), "RemoveHost(A') did not remove A")
+}
+
+// TestHostPoolPolicy_SetHostsByIdentity pins SetHosts' contract:
+// it deduplicates by identity, the first occurrence winning,
+// offers each address once,
+// serves an address from the last host admitted there,
+// and records every host it keeps as a member.
+func TestHostPoolPolicy_SetHostsByIdentity(t *testing.T) {
+	const addrA, addrC = "10.0.0.1", "10.0.0.3"
+	pool := newRecordingPool()
+	policy := HostPoolHostPolicy(pool)
+	a := testHost(t, addrA, hostIDX)
+	b := testHost(t, addrA, hostIDY)
+	aPrime := testHost(t, addrC, hostIDX)
+
+	policy.SetHosts([]*gocql.HostInfo{a, b, aPrime})
+	require.Equal(t, []string{addrA}, pool.lastHosts,
+		"the pool must receive exactly [a]: A' duplicates A, and a is offered once")
+	require.Same(t, b, pickedInfo(policy, pool, addrA), "Pick must return B, the last admitted at a")
+
+	before := pool.setHostsCalls
+	policy.RemoveHost(a)
+	require.Equal(t, before+1, pool.setHostsCalls, "RemoveHost(A) found no member: SetHosts did not record A")
+	require.Same(t, b, pickedInfo(policy, pool, addrA), "Pick after RemoveHost(A) must still return B")
+
+	policy.RemoveHost(b)
+	require.Empty(t, pool.Hosts(), "RemoveHost(B) must empty the pool")
 }

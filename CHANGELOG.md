@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The built-in host selection policies identify a host by its host_id, not by its address.**
+  A host replaced at the same address, or one that took over an address another host had held,
+  could be left out of load balancing.
+  It could stay out indefinitely,
+  unless an up event resolved its current ring object or a control connection reconnected to it.
+  With token-aware, its token ranges were not routed to it as a replica,
+  although the fallback could still select it.
+  With the other built-in policies, whether it was left out depended on a race with its up event.
+  The built-in policies now identify a host by its host_id, and by its address only when it has no host_id.
+  A host with a host_id and a host without one are never treated as the same host.
+  `HostPoolHostPolicy` still hands go-hostpool addresses,
+  and serves each address from the host admitted there last.
+  Custom policies should key membership by `HostID()`, not by `ConnectAddress()` or `HostInfo.Equal`.
+
 ## [2.7.4-otter] - 2026-09-22
 
 Patch release for a correctness review of v2.7.3-otter:

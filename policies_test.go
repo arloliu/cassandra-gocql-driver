@@ -39,6 +39,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // Tests of the round-robin host selection policy implementation
@@ -234,6 +236,155 @@ func TestCOWList_Add(t *testing.T) {
 			t.Errorf("addr was not in the host list: %q", addr)
 		}
 	}
+}
+
+// identityTestHost builds a bare host at addr, with id published when it is non-empty.
+func identityTestHost(id string, addr net.IP) *HostInfo {
+	h := &HostInfo{connectAddress: addr}
+	if id != "" {
+		h.withIdentity(id, "", "")
+	}
+	return h
+}
+
+// requireNoNilHost fails when the list holds a nil entry.
+func requireNoNilHost(t *testing.T, cow *cowHostList) {
+	t.Helper()
+	for i, h := range cow.get() {
+		require.NotNil(t, h, "remove left a nil entry at %d in %v", i, cow.get())
+	}
+}
+
+// TestCOWList_IdentityKeyed pins that the list identifies a host by its host_id:
+// two hosts at one address are two entries,
+// and a distinct object with a listed host's id is that host wherever it is.
+func TestCOWList_IdentityKeyed(t *testing.T) {
+	addrA, addrB := net.IPv4(10, 0, 0, 1), net.IPv4(10, 0, 0, 2)
+	a := identityTestHost("X", addrA)
+	b := identityTestHost("Y", addrA)
+
+	var cow cowHostList
+	require.True(t, cow.add(a), "add(A) to an empty list returned false")
+	require.True(t, cow.add(b), "B not added: add(B) returned false beside A at the same address")
+	require.True(t, cow.remove(a), "remove(A) found nothing")
+	requireNoNilHost(t, &cow)
+	require.Equal(t, []*HostInfo{b}, cow.get(), "remove(A) also removed B")
+
+	require.True(t, cow.add(a), "re-adding A returned false")
+	aPrime := identityTestHost("X", addrB)
+	require.False(t, cow.add(aPrime), "add(A') returned true: a distinct object with A's id is A")
+	require.True(t, cow.remove(aPrime), "remove(A') found nothing: a distinct object with A's id is A")
+	requireNoNilHost(t, &cow)
+	require.Equal(t, []*HostInfo{b}, cow.get(), "remove(A') must remove A and only A")
+}
+
+// TestCOWList_AddressKey pins that hosts without a host_id are identified by their connect address,
+// as every host was before.
+func TestCOWList_AddressKey(t *testing.T) {
+	addrA, addrB := net.IPv4(10, 0, 0, 1), net.IPv4(10, 0, 0, 2)
+	first := identityTestHost("", addrA)
+	second := identityTestHost("", addrA)
+	elsewhere := identityTestHost("", addrB)
+	identified := identityTestHost("Y", addrA)
+
+	var cow cowHostList
+	require.True(t, cow.add(first), "add to an empty list returned false")
+	require.False(t, cow.add(second), "a second id-less host at one address was added")
+	require.True(t, cow.add(elsewhere), "the id-less host at a different address was not added")
+	require.True(t, cow.add(identified), "the identified host at an id-less host's address was not added")
+
+	require.True(t, cow.remove(second), "removing an id-less host found nothing at its address")
+	requireNoNilHost(t, &cow)
+	require.Equal(t, []*HostInfo{elsewhere, identified}, cow.get(),
+		"removing an id-less host must remove only the id-less entry at its address")
+}
+
+// TestCOWList_MixedPairsNeverMatch pins that a host with a host_id and one without are never the same host,
+// so the id-less removal unpublishHostLocked can issue does not evict an identified host at the same address.
+func TestCOWList_MixedPairsNeverMatch(t *testing.T) {
+	addr := net.IPv4(10, 0, 0, 1)
+	b := identityTestHost("Y", addr)
+	c := identityTestHost("", addr)
+
+	var cow cowHostList
+	require.True(t, cow.add(b), "add(B) to an empty list returned false")
+	require.True(t, cow.add(c), "add(C) returned false: an id-less host matched an identified one")
+	require.True(t, cow.remove(c), "remove(C) found nothing")
+	requireNoNilHost(t, &cow)
+	require.Equal(t, []*HostInfo{b}, cow.get(), "remove(C) removed B")
+
+	var onlyB cowHostList
+	require.True(t, onlyB.add(b), "add(B) to an empty list returned false")
+	require.False(t, onlyB.remove(identityTestHost("", addr)), "the bare removal on the list holding only B removed B")
+	require.Equal(t, []*HostInfo{b}, onlyB.get(), "the bare removal on the list holding only B removed B")
+}
+
+// TestCOWList_RemoveAfterIdFilledInPlace covers a listed id-less host whose id HostInfo.update fills in place:
+// it then shares a key with another entry, and one removal matches both.
+// The list must shrink by two, not expose a nil slot.
+func TestCOWList_RemoveAfterIdFilledInPlace(t *testing.T) {
+	addr := net.IPv4(10, 0, 0, 1)
+	c := identityTestHost("", addr)
+	d := identityTestHost("Y", addr)
+
+	var cow cowHostList
+	require.True(t, cow.add(c), "add(C) to an empty list returned false")
+	require.True(t, cow.add(d), "add(D) returned false: an id-less host matched an identified one")
+
+	c.update(d)
+	require.Equal(t, "Y", c.HostID(), "update must fill C's empty host_id from D")
+
+	require.True(t, cow.remove(d), "remove(D) found nothing")
+	requireNoNilHost(t, &cow)
+	require.Empty(t, cow.get(), "remove(D) must remove both entries that carry D's id")
+}
+
+// TestTokenAware_ReplacedAtSameAddressReplicaMap covers a replacement at one address carrying the same token:
+// token-aware's token ring holds both hosts until the departed one is removed,
+// and afterwards no replica map entry names it.
+func TestTokenAware_ReplacedAtSameAddressReplicaMap(t *testing.T) {
+	const keyspace = "myKeyspace"
+	policy := TokenAwareHostPolicy(RoundRobinHostPolicy())
+	ta := policy.(*tokenAwareHostPolicy)
+	keyspaceMeta := &KeyspaceMetadata{
+		Name:          keyspace,
+		StrategyClass: "SimpleStrategy",
+		StrategyOptions: map[string]any{
+			"class":              "SimpleStrategy",
+			"replication_factor": 1,
+		},
+	}
+	strategy := getStrategy(keyspaceMeta, nopLoggerSingleton)
+	keyspaceMeta.placementStrategy = strategy
+	ta.getSchemaMeta = func() *schemaMeta {
+		return &schemaMeta{keyspaceMeta: map[string]*KeyspaceMetadata{keyspace: keyspaceMeta}}
+	}
+	policy.SetPartitioner("OrderedPartitioner")
+
+	addr := net.IPv4(10, 0, 0, 1)
+	a := (&HostInfo{connectAddress: addr, tokens: []string{"50"}}).withIdentity("X", "", "")
+	b := (&HostInfo{connectAddress: addr, tokens: []string{"50"}}).withIdentity("Y", "", "")
+
+	policy.AddHost(a)
+	policy.AddHost(b)
+	var ringIDs []string
+	for _, ht := range ta.getMetadataReadOnly().tokenRing.tokens {
+		ringIDs = append(ringIDs, ht.host.HostID())
+	}
+	require.ElementsMatch(t, []string{"X", "Y"}, ringIDs, "after AddHost(B) the token ring must name both A and B")
+
+	policy.RemoveHost(a)
+	replicas := ta.getMetadataReadOnly().replicas[strategy.strategyKey()]
+	require.NotEmpty(t, replicas, "no replica map for the keyspace's strategy")
+	var named []string
+	for _, ht := range replicas {
+		require.Equal(t, orderedToken("50"), ht.token, "the replica map holds a token no host owns: %v", replicas)
+		for _, h := range ht.hosts {
+			named = append(named, h.HostID())
+		}
+	}
+	require.NotContains(t, named, "X", "the replica map for T still names A: %v", replicas)
+	require.Contains(t, named, "Y", "the replica map for T must name B: %v", replicas)
 }
 
 // TestSimpleRetryPolicy makes sure that we only allow 1 + numRetries attempts

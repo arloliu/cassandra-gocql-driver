@@ -122,9 +122,12 @@ const (
 // and it hands out hosts only up to that count.
 // A one-shot policy (hostpool.HostPoolHostPolicy, see #812 and #1259) is therefore
 // tried on up to one host per up, pooled host and asked for at most 1+maxHosts iterators;
-// a policy whose iterator already enumerates the up hosts consumes the budget in its first round
+// it can reach fewer hosts than that,
+// since of two host IDs behind one connect address it picks only the one admitted there last,
+// while the ring and the pool map hold both.
+// A policy whose iterator already enumerates the up hosts consumes the budget in its first round
 // and is never asked for a replacement, as long as the hosts it holds are the hosts the pool holds.
-// When the two differ (a host joining or leaving mid-query, two host IDs behind one connect address)
+// When the two differ (a host joining or leaving mid-query)
 // an enumerating policy may be asked for a bounded number of further selections.
 //
 // With maxHosts == 0 the selector is the raw iterator behind a mutex:
