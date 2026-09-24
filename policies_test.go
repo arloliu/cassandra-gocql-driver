@@ -1925,3 +1925,76 @@ func TestTokenAware_LogPanicDoesNotStrandPolicyMutex(t *testing.T) {
 		}
 	})
 }
+
+// A token-aware iterator over a vnode ring whose replica walk meets a host
+// twice must still yield every host exactly once (F-soak-3).
+func TestHostPolicy_TokenAware_NetworkStrategyVnodesNoRepeat(t *testing.T) {
+	const keyspace = "myKeyspace"
+
+	tests := []struct {
+		name   string
+		policy func() HostSelectionPolicy
+	}{
+		{"round-robin", func() HostSelectionPolicy {
+			return TokenAwareHostPolicy(RoundRobinHostPolicy(), DoNotShuffleReplicas())
+		}},
+		{"round-robin rotated", func() HostSelectionPolicy {
+			return TokenAwareHostPolicy(RoundRobinHostPolicy(), ShuffleReplicas())
+		}},
+		{"rack-aware non-local fallback", func() HostSelectionPolicy {
+			return TokenAwareHostPolicy(RackAwareRoundRobinPolicy("local", "r1"), NonLocalReplicasFallback(), DoNotShuffleReplicas())
+		}},
+		{"rack-aware non-local fallback rotated", func() HostSelectionPolicy {
+			return TokenAwareHostPolicy(RackAwareRoundRobinPolicy("local", "r1"), NonLocalReplicasFallback(), ShuffleReplicas())
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := test.policy()
+			policyInternal := policy.(*tokenAwareHostPolicy)
+			policyInternal.getKeyspaceName = func() string { return keyspace }
+
+			// The walk from token 01 meets a and x twice before it has every replica.
+			hosts := []*HostInfo{
+				(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 1), tokens: []string{"01", "02"}}).withIdentity("a", "local", "r1"),
+				(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 2), tokens: []string{"04"}}).withIdentity("b", "local", "r1"),
+				(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 3), tokens: []string{"06"}}).withIdentity("c", "local", "r1"),
+				(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 4), tokens: []string{"03", "05"}}).withIdentity("x", "remote", "r1"),
+				(&HostInfo{connectAddress: net.IPv4(10, 0, 0, 5), tokens: []string{"07"}}).withIdentity("y", "remote", "r1"),
+			}
+			for _, host := range hosts {
+				policy.AddHost(host)
+			}
+
+			keyspaceMeta := &KeyspaceMetadata{
+				Name:          keyspace,
+				StrategyClass: "NetworkTopologyStrategy",
+				StrategyOptions: map[string]any{
+					"class":  "NetworkTopologyStrategy",
+					"local":  3,
+					"remote": 2,
+				},
+			}
+			keyspaceMeta.placementStrategy = getStrategy(keyspaceMeta, nopLoggerSingleton)
+			policyInternal.getSchemaMeta = func() *schemaMeta {
+				return &schemaMeta{keyspaceMeta: map[string]*KeyspaceMetadata{keyspace: keyspaceMeta}}
+			}
+			policy.SetPartitioner("OrderedPartitioner")
+
+			query := &Query{}
+			query.getKeyspace = func() string { return keyspace }
+			query.RoutingKey([]byte("01"))
+
+			// Several iterators, so the rotated variants move through their starts.
+			for n := range 6 {
+				iter := policy.Pick(newInternalQuery(query, nil))
+				var got []string
+				for host := iter(); host != nil; host = iter() {
+					got = append(got, host.Info().HostID())
+				}
+				require.ElementsMatch(t, []string{"a", "b", "c", "x", "y"}, got, "iterator %d yielded %v", n, got)
+			}
+		})
+	}
+}

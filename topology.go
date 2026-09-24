@@ -261,6 +261,12 @@ func (n *networkTopology) haveRF(replicaCounts map[string]int) bool {
 // Replicas are picked walking the ring from each token, preferring an unseen
 // rack within each data center and falling back to the racks already used once
 // every rack has been seen.
+// This is Apache Cassandra 3.0's NetworkTopologyStrategy.calculateNaturalEndpoints,
+// including its set semantics: a host appears at most once in a token's list,
+// however many of its vnodes the walk meets.
+// A data center gets up to min(rf, token-owning hosts) replicas; fewer when a
+// rack in its inventory has no token-owning host, because such a rack is never
+// seen and the hosts queued behind it are never drained.
 //
 // A token whose primary host is in a data center this strategy does not
 // replicate to is skipped; a token that reaches the selection loop and comes out
@@ -282,8 +288,9 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 
 	// One identity snapshot per host for the whole build.
 	// Building the replica map is a single logical decision that reads each host
-	// across three passes - the rack inventory below, the primary-DC check, and
-	// the selection loop - and a HostInfo.update landing between two of them (it
+	// across four passes - the rack inventory below, the owner count, the
+	// primary-DC check, and the selection loop - and a HostInfo.update landing
+	// between two of them (it
 	// takes only the host's own lock, not t.mu) would let the inventory record a
 	// host under one rack and the selection loop look it up under another, which
 	// reads as an unknown rack and can leave a token with no replicas at all.
@@ -311,12 +318,40 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 	tokens := tokenRing.tokens
 	replicaRing := make(tokenRingReplicas, 0, len(tokens))
 
-	var totalRF int
-	for _, rf := range n.dcs {
-		totalRF += rf
+	// Distinct token-owning hosts per data center, classified by the same
+	// snapshot as the selection loop. A data center cannot supply more replicas
+	// than it has owners, so its factor is capped at that count, as Cassandra's
+	// hasSufficientReplicas does. Without the cap, a data center smaller than its
+	// factor would walk the whole ring for every token.
+	counted := make(map[*HostInfo]struct{}, len(tokenRing.hosts))
+	ownersInDC := make(map[string]int, len(dcRacks))
+	for _, th := range tokens {
+		if _, ok := counted[th.host]; ok {
+			continue
+		}
+		counted[th.host] = struct{}{}
+		id := ids[th.host]
+		if id == nil {
+			id = th.host.identity()
+			ids[th.host] = id
+		}
+		ownersInDC[id.dataCenter]++
 	}
 
+	var totalRF int
+	for dc, rf := range n.dcs {
+		totalRF += min(rf, ownersInDC[dc])
+	}
+
+	// pickedAt[h] == i+1 when h is already a replica of token i, and
+	// skippedAt[h] == i+1 when h is already queued for it, so a host is never
+	// listed or queued twice. Stamping with the ring index needs no reset
+	// between tokens.
+	pickedAt := make(map[*HostInfo]int, len(counted))
+	skippedAt := make(map[*HostInfo]int, len(counted))
+
 	for i, th := range tokenRing.tokens {
+		stamp := i + 1
 		// tokens only name hosts in tokenRing.hosts, so ids has an entry; the
 		// fallback is defensive rather than reachable.
 		thID := ids[th.host]
@@ -341,12 +376,15 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 
 		replicas := make([]*HostInfo, 0, totalRF)
 		for j := 0; j < len(tokens) && (len(replicas) < totalRF && !n.haveRF(replicasInDC)); j++ {
-			// TODO: ensure we dont add the same host twice
 			p := i + j
 			if p >= len(tokens) {
 				p -= len(tokens)
 			}
 			h := tokens[p].host
+			if pickedAt[h] == stamp {
+				// another vnode of a host already listed for this token
+				continue
+			}
 
 			id := ids[h]
 			if id == nil {
@@ -375,6 +413,7 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 			if _, ok := racks[rack]; ok && len(racks) == len(dcRacks[dc]) {
 				// we have been through all the racks and dont have RF yet, add this
 				replicas = append(replicas, h)
+				pickedAt[h] = stamp
 				replicasInDC[dc]++
 			} else if !ok {
 				if racks == nil {
@@ -385,17 +424,21 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 				// new rack
 				racks[rack] = struct{}{}
 				replicas = append(replicas, h)
+				pickedAt[h] = stamp
 				r := replicasInDC[dc] + 1
 
 				if len(racks) == len(dcRacks[dc]) {
 					// if we have been through all the racks, drain the rest of the skipped
 					// hosts until we have RF. The next iteration will skip in the block
-					// above
+					// above. Queued hosts are distinct and none is listed yet: a host
+					// is queued at most once, never once listed, and nothing on a seen
+					// rack is listed before this drain.
 					skippedHosts := skipped[dc]
 					var k int
 					for ; k < len(skippedHosts) && r+k < rf; k++ {
 						sh := skippedHosts[k]
 						replicas = append(replicas, sh)
+						pickedAt[sh] = stamp
 					}
 					r += k
 					skipped[dc] = skippedHosts[k:]
@@ -404,7 +447,10 @@ func (n *networkTopology) replicaMap(tokenRing *tokenRing) tokenRingReplicas {
 			} else {
 				// already seen this rack, keep hold of this host incase
 				// we dont get enough for rf
-				skipped[dc] = append(skipped[dc], h)
+				if skippedAt[h] != stamp {
+					skippedAt[h] = stamp
+					skipped[dc] = append(skipped[dc], h)
+				}
 			}
 		}
 
