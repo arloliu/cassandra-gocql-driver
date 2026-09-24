@@ -2228,16 +2228,30 @@ func (c *Conn) prepareStatement(ctx context.Context, stmt string, tracer Tracer,
 
 		framer, err := c.exec(loadCtx, prep, tracer)
 		if err != nil {
-			// execInternal defers to a context deadline instead of arming its own
-			// request timer, so the bound above surfaces as context.DeadlineExceeded
-			// rather than ErrTimeoutNoResponse. Otter shares a load's error with every
-			// waiter, including ones whose own context is still alive, and the executor
-			// reads a bare context error as a caller cancellation that must not be
-			// retried elsewhere. Translate it back to the error the request timer would
-			// have produced, so a node that really timed out is not mistaken for a
-			// caller that gave up. c.ctx carries no deadline of its own, so a deadline
-			// here can only be ours.
-			if errors.Is(err, context.DeadlineExceeded) && c.ctx.Err() == nil {
+			// Otter shares a load's error with every waiter, including ones whose own
+			// context is still alive, and the executor reads a bare context error as a
+			// caller cancellation that must not be retried elsewhere.
+			// loadCtx is not a caller's context, so neither of its errors may leave the
+			// load as one.
+			switch {
+			case (c.ctx.Err() != nil || c.Closed()) && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
+				// The connection closed under the load.
+				// Its context is cancelled by closeWithError or by the session closing,
+				// and loadCtx inherits that.
+				// closeWithError also hands its own error to the outstanding calls before
+				// it cancels, and a custom transport's reader can fail with a context
+				// error, so the connection being closed counts even while c.ctx is alive.
+				// Whether or not the PREPARE reached the server, this connection can no
+				// longer answer it, so report it the way the in-flight wait does:
+				// as a host failure the retry policy can take elsewhere.
+				return nil, ErrConnectionClosed
+			case errors.Is(err, context.DeadlineExceeded):
+				// execInternal defers to a context deadline instead of arming its own
+				// request timer, so the bound above surfaces as context.DeadlineExceeded
+				// rather than ErrTimeoutNoResponse. Translate it back to the error the
+				// request timer would have produced, so a node that really timed out is
+				// not mistaken for a caller that gave up. c.ctx carries no deadline of
+				// its own, so a deadline here can only be ours.
 				return nil, ErrTimeoutNoResponse
 			}
 			return nil, err
