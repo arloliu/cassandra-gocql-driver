@@ -111,7 +111,7 @@ func TestControlConn_ReconnectRefreshesRing(t *testing.T) {
 	}
 
 	if err := ccm.NodeDown(ccHostName); err != nil {
-		t.Fatal()
+		t.Fatal(err)
 	}
 
 	defer func() {
@@ -159,7 +159,7 @@ func TestControlConn_ReconnectRefreshesRing(t *testing.T) {
 	}
 
 	if assertErr != nil {
-		t.Fatal(err)
+		t.Fatal(assertErr)
 	}
 
 	testFilter.SetAllowedHosts(allAllowedHosts)
@@ -196,6 +196,6 @@ func TestControlConn_ReconnectRefreshesRing(t *testing.T) {
 	}
 
 	if assertErr != nil {
-		t.Fatal(err)
+		t.Fatal(assertErr)
 	}
 }
