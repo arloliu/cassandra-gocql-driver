@@ -1,0 +1,165 @@
+{
+  "cell": "c50p5",
+  "unit": "soak-cell-2026-09-26-c50p5-d28b2e92.service",
+  "invocation_id": "58f13f53618440a58b71529d83078315",
+  "completion": "done",
+  "unit_result": "exit-code",
+  "main": "code=exited/status=1",
+  "client_status": "1",
+  "receipt": {
+    "version": 1,
+    "state": "done",
+    "cell": "c50p5",
+    "mode": "validate",
+    "kind": "control",
+    "receipt": "../tmp/soak-2026-09-26/night-20260925T193435Z-d28b2e92/receipts/c50p5.json",
+    "at": "2026-09-26T05:06:54+08:00",
+    "attempt": "20260925T202046Z-d736",
+    "launch_token": "2bfe07e0a35640c68c58048d0c3d3e8c",
+    "exec_dir": "../tmp/soak-2026-09-26/c50p5/control-20260925T202046Z-d736",
+    "stage": "run/c50p5-20260925T202046Z-d736-2bfe07e0a356",
+    "digest": "d95deb4b23e2830efaf26fa4b0fe629975e35390574c06698afa1e24e98a1483",
+    "launcher_exit": 1,
+    "reason": "the cell ended with a verdict other than pass",
+    "harness_started": true,
+    "proven": true,
+    "report": "../tmp/soak-2026-09-26/c50p5/control-20260925T202046Z-d736/launcher-cleanup.json"
+  },
+  "report": {
+    "exit": 1,
+    "reason": "the cell ended with a verdict other than pass",
+    "unresolved": [],
+    "retained": []
+  },
+  "verdict": {
+    "status": "invalid-config",
+    "final": true,
+    "evidence_complete": true,
+    "evidence_problems": [],
+    "reasons": [
+      "G2: [gate: threshold missing from gates.json: kG]",
+      "G3: [gate: threshold missing from gates.json: kH]",
+      "G4: [gate: threshold missing from gates.json: kF]",
+      "G6: [gate: threshold missing from gates.json: kS]",
+      "G7: [gate: threshold missing from gates.json: kE]",
+      "G10: [gate: threshold missing from gates.json: kLWTu]",
+      "G12: [gate: threshold missing from gates.json: kC]",
+      "G13: [gate: threshold missing from gates.json: kC]",
+      "G14: [gate: threshold missing from gates.json: kL]",
+      "G16: [gate: threshold missing from gates.json: kD]"
+    ],
+    "workload_seconds": 2700.000162458,
+    "cell_hash": "0ac7c036bb017198790e19b60a88f8e3130acf1e0d8a31a4b22995ff4197fe6c",
+    "shared_hash": "37d3be27082238eed0be0f1ccc201c574e2eb2c7278af0559fa981486a540bfe",
+    "gates": [
+      {
+        "gate": "G0",
+        "status": "pass",
+        "details": []
+      },
+      {
+        "gate": "G1",
+        "status": "pass",
+        "details": []
+      },
+      {
+        "gate": "G2",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kG"
+        ]
+      },
+      {
+        "gate": "G3",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kH"
+        ]
+      },
+      {
+        "gate": "G4",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kF"
+        ]
+      },
+      {
+        "gate": "G5",
+        "status": "pass",
+        "details": []
+      },
+      {
+        "gate": "G6",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kS"
+        ]
+      },
+      {
+        "gate": "G7",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kE"
+        ]
+      },
+      {
+        "gate": "G8",
+        "status": "pass",
+        "details": []
+      },
+      {
+        "gate": "G9",
+        "status": "pass",
+        "details": []
+      },
+      {
+        "gate": "G10",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kLWTu"
+        ]
+      },
+      {
+        "gate": "G11",
+        "status": "pass",
+        "details": []
+      },
+      {
+        "gate": "G12",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kC"
+        ]
+      },
+      {
+        "gate": "G13",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kC"
+        ]
+      },
+      {
+        "gate": "G14",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kL"
+        ]
+      },
+      {
+        "gate": "G15",
+        "status": "pass",
+        "details": []
+      },
+      {
+        "gate": "G16",
+        "status": "invalid-config",
+        "details": [
+          "gate: threshold missing from gates.json: kD"
+        ]
+      }
+    ],
+    "unexpected_config": []
+  },
+  "problems": [],
+  "unit_output": "../tmp/soak-2026-09-26/night-20260925T193435Z-d28b2e92/units/c50p5.out"
+}

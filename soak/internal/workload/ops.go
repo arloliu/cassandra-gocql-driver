@@ -40,6 +40,13 @@ const (
 	specMaxDelay = 30 * time.Millisecond
 )
 
+// scanFull and the other scanVariant values are the scan class's three variants (PLAN §4.2).
+const (
+	scanFull scanVariant = iota
+	scanControlled
+	scanResume
+)
+
 var scanPageSizes = []int{50, 500, 5000}
 
 // Aux load (PLAN §5.4 fixes only 30 s of the mix without LWT):
@@ -50,6 +57,9 @@ const (
 	// AuxWorkersDivisor divides the primary's W into the aux session's.
 	AuxWorkersDivisor = 4
 )
+
+// scanVariant is one of the scan class's three variants.
+type scanVariant int
 
 // Params is every workload constant that shapes the experiment, recorded in the base configuration (Codex I17).
 type Params struct {
@@ -125,6 +135,15 @@ type ErrorRecord struct {
 	Elapsed time.Duration
 }
 
+// Switches are the configuration canaries' Env flags (PLAN §44.4), set on every Env, primary and aux;
+// the zero value changes nothing.
+type Switches struct {
+	// NoEarlyClose runs the controlled scans as full scans, so no prefetch is in flight at a Close (K15).
+	NoEarlyClose bool
+	// NoSpeculation gives every spec-read NumAttempts 0 (K17); workload.Params is left alone.
+	NoSpeculation bool
+}
+
 // OpInfo is carried in every operation's context, so observers can attribute what they see.
 type OpInfo struct {
 	// ID is the operation id, unique within the process.
@@ -175,6 +194,8 @@ type Env struct {
 	Inject func(class Class, seq uint64) time.Duration
 	// ShortDeadlineTimeouts counts short-deadline operations that timed out (G15).
 	ShortDeadlineTimeouts atomic.Int64
+	// Switches are the configuration canaries' flags (K15, K17); the zero value changes nothing.
+	Switches Switches
 
 	lwtMu    sync.Mutex
 	lwtKnown map[int]int64
@@ -206,6 +227,20 @@ func OpFrom(ctx context.Context) (OpInfo, bool) {
 	}
 	info, ok := ctx.Value(opKey{}).(OpInfo)
 	return info, ok
+}
+
+// scanVariantOf maps a draw in [0, 100) to a variant; without early close the controlled share runs as full scans (K15).
+func scanVariantOf(v int, noEarlyClose bool) scanVariant {
+	switch {
+	case v < controlledShare && !noEarlyClose:
+		return scanControlled
+	case v < controlledShare:
+		return scanFull
+	case v < controlledShare+resumeShare:
+		return scanResume
+	default:
+		return scanFull
+	}
 }
 
 // Do runs one offered operation on worker w.
@@ -285,6 +320,20 @@ func (e *Env) pickKeys(w int, rng *rand.Rand, n int, samePartition bool) []Key {
 
 func (e *Env) opContext(ctx context.Context, info OpInfo, d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(WithOp(ctx, info), d)
+}
+
+// RecordCanaryError records a terminal error for an operation that never ran, through the path every operation uses
+// (the K7 canary, PLAN §44.4). The record has a fresh op id and the read class; nothing reaches Latency or Progress.
+//
+// Parameters:
+//   - err: the error
+//
+// Returns:
+//   - uint64: the op id it was recorded under
+func (e *Env) RecordCanaryError(err error) uint64 {
+	info := OpInfo{ID: e.OpIDs.Add(1), Session: e.SessionID, Class: ClassRead}
+	e.record(info, err, nil, gocql.Quorum)
+	return info.ID
 }
 
 func (e *Env) record(info OpInfo, err error, host *gocql.HostInfo, cl gocql.Consistency) {
@@ -435,10 +484,10 @@ func (e *Env) lwtForget(id int) {
 func (e *Env) scan(ctx context.Context, rng *rand.Rand, info OpInfo) {
 	p := rng.IntN(ScanPartitions)
 	pageSize := scanPageSizes[rng.IntN(len(scanPageSizes))]
-	switch v := rng.IntN(100); {
-	case v < controlledShare:
+	switch scanVariantOf(rng.IntN(100), e.Switches.NoEarlyClose) {
+	case scanControlled:
 		e.controlledScan(ctx, info, p, pageSize)
-	case v < controlledShare+resumeShare:
+	case scanResume:
 		e.resumeScan(ctx, info, p, pageSize)
 	default:
 		e.fullScan(ctx, info, p, pageSize)
@@ -532,7 +581,7 @@ func (e *Env) specRead(ctx context.Context, w int, rng *rand.Rand, info OpInfo) 
 	info.Proof = ProofSpeculation
 	k := e.pickKeys(w, rng, 1, true)[0]
 	sp := &gocql.SimpleSpeculativeExecution{
-		NumAttempts:  1 + rng.IntN(specAttemptsMax),
+		NumAttempts:  e.specAttempts(rng),
 		TimeoutDelay: time.Millisecond + time.Duration(rng.Int64N(int64(specMaxDelay-time.Millisecond)+1)),
 	}
 	deadline := time.Now().Add(OpDeadline)
@@ -550,6 +599,15 @@ func (e *Env) specRead(ctx context.Context, w int, rng *rand.Rand, info OpInfo) 
 	case !found:
 		e.Violations(fmt.Sprintf("spec-read of preloaded key (%d,%d) found no row", k.P, k.C))
 	}
+}
+
+// specAttempts draws a spec-read's NumAttempts, 1 or 2; without speculation it is 0 (K17), from the same draw.
+func (e *Env) specAttempts(rng *rand.Rand) int {
+	n := 1 + rng.IntN(specAttemptsMax)
+	if e.Switches.NoSpeculation {
+		return 0
+	}
+	return n
 }
 
 func (e *Env) shortDeadline(ctx context.Context, w int, rng *rand.Rand, info OpInfo) {

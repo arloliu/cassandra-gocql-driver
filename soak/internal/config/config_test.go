@@ -1,12 +1,14 @@
 package config
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/canary"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/workload"
 )
@@ -44,8 +46,9 @@ func TestOverridesLeaveHashesUnchanged(t *testing.T) {
 			o.CanaryParams = map[string]float64{"n": 20}
 			return o
 		}(),
-		"duration":  {Mode: "night", Workload: time.Hour},
-		"g15 scale": {Mode: "night", G15Scale: 0.5},
+		"k12 expected version": ValidationOverrides("K12"),
+		"duration":             {Mode: "night", Workload: time.Hour},
+		"g15 scale":            {Mode: "night", G15Scale: 0.5},
 	} {
 		c, err := New(b, o, 99)
 		require.NoError(t, err, name)
@@ -152,4 +155,48 @@ func TestEffective(t *testing.T) {
 	require.True(t, fixed)
 	require.Equal(t, []chaos.Kind{chaos.FaultStop, chaos.FaultPause}, a.Short)
 	require.InDelta(t, ValidationG15Scale, val.G15Scale(), 0)
+}
+
+// Every canary's overrides leave both hashes unchanged (PLAN §44.4, hash neutrality).
+func TestEveryCanaryIsHashNeutral(t *testing.T) {
+	b := base(t, "c50p5")
+	control, err := New(b, ValidationOverrides(""), 1)
+	require.NoError(t, err)
+	for _, s := range canary.All() {
+		o := ValidationOverrides(s.ID)
+		require.Equal(t, s.ID, o.Canary)
+		c, err := New(b, o, 2)
+		require.NoError(t, err, s.ID)
+		require.Equal(t, control.CellHash, c.CellHash, s.ID)
+		require.Equal(t, control.SharedHash, c.SharedHash, s.ID)
+		require.Equal(t, b.Shared.Workload, c.Base.Shared.Workload, "%s: workload.Params is untouched", s.ID)
+	}
+}
+
+// Only K12 changes G0's expected version; the ccm install directory keeps using the cell's (Base.Cell.Version).
+func TestExpectedVersion(t *testing.T) {
+	b := base(t, "c50p5")
+	for _, id := range []string{"", "K7"} {
+		c, err := New(b, ValidationOverrides(id), 1)
+		require.NoError(t, err)
+		require.Empty(t, c.Overrides.ExpectedVersion, id)
+		require.Equal(t, "5.0.3", c.ExpectedVersion(), id)
+	}
+	k12, _ := canary.Lookup("K12")
+	c, err := New(b, ValidationOverrides("K12"), 1)
+	require.NoError(t, err)
+	require.Equal(t, k12.ExpectedVersion, c.ExpectedVersion())
+	require.Equal(t, "5.0.3", c.Base.Cell.Version)
+}
+
+// No canary, no override field: a control's and a night's overrides are what they were before the canaries.
+func TestNoCanaryNoOverrideField(t *testing.T) {
+	o := ValidationOverrides("")
+	require.Empty(t, o.Canary)
+	require.Empty(t, o.ExpectedVersion)
+	require.Nil(t, o.CanaryParams)
+	raw, err := json.Marshal(o)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "canary")
+	require.NotContains(t, string(raw), "expected_version")
 }

@@ -419,3 +419,30 @@ func TestObserverKeepsTheFailedUpdateAfterASuccessfulRead(t *testing.T) {
 		Err: errors.New("cas write timeout")})
 	require.Equal(t, 2*time.Millisecond, o.FailedAttempt(7).Elapsed)
 }
+
+// K15: with early close disabled, the controlled share runs as full scans; the draw itself is unchanged.
+func TestScanVariantWithoutEarlyClose(t *testing.T) {
+	count := func(noEarlyClose bool) map[scanVariant]int {
+		out := map[scanVariant]int{}
+		for v := range 100 {
+			out[scanVariantOf(v, noEarlyClose)]++
+		}
+		return out
+	}
+	require.Equal(t, map[scanVariant]int{scanControlled: 40, scanResume: 10, scanFull: 50}, count(false))
+	require.Equal(t, map[scanVariant]int{scanResume: 10, scanFull: 90}, count(true))
+}
+
+// K17: with speculation disabled every spec-read gets NumAttempts 0, and the generator advances exactly as before.
+func TestSpecAttemptsWithoutSpeculation(t *testing.T) {
+	on, off := &Env{}, &Env{Switches: Switches{NoSpeculation: true}}
+	a, b := rand.New(rand.NewPCG(1, 2)), rand.New(rand.NewPCG(1, 2))
+	seen := map[int]bool{}
+	for range 200 {
+		n := on.specAttempts(a)
+		seen[n] = true
+		require.Equal(t, 0, off.specAttempts(b))
+		require.Equal(t, a.Uint64(), b.Uint64(), "the same draws")
+	}
+	require.Equal(t, map[int]bool{1: true, 2: true}, seen)
+}

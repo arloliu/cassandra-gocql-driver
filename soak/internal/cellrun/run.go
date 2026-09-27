@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/artifact"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/canary"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/ccmctl"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/cell"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
@@ -83,6 +84,8 @@ type Options struct {
 	LaunchToken string
 	// GatesPath is gates.json; a missing file leaves every calibrated gate invalid-config.
 	GatesPath string
+	// Canary is the canary id of a validation run, empty for none (PLAN §44.5).
+	Canary string
 	// KeepFailed keeps the cluster of a cell that did not pass.
 	KeepFailed bool
 	// Repository holds the unpacked Cassandra versions; CCMBin, CCMConfig and JavaHome are the ccm environment.
@@ -113,6 +116,8 @@ type VerdictFile struct {
 	Cell       string `json:"cell"`
 	CellHash   string `json:"cell_hash"`
 	SharedHash string `json:"shared_hash"`
+	// Validation is the validation judgment (PLAN §44.3), written with the final verdict of a validation run only.
+	Validation *canary.Validation `json:"validation,omitempty"`
 }
 
 // Evidence is the completeness of a run's measurements and artifacts.
@@ -152,6 +157,8 @@ type cellRun struct {
 	tl   config.Timeline
 	sch  chaos.Schedule
 	th   gate.Thresholds
+	// canary is the validation run's canary; the zero Spec for none.
+	canary canary.Spec
 
 	vmu     sync.Mutex
 	vfile   VerdictFile
@@ -199,15 +206,15 @@ type cellRun struct {
 //
 // Returns:
 //   - string: the execution directory
-//   - gate.Verdict: the final verdict
+//   - VerdictFile: the final verdict.json, with the validation judgment in validation mode
 //   - error: when the execution directory itself could not be written
-func Run(ctx context.Context, o Options) (string, gate.Verdict, error) {
+func Run(ctx context.Context, o Options) (string, VerdictFile, error) {
 	r := &cellRun{o: o, logf: o.Logf, windows: &chaos.Windows{}, reg: view.NewRegistry(), diskLow: make(chan struct{})}
 	if r.logf == nil {
 		r.logf = func(string, ...any) {}
 	}
 	if err := r.prepare(); err != nil {
-		return r.dir, gate.Verdict{}, err
+		return r.dir, VerdictFile{}, err
 	}
 	r.execute(ctx)
 	if r.rec != nil {
@@ -226,14 +233,27 @@ func Run(ctx context.Context, o Options) (string, gate.Verdict, error) {
 		}
 	}
 	v = Evaluate(r.col)
+	evidence := EvidenceOf(v, r.col.Incomplete)
 	r.vmu.Lock()
-	r.vfile.Evidence = EvidenceOf(v, r.col.Incomplete)
+	r.vfile.Evidence = evidence
+	if r.o.Mode == gate.ModeValidate {
+		// The judgment reads the persisted records, so it runs once every stream is closed (PLAN §44.3, §44.8).
+		val := judgeRun(r.dir, r.canary.ID, v, evidence)
+		r.vfile.Validation = &val
+	}
 	r.vmu.Unlock()
-	if err := r.writeVerdict(PhaseDone, true, &v); err != nil {
-		return r.dir, v, fmt.Errorf("final verdict.json: %w", err)
+	err := r.writeVerdict(PhaseDone, true, &v)
+	r.vmu.Lock()
+	final := r.vfile
+	r.vmu.Unlock()
+	if err != nil {
+		return r.dir, final, fmt.Errorf("final verdict.json: %w", err)
 	}
 	r.logf("verdict %s %v %v", v.Status, v.FailingGates, v.Reasons)
-	return r.dir, v, nil
+	if final.Validation != nil {
+		r.logf("validation %q: %s %v", final.Validation.Canary, final.Validation.Result, final.Validation.Reasons)
+	}
+	return r.dir, final, nil
 }
 
 // artifactFailure records an artifact write that failed.
@@ -288,10 +308,20 @@ func (r *cellRun) prepare() error {
 			return err
 		}
 	}
+	if r.o.Canary != "" {
+		spec, ok := canary.Lookup(r.o.Canary)
+		switch {
+		case r.o.Mode != gate.ModeValidate:
+			return fmt.Errorf("canary %s runs only in validation mode", r.o.Canary)
+		case !ok || !spec.Implemented:
+			return fmt.Errorf("canary %s is not implemented", r.o.Canary)
+		}
+		r.canary = spec
+	}
 	base := config.NightBase(c, cell.DriverSettings(), r.o.Rate, r.o.Workers)
 	overrides := config.Overrides{Mode: gate.ModeNight}
 	if r.o.Mode == gate.ModeValidate {
-		overrides = config.ValidationOverrides("")
+		overrides = config.ValidationOverrides(r.o.Canary)
 	}
 	if r.conf, err = config.New(base, overrides, r.o.Seed); err != nil {
 		return err
@@ -498,6 +528,9 @@ func (r *cellRun) setup(ctx context.Context) bool {
 	if r.primary, err = openBounded(pspec, openBound); err != nil {
 		return fixture("open primary: %v", err)
 	}
+	if e, ok := canary.ArmBeforeG0(r.canary.ID, time.Now()); ok {
+		r.rec.Event("canary", e.Time, e)
+	}
 	if !r.g0(ctx) {
 		return false
 	}
@@ -524,6 +557,7 @@ func (r *cellRun) setup(ctx context.Context) bool {
 	r.churner = &Churner{Spec: spec, Sampler: r.sampler, Recorder: r.rec, Ledger: ledger, Settlement: settlement,
 		OpIDs: r.env.OpIDs, Violations: r.violation, Rate: r.o.Rate, Workers: r.o.Workers, Seed: r.o.Seed,
 		Registry: r.reg, FDDir: "/proc/self/fd", NetDir: "/proc/net"}
+	applyEnvHooks(r.canary, r.env, r.churner)
 	return true
 }
 
@@ -534,9 +568,10 @@ func (r *cellRun) g0(ctx context.Context) bool {
 	if err != nil {
 		v = append(v, err.Error())
 	}
+	want := r.conf.ExpectedVersion()
 	for addr, ver := range versions {
-		if ver != r.conf.Base.Cell.Version {
-			v = append(v, fmt.Sprintf("%s release_version %s, want %s", addr, ver, r.conf.Base.Cell.Version))
+		if ver != want {
+			v = append(v, fmt.Sprintf("%s release_version %s, want %s", addr, ver, want))
 		}
 	}
 	if len(versions) != clusterNodes {
@@ -606,6 +641,10 @@ func (r *cellRun) workload(ctx context.Context) {
 	var bg sync.WaitGroup
 	bg.Go(func() { r.sampler.Run(bgCtx) })
 	bg.Go(func() { r.health.Run(healthCtx, r.epoch) })
+	// The canary goroutine (PLAN §44.5) stops with the background work; what it leaked stays leaked.
+	bg.Go(canary.Start(bgCtx, r.canary.ID, canary.Deps{Epoch: r.epoch, Session: r.primary.Session, Env: r.env, Streams: r.primary.Streams,
+		Event:    func(e canary.Event) { r.rec.Event("canary", e.Time, e) },
+		InWindow: func(t time.Time) bool { _, in := r.windows.At(t); return in }}))
 	bg.Go(func() {
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
@@ -695,8 +734,8 @@ wait:
 	r.col.Settlement = r.env.Settlement.Totals()
 	r.col.ShortDeadlineTimeouts = int(r.env.ShortDeadlineTimeouts.Load())
 	r.col.Churns = r.churner.Residue()
-	r.rec.Event("coverage", time.Now(), map[string]any{"settlement": r.col.Settlement,
-		"short_deadline_timeouts": r.col.ShortDeadlineTimeouts, "error_classes": r.rec.ClassCounts()})
+	r.rec.Event("coverage", time.Now(), coverageEvent{Settlement: r.col.Settlement,
+		ShortDeadlineTimeouts: r.col.ShortDeadlineTimeouts, ErrorClasses: r.rec.ClassCounts()})
 	r.latency()
 	r.rec.Event("latency", time.Now(), map[string]any{"warmup_p99_s": r.col.WarmupP99, "cooldown_p99_s": r.col.CooldownP99})
 
@@ -767,7 +806,8 @@ func (r *cellRun) latency() {
 // oracles runs the final register and LWT checks (PLAN §4.3, §4.4).
 func (r *cellRun) oracles(ctx context.Context) {
 	ranges := append([]workload.Range{workload.PrimaryRange()}, r.churner.Ranges()...)
-	keys := workload.SampleKeys(rand.New(rand.NewPCG(r.o.Seed, 0x6a10)), ranges, workload.RegisterSample, nil)
+	// K8's pinned key, when it runs, is always sampled (PLAN §44.2); otherwise Excluded is nil.
+	keys := workload.SampleKeys(rand.New(rand.NewPCG(r.o.Seed, 0x6a10)), ranges, workload.RegisterSample, r.env.Excluded)
 	r.col.Register = workload.VerifyRegister(ctx, r.primary.Session, r.env.Ledger, keys)
 	lwt := workload.VerifyLWT(ctx, r.primary.Session, r.env.LWT)
 	r.col.LWT, r.col.Uncertain = lwt.Violations, lwt.Uncertain

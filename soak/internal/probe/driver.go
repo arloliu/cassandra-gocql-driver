@@ -27,6 +27,8 @@ const (
 // StreamCounters counts one session's streams for G6: started, finished, abandoned.
 type StreamCounters struct {
 	started, finished, abandoned atomic.Int64
+	// skipEvery and finishes implement the K6b canary: once armed, one in every skipEvery finished increments is dropped.
+	skipEvery, finishes atomic.Int64
 }
 
 var _ gocql.StreamObserver = (*StreamCounters)(nil)
@@ -99,11 +101,23 @@ func (c *StreamCounters) Balance() int64 {
 	return s - f - a
 }
 
+// SkipFinished arms the K6b canary (PLAN §44.2): from now on the counters drop one in every n finished increments.
+// Until it is called they count every one; it may be called while the session runs.
+//
+// Parameters:
+//   - n: the period
+func (c *StreamCounters) SkipFinished(n int64) { c.skipEvery.Store(n) }
+
 // StreamStarted counts a started stream.
 func (s streamContext) StreamStarted(gocql.ObservedStream) { s.c.started.Add(1) }
 
 // StreamFinished counts a stream that received its response.
-func (s streamContext) StreamFinished(gocql.ObservedStream) { s.c.finished.Add(1) }
+func (s streamContext) StreamFinished(gocql.ObservedStream) {
+	if n := s.c.skipEvery.Load(); n > 0 && s.c.finishes.Add(1)%n == 0 {
+		return
+	}
+	s.c.finished.Add(1)
+}
 
 // StreamAbandoned counts a stream whose connection closed first.
 func (s streamContext) StreamAbandoned(gocql.ObservedStream) { s.c.abandoned.Add(1) }

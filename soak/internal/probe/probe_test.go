@@ -194,3 +194,25 @@ func TestLatencySliceHistograms(t *testing.T) {
 	require.EqualValues(t, 1, n)
 	require.GreaterOrEqual(t, q, time.Millisecond)
 }
+
+// K6b: once armed, the counters drop exactly one in every n finished increments, and nothing else;
+// before that they count every one.
+func TestStreamCountersSkipFinished(t *testing.T) {
+	var c StreamCounters
+	sc := c.StreamContext(nil)
+	for range 300 {
+		sc.StreamStarted(gocql.ObservedStream{})
+		sc.StreamFinished(gocql.ObservedStream{})
+	}
+	_, finished, _ := c.Snapshot()
+	require.Equal(t, int64(300), finished, "nothing is dropped before the arm")
+	c.SkipFinished(500)
+	for range 1000 {
+		sc.StreamStarted(gocql.ObservedStream{})
+		sc.StreamFinished(gocql.ObservedStream{})
+	}
+	sc.StreamAbandoned(gocql.ObservedStream{})
+	started, finished, abandoned := c.Snapshot()
+	require.Equal(t, []int64{1300, 1298, 1}, []int64{started, finished, abandoned})
+	require.Equal(t, int64(1), c.Balance())
+}

@@ -49,6 +49,8 @@ type Churner struct {
 	CloseSession func(*cell.Session)
 	// Measure takes an aux session's residue after its grace period; nil means the /proc-based probe.
 	Measure func(id string) (measured bool, live, sockets int, groups map[string]int, err error)
+	// Switches are the configuration canaries' Env flags, set on every aux Env too (K15, K17).
+	Switches workload.Switches
 	// StartLoad starts the aux load; nil means workload.Start.
 	StartLoad func(ctx context.Context, env *workload.Env, rate float64, workers int, mix workload.Mix, seed uint64) (Stopper, error)
 
@@ -161,7 +163,7 @@ func (o *auxOwner) load(ctx context.Context, rng workload.Range, index int) erro
 		Session: o.sess.Session, SessionID: o.id, Range: rng, Workers: max(c.Workers/workload.AuxWorkersDivisor, 1),
 		ChurnSpace: cell.ChurnSpace(), Ledger: c.Ledger, Settlement: c.Settlement,
 		Progress: workload.NewProgress(time.Now()), Latency: probe.NewLatency(time.Now()), OpIDs: c.OpIDs,
-		Errors: c.Recorder.Error, Violations: c.Violations,
+		Errors: c.Recorder.Error, Violations: c.Violations, Switches: c.Switches,
 	}
 	start := c.StartLoad
 	if start == nil {

@@ -15,6 +15,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/canary"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/workload"
@@ -163,6 +164,9 @@ type Overrides struct {
 	Canary string `json:"canary,omitempty"`
 	// CanaryParams are the canary's parameters, e.g. K16's n.
 	CanaryParams map[string]float64 `json:"canary_params,omitempty"`
+	// ExpectedVersion replaces the Cassandra version G0 expects (K12); empty keeps Base.Cell.Version,
+	// which also names the ccm install directory.
+	ExpectedVersion string `json:"expected_version,omitempty"`
 	// G15Scale scales the G15 minimums; zero means 1.
 	G15Scale float64 `json:"g15_scale,omitempty"`
 }
@@ -248,17 +252,23 @@ func NightBase(c Cell, driver Driver, rate float64, workers int) Base {
 // ValidationOverrides returns the overrides of a validation run (PLAN §7): its own timeline and timetable,
 // F-stop then F-pause as the fixed faults, and the scaled G15 minimums.
 //
+// A canary's overrides are its id and, for K12, the expected version (PLAN §44.4); every other hook follows from the id.
+//
 // Parameters:
-//   - canary: the canary id, empty for the control run
+//   - id: the canary id, empty for the control run
 //
 // Returns:
 //   - Overrides: the overrides
-func ValidationOverrides(canary string) Overrides {
-	return Overrides{
+func ValidationOverrides(id string) Overrides {
+	o := Overrides{
 		Mode: gate.ModeValidate, Workload: ValidationWorkload, Warmup: ValidationWarmup, Cooldown: ValidationCooldown,
 		Timetable: chaos.ValidationTimetable(), Faults: []chaos.Kind{chaos.FaultStop, chaos.FaultPause},
-		Canary: canary, G15Scale: ValidationG15Scale,
+		Canary: id, G15Scale: ValidationG15Scale,
 	}
+	if s, ok := canary.Lookup(id); ok {
+		o.ExpectedVersion = s.ExpectedVersion
+	}
+	return o
 }
 
 // Normalize returns a base in canonical form: the mandatory set and the mix sorted, the timetable by start.
@@ -351,6 +361,17 @@ func (c Config) Effective() (Timeline, []chaos.Slot, chaos.Assignment, bool) {
 		return tl, slices.Clone(slots), chaos.Assignment{Short: slices.Clone(c.Overrides.Faults)}, true
 	}
 	return tl, slices.Clone(slots), chaos.Assignment{Short: slices.Clone(c.Base.Cell.Short), Long: c.Base.Cell.Long}, false
+}
+
+// ExpectedVersion returns the Cassandra version G0 expects: K12's override, or the cell's.
+//
+// Returns:
+//   - string: the version
+func (c Config) ExpectedVersion() string {
+	if c.Overrides.ExpectedVersion != "" {
+		return c.Overrides.ExpectedVersion
+	}
+	return c.Base.Cell.Version
 }
 
 // G15Scale returns the scale of the G15 minimums.
