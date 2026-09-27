@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# A fake git for the run-night.sh fixtures: FAKE_GIT=stall makes it hang, as a stuck build-fact command would.
+[[ "${FAKE_GIT:-}" == stall ]] && exec sleep 1000
+exec /usr/bin/git "$@"

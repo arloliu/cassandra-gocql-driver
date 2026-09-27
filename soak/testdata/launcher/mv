@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# A fake mv for the run-night.sh fixtures: FAKE_MV=fail-stdout leaves a partial stdout.log at the destination
+# and fails, as a cross-filesystem copy that hits a read error would; FAKE_MV=fail-receipt-done fails the launcher's
+# final receipt write, fail-receipt-first its first `started`, fail-receipt-digest the `started` carrying the digest;
+# fail-json-final and fail-md-final the runner's final summary JSON or Markdown, fail-md-then-json the final Markdown
+# and then the recommitted JSON; every other call is the real mv.
+if [[ "${FAKE_MV:-}" == fail-receipt-done && "$*" == *receipt.json.tmp* ]] && grep -q '"state": "done"' "${@: -2:1}" 2>/dev/null; then
+  exit 1
+fi
+if [[ "$*" == *receipt.json.tmp* ]]; then
+  src=${*: -2:1}
+  [[ "${FAKE_MV:-}" == fail-receipt-first ]] && grep -q '"state": "started"' "$src" && ! grep -q '"digest"' "$src" && exit 1
+  [[ "${FAKE_MV:-}" == fail-receipt-digest ]] && grep -q '"state": "started"' "$src" && grep -q '"digest"' "$src" && exit 1
+fi
+if [[ "${FAKE_MV:-}" == fail-json-final && "$*" == *night-*.json.tmp* ]] && grep -q '"state": "completed"' "${@: -2:1}"; then
+  exit 1
+fi
+if [[ "${FAKE_MV:-}" == fail-md-final || "${FAKE_MV:-}" == fail-md-then-json ]] && [[ "$*" == *night-*.md.tmp* ]] &&
+  grep -q ' — completed' "${@: -2:1}"; then
+  exit 1
+fi
+if [[ "${FAKE_MV:-}" == fail-md-then-json && "$*" == *night-*.json.tmp* ]] && grep -q '"runner_exit": 3' "${@: -2:1}"; then
+  exit 1
+fi
+if [[ "${FAKE_MV:-}" == fail-stdout ]]; then
+  for a in "$@"; do
+    if [[ "$a" == *.stdout.log ]]; then
+      dest=${*: -1}
+      echo partial >"$dest"
+      exit 1
+    fi
+  done
+fi
+exec /usr/bin/mv "$@"

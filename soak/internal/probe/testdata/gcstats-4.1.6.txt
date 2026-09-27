@@ -1,0 +1,4 @@
+
+       Interval (ms) Max GC Elapsed (ms)Total GC Elapsed (ms)Stdev GC Elapsed (ms)   GC Reclaimed (MB)         Collections      Direct Memory Bytes
+               43648                  51                 440                   8         22358001656                 109                       -1
+

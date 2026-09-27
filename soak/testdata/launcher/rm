@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# A fake rm for the run-night.sh fixtures: FAKE_RM=stuck makes deleting a soak cluster hang,
+# FAKE_RM=current-fail makes clearing CURRENT fail; every other call is the real rm.
+for a in "$@"; do
+  [[ "${FAKE_RM:-}" == stuck && "$a" =~ /gocql_soak_c[0-9]{2}p[0-9]$ ]] && exec sleep 1000
+  [[ "${FAKE_RM:-}" == current-fail && "$a" == */CURRENT ]] && exit 1
+done
+exec /usr/bin/rm "$@"

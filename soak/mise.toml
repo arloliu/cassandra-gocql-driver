@@ -1,0 +1,6 @@
+# Directory-scoped toolchain for the soak harness (PLAN D1/D2).
+# The root module stays on go 1.24; only this nested module uses 1.27.
+[tools]
+go = "1.27.1"
+golangci-lint = "2.13.1"
+"aqua:Shopify/toxiproxy" = "2.12.0"

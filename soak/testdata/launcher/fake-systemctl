@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# A fake systemctl for the run-cells.sh fixtures (SYSTEMCTL): FAKE_SYSTEMCTL=show-fail makes every `show` fail,
+# FAKE_SYSTEMCTL=jobs-fail makes `list-jobs` fail, stop-fail every `stop`, show-hang and stop-hang make those hang,
+# jobs-slow delays `list-jobs` by 3 s; every other call is the real systemctl.
+for a in "$@"; do
+  [[ "${FAKE_SYSTEMCTL:-}" == show-fail && "$a" == show ]] && exit 1
+  [[ "${FAKE_SYSTEMCTL:-}" == jobs-fail && "$a" == list-jobs ]] && exit 1
+  [[ "${FAKE_SYSTEMCTL:-}" == show-hang && "$a" == show ]] && exec sleep 100000
+  [[ "${FAKE_SYSTEMCTL:-}" == stop-hang && "$a" == stop ]] && exec sleep 100000
+  [[ "${FAKE_SYSTEMCTL:-}" == stop-fail && "$a" == stop ]] && exit 1
+  [[ "${FAKE_SYSTEMCTL:-}" == jobs-slow && "$a" == list-jobs ]] && sleep 3
+done
+exec /usr/bin/systemctl "$@"

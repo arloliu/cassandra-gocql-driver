@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# A fake ln for the run-cells.sh fixtures: FAKE_LN_FAIL_FROM=N makes the Nth and later calls fail
+# (the runner links night.json and night.md at every summary write); every other call is the real ln.
+if [[ -n "${FAKE_LN_FAIL_FROM:-}" ]]; then
+  n=$(($(cat "$FIX/ln.count" 2>/dev/null || echo 0) + 1))
+  echo "$n" >"$FIX/ln.count"
+  ((n >= FAKE_LN_FAIL_FROM)) && exit 1
+fi
+exec /usr/bin/ln "$@"

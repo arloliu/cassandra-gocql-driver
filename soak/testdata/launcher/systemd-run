@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# A fake systemd-run for the run-cells.sh fixtures: FAKE_CLIENT=<mode>:<cell> changes how the result client behaves
+# for that cell's unit; every other call is the real systemd-run.
+#   stall-before  never submits and never exits (a client stuck before its announcement)
+#   stall-after   submits without --wait, prints the announcement, then never exits
+#   truncated     submits without --wait, prints the announcement and exits with no result
+#   fail          exits 1 without submitting
+#   delay         waits 3 s, then behaves normally
+#   silent        behaves normally but never prints its announcement
+mode=${FAKE_CLIENT%%:*} cell=${FAKE_CLIENT#*:}
+target=0
+for a in "$@"; do [[ "$a" == --unit=soak-cell-*"-$cell-"* ]] && target=1; done
+((target)) || exec /usr/bin/systemd-run "$@"
+nowait=()
+for a in "$@"; do [[ "$a" == --wait ]] || nowait+=("$a"); done
+case "$mode" in
+stall-before) exec sleep 100000 ;;
+stall-after)
+  /usr/bin/systemd-run "${nowait[@]}"
+  exec sleep 100000
+  ;;
+truncated) exec /usr/bin/systemd-run "${nowait[@]}" ;;
+fail)
+  echo "Failed to start transient service unit: fake failure" >&2
+  exit 1
+  ;;
+delay)
+  sleep 3
+  exec /usr/bin/systemd-run "$@"
+  ;;
+silent)
+  /usr/bin/systemd-run "$@" 2>&1 | grep -v '^Running as unit'
+  exit "${PIPESTATUS[0]}"
+  ;;
+esac
+exec /usr/bin/systemd-run "$@"

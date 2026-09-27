@@ -1,0 +1,33 @@
+version: "2"
+
+# The soak module is linted on its own, under Go 1.27 (soak/mise.toml).
+# Unlike the root module, its tests carry no build tags.
+
+issues:
+  max-same-issues: 50
+
+formatters:
+  enable:
+    - goimports
+
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/apache/cassandra-gocql-driver/v2
+
+linters:
+  default: none
+  enable:
+    - nolintlint
+    - govet
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - shadow
+        - fieldalignment
+
+    nolintlint:
+      allow-no-explanation: [ golines ]
+      require-explanation: true
+      require-specific: true
