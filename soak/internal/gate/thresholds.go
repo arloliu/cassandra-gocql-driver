@@ -43,6 +43,9 @@ const (
 	KGt = "kGt"
 )
 
+// AllThresholds lists every threshold name, in PLAN §41.1's order.
+var AllThresholds = []string{KG, KG0, KH, KHr, KF, KFs, KS, KSs, KE, KC, KCh, KL, KLWTu, KD, KGp, KGt}
+
 // ErrMissingThreshold is returned for a threshold that gates.json lacks or holds as a non-finite number.
 var ErrMissingThreshold = errors.New("gate: threshold missing from gates.json")
 

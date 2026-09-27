@@ -1,0 +1,127 @@
+{
+  "status": "invalid-config",
+  "reasons": [
+    "G2: [gate: threshold missing from gates.json: kG]",
+    "G3: [gate: threshold missing from gates.json: kH]",
+    "G4: [gate: threshold missing from gates.json: kF]",
+    "G6: [gate: threshold missing from gates.json: kS]",
+    "G7: [gate: threshold missing from gates.json: kE]",
+    "G10: [gate: threshold missing from gates.json: kLWTu]",
+    "G12: [gate: threshold missing from gates.json: kC]",
+    "G13: [gate: threshold missing from gates.json: kC]",
+    "G14: [gate: threshold missing from gates.json: kL]",
+    "G16: [gate: threshold missing from gates.json: kD]"
+  ],
+  "gates": [
+    {
+      "gate": "G0",
+      "status": "pass"
+    },
+    {
+      "gate": "G1",
+      "status": "pass"
+    },
+    {
+      "gate": "G2",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kG"
+      ]
+    },
+    {
+      "gate": "G3",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kH"
+      ]
+    },
+    {
+      "gate": "G4",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kF"
+      ]
+    },
+    {
+      "gate": "G5",
+      "status": "pass"
+    },
+    {
+      "gate": "G6",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kS"
+      ]
+    },
+    {
+      "gate": "G7",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kE"
+      ]
+    },
+    {
+      "gate": "G8",
+      "status": "pass"
+    },
+    {
+      "gate": "G9",
+      "status": "pass"
+    },
+    {
+      "gate": "G10",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kLWTu"
+      ]
+    },
+    {
+      "gate": "G11",
+      "status": "pass"
+    },
+    {
+      "gate": "G12",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kC"
+      ]
+    },
+    {
+      "gate": "G13",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kC"
+      ]
+    },
+    {
+      "gate": "G14",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kL"
+      ]
+    },
+    {
+      "gate": "G15",
+      "status": "pass"
+    },
+    {
+      "gate": "G16",
+      "status": "invalid-config",
+      "details": [
+        "gate: threshold missing from gates.json: kD"
+      ]
+    }
+  ],
+  "final": true,
+  "phase": "done",
+  "updated": "2026-09-27T06:05:16.680998305+08:00",
+  "t": 7235.710544216,
+  "workload_seconds": 7200.000912135,
+  "unexpected": 0,
+  "evidence": {
+    "complete": true
+  },
+  "cell": "c50p5",
+  "cell_hash": "0ac7c036bb017198790e19b60a88f8e3130acf1e0d8a31a4b22995ff4197fe6c",
+  "shared_hash": "37d3be27082238eed0be0f1ccc201c574e2eb2c7278af0559fa981486a540bfe"
+}

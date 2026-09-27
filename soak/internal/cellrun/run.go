@@ -298,7 +298,7 @@ func (r *cellRun) prepare() error {
 	}
 	tl, slots, assignment, fixed := r.conf.Effective()
 	r.tl = tl
-	r.nodes = []string{"node1", "node2", "node3"}
+	r.nodes = slices.Clone(cellNodes)
 	for i := range clusterNodes {
 		r.addrs = append(r.addrs, netip.MustParseAddr("127.0.1."+strconv.Itoa(i+1)))
 	}

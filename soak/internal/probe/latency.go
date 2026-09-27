@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"fmt"
 	"maps"
 	"math"
 	"slices"
@@ -26,6 +27,8 @@ type Latency struct {
 	mu    sync.Mutex
 	// slices is class → minute since epoch → histogram.
 	slices map[string]map[int]*histogram
+	// ambiguous holds the buckets a rebuild restored from a key several buckets share (RebuildLatency).
+	ambiguous map[int]bool
 }
 
 // histogram is a sparse log-linear histogram.
@@ -99,6 +102,38 @@ func (l *Latency) Observe(class string, at time.Time, d time.Duration, delayed b
 //   - int64: the number of observations in the window
 //   - bool: false when the window holds no observation
 func (l *Latency) Quantile(class string, from, to float64, q float64) (time.Duration, int64, bool) {
+	b, n, ok := l.quantileBucket(class, from, to, q)
+	if !ok {
+		return 0, 0, false
+	}
+	return bucketUpper(b), n, true
+}
+
+// QuantileChecked is Quantile on a rebuilt Latency, and also reports whether the selected bucket was restored
+// from a truncated key that several buckets share, so its bound is not certain (PLAN §41.2).
+//
+// Parameters:
+//   - class: the operation class
+//   - from, to: the span, seconds since the epoch
+//   - q: the quantile, in (0, 1]
+//
+// Returns:
+//   - time.Duration: the upper bound of the bucket holding the quantile
+//   - int64: how many observations the span holds
+//   - bool: false when the span holds none
+//   - bool: true when the selected bucket is ambiguous
+func (l *Latency) QuantileChecked(class string, from, to float64, q float64) (time.Duration, int64, bool, bool) {
+	b, n, ok := l.quantileBucket(class, from, to, q)
+	if !ok {
+		return 0, 0, false, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return bucketUpper(b), n, true, l.ambiguous[b]
+}
+
+// quantileBucket returns the bucket holding the q quantile of a class over [from, to).
+func (l *Latency) quantileBucket(class string, from, to float64, q float64) (int, int64, bool) {
 	merged := l.merge(class, from, to)
 	if merged.n == 0 {
 		return 0, 0, false
@@ -109,10 +144,10 @@ func (l *Latency) Quantile(class string, from, to float64, q float64) (time.Dura
 	for _, b := range slices.Sorted(maps.Keys(merged.buckets)) {
 		seen += merged.buckets[b]
 		if seen >= rank {
-			return bucketUpper(b), merged.n, true
+			return b, merged.n, true
 		}
 	}
-	return bucketUpper(slices.Max(slices.Collect(maps.Keys(merged.buckets)))), merged.n, true
+	return slices.Max(slices.Collect(maps.Keys(merged.buckets))), merged.n, true
 }
 
 // Counts returns how many operations of a class finished in the window, and how many were delayed.
@@ -219,4 +254,64 @@ func bucketOf(d time.Duration) int {
 
 func bucketUpper(b int) time.Duration {
 	return time.Duration(float64(bucketFloor) * math.Pow(bucketGrowth, float64(b)))
+}
+
+// RebuildLatency rebuilds a Latency from the slices samples.jsonl persisted (PLAN §41.2).
+// A slice keys each bucket by its upper bound truncated to whole microseconds, so below about 50 µs several buckets share a key:
+// such a key restores its highest bucket, and QuantileChecked reports a quantile that selects it.
+//
+// Parameters:
+//   - sliceSeconds: the slice length every persisted slice must have
+//   - byClass: each class's persisted slices
+//
+// Returns:
+//   - *Latency: the rebuilt histograms, with the zero time as epoch
+//   - error: a slice off the grid, of another length, repeated, with a key no bucket has, or whose counts do not add up
+func RebuildLatency(sliceSeconds int, byClass map[string][]SliceHistogram) (*Latency, error) {
+	l := &Latency{slice: sliceSeconds, slices: map[string]map[int]*histogram{}, ambiguous: map[int]bool{}}
+	var maxKey int64
+	for _, hs := range byClass {
+		for _, h := range hs {
+			for k := range h.UpperMicros {
+				maxKey = max(maxKey, k)
+			}
+		}
+	}
+	keyBuckets := map[int64][]int{}
+	for b := 0; b <= bucketOf(time.Duration(maxKey+1)*time.Microsecond); b++ {
+		k := bucketUpper(b).Microseconds()
+		keyBuckets[k] = append(keyBuckets[k], b)
+	}
+	for class, hs := range byClass {
+		bySlice := map[int]*histogram{}
+		l.slices[class] = bySlice
+		for _, h := range hs {
+			if h.Seconds != sliceSeconds || h.Start%sliceSeconds != 0 {
+				return nil, fmt.Errorf("class %s: slice at %d s of %d s is off the %d s grid", class, h.Start, h.Seconds, sliceSeconds)
+			}
+			idx := h.Start / sliceSeconds
+			if _, dup := bySlice[idx]; dup {
+				return nil, fmt.Errorf("class %s: slice at %d s appears twice", class, h.Start)
+			}
+			out := &histogram{buckets: map[int]int64{}, n: h.N, delayed: h.Delayed}
+			var sum int64
+			for k, n := range h.UpperMicros {
+				bs := keyBuckets[k]
+				if len(bs) == 0 {
+					return nil, fmt.Errorf("class %s: slice at %d s: no bucket has the upper bound %d µs", class, h.Start, k)
+				}
+				b := bs[len(bs)-1]
+				if len(bs) > 1 {
+					l.ambiguous[b] = true
+				}
+				out.buckets[b] += n
+				sum += n
+			}
+			if sum != h.N {
+				return nil, fmt.Errorf("class %s: slice at %d s: buckets hold %d observations, n is %d", class, h.Start, sum, h.N)
+			}
+			bySlice[idx] = out
+		}
+	}
+	return l, nil
 }

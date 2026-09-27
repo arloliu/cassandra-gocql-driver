@@ -6,7 +6,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/cell"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/config"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
@@ -105,7 +104,43 @@ func Evaluate(c Collected) gate.Verdict {
 // a night has at least one per done fault plus the cool-down's, a validation run at least three.
 const minQuietCheckpoints = 2
 
-func (c Collected) runGates() []gate.Result {
+// MinQuietCheckpoints is minQuietCheckpoints, for the calibration suitability check (PLAN §41.5).
+const MinQuietCheckpoints = minQuietCheckpoints
+
+// TrendSeries is what the trend-window gates read, built from the profiles exactly as the gates build it (PLAN §41.2).
+type TrendSeries struct {
+	// Warm and End bound the trend window, seconds since the epoch.
+	Warm, End float64
+	// Groups is each goroutine group's count over the trend profiles (G2).
+	Groups map[string]gate.Series
+	// Heap is the heap after GC over the trend profiles (G3).
+	Heap gate.Series
+	// QuietTotals and QuietFDs are the goroutine total and the fd count at quiet trend checkpoints (G2, G4).
+	QuietTotals, QuietFDs gate.Series
+	// QuietBalance is each session's stream balance at quiet trend checkpoints (G6).
+	QuietBalance map[string]gate.Series
+	// Quiet counts the quiet trend checkpoints.
+	Quiet int
+}
+
+// seriesBuild is everything runGates derives from the profiles.
+type seriesBuild struct {
+	TrendSeries
+	leaks   gate.Series
+	r2      []string
+	missing map[string][]string
+	notes   map[string][]string
+}
+
+// Series returns the trend-window series the gates read.
+//
+// Returns:
+//   - TrendSeries: the series, with the trend window's bounds
+func (c Collected) Series() TrendSeries {
+	return c.buildSeries().TrendSeries
+}
+
+func (c Collected) buildSeries() seriesBuild {
 	warm, end := c.Timeline.Warmup.Seconds(), c.WorkloadSeconds
 	// The trend window is [warm-up end, workload end]; the final sample, taken after the workload stopped,
 	// only feeds G1 (Codex I14).
@@ -183,6 +218,18 @@ func (c Collected) runGates() []gate.Result {
 			}
 		}
 	}
+	return seriesBuild{
+		TrendSeries: TrendSeries{Warm: warm, End: end, Groups: groups, Heap: heap, QuietTotals: quietTotals, QuietFDs: quietFDs, QuietBalance: quietBalance, Quiet: quiet},
+		leaks:       leaks, r2: r2, missing: missing, notes: notes,
+	}
+}
+
+func (c Collected) runGates() []gate.Result {
+	b := c.buildSeries()
+	warm, end := b.Warm, b.End
+	leaks, heap, quietFDs, quietBalance := b.leaks, b.Heap, b.QuietFDs, b.QuietBalance
+	r2, missing, notes := b.r2, b.missing, b.notes
+	miss := func(g, format string, args ...any) { missing[g] = append(missing[g], fmt.Sprintf(format, args...)) }
 	if c.G12Checked {
 		leaks = append(leaks, gate.Point{T: end, V: float64(c.G12.Leaks)})
 	}
@@ -226,7 +273,7 @@ func (c Collected) runGates() []gate.Result {
 
 	out := []gate.Result{
 		gate.G1(leaks),
-		gate.G2(gate.G2Input{Groups: groups, QuietTotals: quietTotals, Base: float64(c.Baseline.Total), Hosts: clusterHosts, NumConns: cell.NumConns}, c.Thresholds),
+		gate.G2(c.g2Input(b.TrendSeries), c.Thresholds),
 		gate.G3(heap, warm, end, c.Thresholds),
 		gate.G4(quietFDs, float64(c.Baseline.FDs), c.Thresholds),
 		gate.Bool("G5", append(slices.Clone(c.Dials9042), r2...)),

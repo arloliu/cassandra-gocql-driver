@@ -1,0 +1,352 @@
+{
+  "base": {
+    "cell": {
+      "id": "c50p5",
+      "version": "5.0.3",
+      "proto": 5,
+      "compression": "lz4-segment",
+      "short": [
+        "F-full",
+        "F-kill",
+        "F-kill",
+        "F-pause",
+        "F-stop",
+        "F-two"
+      ],
+      "long": "F-roll"
+    },
+    "shared": {
+      "rate": 1500,
+      "workers": 32,
+      "mix": [
+        {
+          "Class": "batch-logged",
+          "Weight": 7
+        },
+        {
+          "Class": "batch-unlogged",
+          "Weight": 4
+        },
+        {
+          "Class": "churn",
+          "Weight": 6
+        },
+        {
+          "Class": "large-read",
+          "Weight": 4
+        },
+        {
+          "Class": "lwt",
+          "Weight": 3
+        },
+        {
+          "Class": "read",
+          "Weight": 28
+        },
+        {
+          "Class": "scan",
+          "Weight": 7
+        },
+        {
+          "Class": "short-deadline",
+          "Weight": 3
+        },
+        {
+          "Class": "spec-read",
+          "Weight": 5
+        },
+        {
+          "Class": "write",
+          "Weight": 33
+        }
+      ],
+      "driver": {
+        "num_conns": 2,
+        "consistency": "QUORUM",
+        "serial_consistency": "SERIAL",
+        "timeout": 2000000000,
+        "connect_timeout": 5000000000,
+        "reconnect_interval": 10000000000,
+        "host_policy": "TokenAwareHostPolicy(RoundRobinHostPolicy())",
+        "op_deadline": 2000000000,
+        "short_deadline_min": 1000000,
+        "short_deadline_max": 300000000,
+        "retries": 2
+      },
+      "faults": {
+        "F-black": {
+          "Install": 60000000000,
+          "ActiveMin": 30000000000,
+          "ActiveMax": 120000000000,
+          "Remove": 60000000000,
+          "Recovery": 120000000000,
+          "Width": 1,
+          "SubFaults": 0
+        },
+        "F-bw": {
+          "Install": 60000000000,
+          "ActiveMin": 30000000000,
+          "ActiveMax": 120000000000,
+          "Remove": 60000000000,
+          "Recovery": 90000000000,
+          "Width": 1,
+          "SubFaults": 0
+        },
+        "F-ddl": {
+          "Install": 30000000000,
+          "ActiveMin": 60000000000,
+          "ActiveMax": 60000000000,
+          "Remove": 30000000000,
+          "Recovery": 60000000000,
+          "Width": 0,
+          "SubFaults": 0
+        },
+        "F-full": {
+          "Install": 60000000000,
+          "ActiveMin": 30000000000,
+          "ActiveMax": 60000000000,
+          "Remove": 90000000000,
+          "Recovery": 180000000000,
+          "Width": 3,
+          "SubFaults": 0
+        },
+        "F-halfopen": {
+          "Install": 60000000000,
+          "ActiveMin": 30000000000,
+          "ActiveMax": 90000000000,
+          "Remove": 60000000000,
+          "Recovery": 120000000000,
+          "Width": 1,
+          "SubFaults": 0
+        },
+        "F-kill": {
+          "Install": 60000000000,
+          "ActiveMin": 30000000000,
+          "ActiveMax": 120000000000,
+          "Remove": 90000000000,
+          "Recovery": 90000000000,
+          "Width": 1,
+          "SubFaults": 0
+        },
+        "F-lat": {
+          "Install": 60000000000,
+          "ActiveMin": 30000000000,
+          "ActiveMax": 120000000000,
+          "Remove": 60000000000,
+          "Recovery": 90000000000,
+          "Width": 1,
+          "SubFaults": 0
+        },
+        "F-pause": {
+          "Install": 60000000000,
+          "ActiveMin": 10000000000,
+          "ActiveMax": 90000000000,
+          "Remove": 60000000000,
+          "Recovery": 120000000000,
+          "Width": 1,
+          "SubFaults": 0
+        },
+        "F-reset": {
+          "Install": 60000000000,
+          "ActiveMin": 0,
+          "ActiveMax": 0,
+          "Remove": 60000000000,
+          "Recovery": 90000000000,
+          "Width": 1,
+          "SubFaults": 0
+        },
+        "F-roll": {
+          "Install": 0,
+          "ActiveMin": 0,
+          "ActiveMax": 0,
+          "Remove": 0,
+          "Recovery": 0,
+          "Width": 1,
+          "SubFaults": 3
+        },
+        "F-stop": {
+          "Install": 60000000000,
+          "ActiveMin": 30000000000,
+          "ActiveMax": 120000000000,
+          "Remove": 90000000000,
+          "Recovery": 90000000000,
+          "Width": 1,
+          "SubFaults": 0
+        },
+        "F-topo": {
+          "Install": 480000000000,
+          "ActiveMin": 0,
+          "ActiveMax": 0,
+          "Remove": 480000000000,
+          "Recovery": 90000000000,
+          "Width": 0,
+          "SubFaults": 0
+        },
+        "F-two": {
+          "Install": 60000000000,
+          "ActiveMin": 30000000000,
+          "ActiveMax": 90000000000,
+          "Remove": 90000000000,
+          "Recovery": 180000000000,
+          "Width": 2,
+          "SubFaults": 0
+        }
+      },
+      "timetable": [
+        {
+          "id": "M0",
+          "kind": "ddl",
+          "start": 900000000000,
+          "end": 1200000000000
+        },
+        {
+          "id": "C1",
+          "kind": "churn",
+          "start": 1200000000000,
+          "end": 1350000000000
+        },
+        {
+          "id": "M1",
+          "kind": "short",
+          "start": 1350000000000,
+          "end": 1800000000000
+        },
+        {
+          "id": "C2",
+          "kind": "churn",
+          "start": 1800000000000,
+          "end": 1950000000000
+        },
+        {
+          "id": "M2",
+          "kind": "short",
+          "start": 1950000000000,
+          "end": 2400000000000
+        },
+        {
+          "id": "C3",
+          "kind": "churn",
+          "start": 2400000000000,
+          "end": 2550000000000
+        },
+        {
+          "id": "M3",
+          "kind": "short",
+          "start": 2550000000000,
+          "end": 3000000000000
+        },
+        {
+          "id": "C4",
+          "kind": "churn",
+          "start": 3000000000000,
+          "end": 3150000000000
+        },
+        {
+          "id": "M4",
+          "kind": "short",
+          "start": 3150000000000,
+          "end": 3600000000000
+        },
+        {
+          "id": "C5",
+          "kind": "churn",
+          "start": 3600000000000,
+          "end": 3750000000000
+        },
+        {
+          "id": "L",
+          "kind": "long",
+          "start": 3750000000000,
+          "end": 4950000000000
+        },
+        {
+          "id": "M5",
+          "kind": "short",
+          "start": 4950000000000,
+          "end": 5400000000000
+        },
+        {
+          "id": "C6",
+          "kind": "churn",
+          "start": 5400000000000,
+          "end": 5550000000000
+        },
+        {
+          "id": "M6",
+          "kind": "short",
+          "start": 5550000000000,
+          "end": 6000000000000
+        },
+        {
+          "id": "C7",
+          "kind": "churn",
+          "start": 6000000000000,
+          "end": 6150000000000
+        }
+      ],
+      "timeline": {
+        "warmup": 900000000000,
+        "cooldown": 6300000000000,
+        "workload": 7200000000000
+      },
+      "cluster": {
+        "nodes": 3,
+        "heap_max": "1G",
+        "heap_new": "256M",
+        "ip_prefix": "127.0.1."
+      },
+      "dataset": {
+        "primary_partitions": 4096,
+        "clustering_per_partition": 16,
+        "aux_ranges": 9,
+        "aux_partitions": 256,
+        "blob_keys": 64,
+        "scan_partitions": 64,
+        "scan_rows_per_partition": 12000,
+        "lwt_rows": 64,
+        "kv_payload_min": 100,
+        "kv_payload_max": 4096,
+        "register_sample": 2000
+      },
+      "workload": {
+        "logged_batch_members": 5,
+        "unlogged_batch_members": 3,
+        "scan_page_sizes": [
+          50,
+          500,
+          5000
+        ],
+        "controlled_scan_share": 40,
+        "resume_scan_share": 10,
+        "scan_pages_entered": 2,
+        "prefetch_threshold": 0.25,
+        "spec_attempts_max": 2,
+        "spec_max_delay": 30000000,
+        "aux_rate_share": 0.2,
+        "aux_workers_divisor": 4
+      },
+      "churn": {
+        "deadline": 150000000000,
+        "create": 20000000000,
+        "load": 30000000000,
+        "close": 30000000000,
+        "grace": 30000000000,
+        "residue": 20000000000,
+        "margin": 20000000000
+      },
+      "optional": [
+        "F-full",
+        "F-kill",
+        "F-pause",
+        "F-stop",
+        "F-two"
+      ]
+    }
+  },
+  "overrides": {
+    "mode": "night"
+  },
+  "seed": 17908040569242239381,
+  "cell_hash": "0ac7c036bb017198790e19b60a88f8e3130acf1e0d8a31a4b22995ff4197fe6c",
+  "shared_hash": "37d3be27082238eed0be0f1ccc201c574e2eb2c7278af0559fa981486a540bfe"
+}

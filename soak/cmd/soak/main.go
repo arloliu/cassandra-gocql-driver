@@ -14,7 +14,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: soak cell|smoke [flags]")
+		fmt.Fprintln(os.Stderr, "usage: soak cell|smoke|derive [flags]")
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -24,6 +24,8 @@ func main() {
 		os.Exit(cellMain(ctx, os.Args[2:]))
 	case "smoke":
 		os.Exit(smokeMain(ctx, os.Args[2:]))
+	case "derive":
+		os.Exit(deriveMain(os.Args[2:]))
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", os.Args[1])
 		os.Exit(2)

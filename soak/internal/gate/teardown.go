@@ -135,7 +135,6 @@ func G13(churns []ChurnResidue, failures []string, th Thresholds) Result {
 	}
 	kC, kCh := v[0], v[1]
 	details := slices.Clone(failures)
-	var residue Series
 	for _, c := range churns {
 		for _, f := range c.Failures {
 			details = append(details, fmt.Sprintf("%s: %s", c.Slot, f))
@@ -156,9 +155,8 @@ func G13(churns []ChurnResidue, failures []string, th Thresholds) Result {
 		for _, d := range groupDrift(c.Before, c.After, kC) {
 			details = append(details, fmt.Sprintf("%s: %s", c.Slot, d))
 		}
-		residue = append(residue, Point{T: float64(c.Index), V: float64(total(c.After) - total(c.Before))})
 	}
-	if slope, ok := TheilSenSlope(residue); ok && slope > kCh {
+	if slope, ok := TheilSenSlope(residueSeries(churns)); ok && slope > kCh {
 		details = append(details, fmt.Sprintf("residue slope %.2f goroutines per churn > %.2f", slope, kCh))
 	}
 	return result("G13", details)
@@ -176,11 +174,27 @@ func groupDrift(before, after map[string]int, tol float64) []string {
 	}
 	var details []string
 	for _, name := range slices.Sorted(maps.Keys(names)) {
-		if d := after[name] - before[name]; math.Abs(float64(d)) > tol {
+		if drift(before, after, name) > tol {
 			details = append(details, fmt.Sprintf("group %q %d → %d, beyond ±%.0f", name, before[name], after[name], tol))
 		}
 	}
 	return details
+}
+
+// drift is how far one goroutine group moved from before to after, a missing side counting as zero.
+func drift(before, after map[string]int, name string) float64 {
+	return math.Abs(float64(after[name] - before[name]))
+}
+
+// residueSeries is the per-churn residue G13 fits a slope to: the goroutine total's change over each measured churn, by churn index.
+func residueSeries(churns []ChurnResidue) Series {
+	var residue Series
+	for _, c := range churns {
+		if c.Measured {
+			residue = append(residue, Point{T: float64(c.Index), V: float64(total(c.After) - total(c.Before))})
+		}
+	}
+	return residue
 }
 
 func total(groups map[string]int) int {

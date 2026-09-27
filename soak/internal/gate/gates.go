@@ -124,15 +124,16 @@ func G2(in G2Input, th Thresholds) Result {
 	}
 	kG, kG0 := v[0], v[1]
 	var details []string
-	for _, name := range slices.Sorted(maps.Keys(in.Groups)) {
-		if slope, ok := TheilSenSlope(in.Groups[name]); ok && slope*secondsPerHour > kG {
-			details = append(details, fmt.Sprintf("group %q slope %.2f/h > %.2f/h", name, slope*secondsPerHour, kG))
+	slopes := groupSlopes(in.Groups)
+	for _, name := range slices.Sorted(maps.Keys(slopes)) {
+		if slopes[name] > kG {
+			details = append(details, fmt.Sprintf("group %q slope %.2f/h > %.2f/h", name, slopes[name], kG))
 		}
 	}
-	bound := in.Base + float64(in.Hosts*in.NumConns*goroutinesPerConn) + kG0
+	fixed := g2Fixed(in)
 	for _, p := range in.QuietTotals {
-		if p.V > bound {
-			details = append(details, fmt.Sprintf("t=%.0fs total %.0f > %.0f", p.T, p.V, bound))
+		if p.V-fixed > kG0 {
+			details = append(details, fmt.Sprintf("t=%.0fs total %.0f > %.0f", p.T, p.V, fixed+kG0))
 		}
 	}
 	return result("G2", details)
@@ -157,19 +158,18 @@ func G3(heapMiB Series, from, to float64, th Thresholds) Result {
 	}
 	kH, kHr := v[0], v[1]
 	var details []string
-	slope, ok := TheilSenSlope(heapMiB)
+	slope, ok := slopePerHour(heapMiB)
 	switch {
 	case !ok:
 		details = append(details, "too few heap samples for a slope")
-	case slope*secondsPerHour > kH:
-		details = append(details, fmt.Sprintf("heap slope %.2f MiB/h > %.2f MiB/h", slope*secondsPerHour, kH))
+	case slope > kH:
+		details = append(details, fmt.Sprintf("heap slope %.2f MiB/h > %.2f MiB/h", slope, kH))
 	}
-	early, okE := Median(heapMiB.Window(from, from+heapMedianSpan).Values())
-	late, okL := Median(heapMiB.Window(to-heapMedianSpan, to).Values())
+	early, late, ok := heapMedians(heapMiB, from, to)
 	switch {
-	case !okE || !okL:
+	case !ok:
 		details = append(details, "too few heap samples for the median comparison")
-	case late > early*(1+kHr):
+	case rise(early, late) > kHr:
 		details = append(details, fmt.Sprintf("late median %.1f MiB > early %.1f MiB × (1+%.2f)", late, early, kHr))
 	}
 	return result("G3", details)
@@ -189,7 +189,7 @@ func G4(quietFDs Series, fd0 float64, th Thresholds) Result {
 	if err != nil {
 		return invalid("G4", err)
 	}
-	return result("G4", boundAndSlope(quietFDs, fd0+v[0], v[1], "fds"))
+	return result("G4", boundAndSlope(quietFDs, fd0, v[0], v[1], "fds"))
 }
 
 // G6 checks each session's stream balance, started − finished − abandoned, at quiet checkpoints.
@@ -207,7 +207,7 @@ func G6(quietBalance map[string]Series, th Thresholds) Result {
 	}
 	var details []string
 	for _, id := range slices.Sorted(maps.Keys(quietBalance)) {
-		for _, d := range boundAndSlope(quietBalance[id], v[0], v[1], "streams") {
+		for _, d := range boundAndSlope(quietBalance[id], 0, v[0], v[1], "streams") {
 			details = append(details, fmt.Sprintf("session %s: %s", id, d))
 		}
 	}
@@ -354,7 +354,7 @@ func G14(warmupP99, cooldownP99 map[string]float64, classes []string, contaminat
 			details = append(details, fmt.Sprintf("class %s has no warm-up p99", class))
 			continue
 		}
-		if cool := cooldownP99[class]; cool > warm*(1+kL) {
+		if cool := cooldownP99[class]; rise(warm, cool) > kL {
 			details = append(details, fmt.Sprintf("class %s cool-down p99 %.4fs > warm-up %.4fs × (1+%.2f)", class, cool, warm, kL))
 		}
 	}
@@ -404,15 +404,15 @@ func Bool(gate string, violations []string) Result {
 	return result(gate, violations)
 }
 
-func boundAndSlope(s Series, bound, slopePerHour float64, unit string) []string {
+func boundAndSlope(s Series, base, slack, maxSlope float64, unit string) []string {
 	var details []string
 	for _, p := range s {
-		if p.V > bound {
-			details = append(details, fmt.Sprintf("t=%.0fs %.0f %s > %.0f", p.T, p.V, unit, bound))
+		if p.V-base > slack {
+			details = append(details, fmt.Sprintf("t=%.0fs %.0f %s > %.0f", p.T, p.V, unit, base+slack))
 		}
 	}
-	if slope, ok := TheilSenSlope(s); ok && slope*secondsPerHour > slopePerHour {
-		details = append(details, fmt.Sprintf("slope %.2f %s/h > %.2f/h", slope*secondsPerHour, unit, slopePerHour))
+	if slope, ok := slopePerHour(s); ok && slope > maxSlope {
+		details = append(details, fmt.Sprintf("slope %.2f %s/h > %.2f/h", slope, unit, maxSlope))
 	}
 	return details
 }

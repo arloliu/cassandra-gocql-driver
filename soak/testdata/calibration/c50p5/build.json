@@ -1,0 +1,16 @@
+{
+  "built_at": "2026-09-26T20:04:14Z",
+  "go_version": "go version go1.27.1 linux/amd64",
+  "driver_sha": "706fa066cd00b2f9799fca92ad25856b4ef8c643",
+  "driver_dirty": "true",
+  "ccm_version": "3.1.6.dev1338",
+  "soak_bin": "./bin/soak",
+  "soak_sha256": "5b48f54ee267bc96a47f6c257a3c65bc2871223fec7dcbc6498d8bca274b3086",
+  "cell": "c50p5",
+  "mode": "night",
+  "kind": "calib",
+  "attempt": "20260926T200414Z-11a4",
+  "keep_failed": false,
+  "deadline_s": 9300,
+  "ccm_config_dir": "/home/user/.ccm-soak"
+}

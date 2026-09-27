@@ -81,6 +81,38 @@ func G16(tp []TPStatsSample, gc []GCStatsSample, windows []Interval, th Threshol
 		kD, kGp, kGt = v[0], v[1], v[2]
 	}
 	var details []string
+	drops, gcs, missing := g16Observations(tp, gc, windows)
+	for _, d := range drops {
+		if d.Dropped > kD {
+			details = append(details, fmt.Sprintf("%s dropped %.0f messages in %.0f–%.0fs", d.Node, d.Dropped, d.From, d.To))
+		}
+	}
+	for _, s := range gcs {
+		if s.MaxPauseMs > kGp {
+			details = append(details, fmt.Sprintf("%s GC pause %.0f ms at %.0fs", s.Node, s.MaxPauseMs, s.T))
+		}
+		if share := gcShare(s); share > kGt {
+			details = append(details, fmt.Sprintf("%s GC share %.3f at %.0fs", s.Node, share, s.T))
+		}
+	}
+	if !evaluate {
+		return invalid("G16", err), missing
+	}
+	return result("G16", details), missing
+}
+
+// g16Drop is one node's dropped-message delta over one evaluated steady-state tpstats interval.
+type g16Drop struct {
+	Node     string
+	From, To float64
+	Dropped  float64
+}
+
+// g16Observations returns what G16 evaluates: the dropped-message deltas and the gcstats readings of the steady-state intervals,
+// and how many intervals were missing.
+func g16Observations(tp []TPStatsSample, gc []GCStatsSample, windows []Interval) ([]g16Drop, []GCStatsSample, int) {
+	var drops []g16Drop
+	var gcs []GCStatsSample
 	missing := 0
 
 	sorted := slices.Clone(tp)
@@ -110,8 +142,8 @@ func G16(tp []TPStatsSample, gc []GCStatsSample, windows []Interval, th Threshol
 				missing++
 			case after < before:
 				missing++
-			case after-before > kD:
-				details = append(details, fmt.Sprintf("%s dropped %.0f messages in %.0f–%.0fs", node, after-before, prev.T, cur.T))
+			default:
+				drops = append(drops, g16Drop{Node: node, From: prev.T, To: cur.T, Dropped: after - before})
 			}
 		}
 	}
@@ -124,17 +156,14 @@ func G16(tp []TPStatsSample, gc []GCStatsSample, windows []Interval, th Threshol
 			missing++
 			continue
 		}
-		if s.MaxPauseMs > kGp {
-			details = append(details, fmt.Sprintf("%s GC pause %.0f ms at %.0fs", s.Node, s.MaxPauseMs, s.T))
-		}
-		if share := s.TotalMs / s.IntervalMs; share > kGt {
-			details = append(details, fmt.Sprintf("%s GC share %.3f at %.0fs", s.Node, share, s.T))
-		}
+		gcs = append(gcs, s)
 	}
-	if !evaluate {
-		return invalid("G16", err), missing
-	}
-	return result("G16", details), missing
+	return drops, gcs, missing
+}
+
+// gcShare is the fraction of a gcstats interval spent in GC.
+func gcShare(s GCStatsSample) float64 {
+	return s.TotalMs / s.IntervalMs
 }
 
 func overlapsAny(iv Interval, windows []Interval) bool {

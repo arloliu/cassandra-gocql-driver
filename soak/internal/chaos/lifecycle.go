@@ -35,6 +35,8 @@ const (
 	Consecutive = 3
 	// windowTail extends a done fault's window (PLAN §6.1).
 	windowTail = 10 * time.Second
+	// WindowTail is windowTail, for the calibration loader: a done window ends exactly this long after its fault (PLAN §41.2).
+	WindowTail = windowTail
 )
 
 // State is a lifecycle state.
