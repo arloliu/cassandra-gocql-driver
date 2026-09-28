@@ -102,7 +102,7 @@ fi
 if wanted pass; then
   echo "pass: every slot validated, canaries in canonical order, controls around them"
   newbatch pass
-  run pass -gates "$GATES" -slots K7,K1 -- -toxiproxy /opt/toxi
+  run pass -date "$DATE" -gates "$GATES" -slots K7,K1 -- -toxiproxy /opt/toxi
   check "exit 0" test "$EXIT" = 0
   check "slots in canonical order" lq '.batch.slots == ["control-open", "k1", "k7", "control-close"]'
   check "every slot validated in one attempt" lq 'all(.slots[]; .effective.result == "validated" and (.attempts | length) == 1)'
@@ -122,7 +122,7 @@ fi
 if wanted dotted; then
   echo "dotted: a batch directory whose name contains '..' is not a traversal (Codex AU01)"
   newbatch "dotted..name"
-  run dotted -gates "$GATES" -slots K7
+  run dotted -date "$DATE" -gates "$GATES" -slots K7
   check "exit 0" test "$EXIT" = 0
   check "every slot validated" lq 'all(.slots[]; .effective.result == "validated")'
 fi
@@ -130,7 +130,7 @@ fi
 if wanted notval; then
   echo "notval: a not-validated slot (the real exit-1 cell entry) is recorded and the batch continues"
   newbatch notval
-  FAKE_VPLAN="k1-1=notval" run notval -gates "$GATES" -slots K1,K7
+  FAKE_VPLAN="k1-1=notval" run notval -date "$DATE" -gates "$GATES" -slots K1,K7
   check "exit 1" test "$EXIT" = 1
   check "k1 not-validated, the rest validated" lq \
     '[.slots[] | .effective.result] == ["validated", "not-validated", "validated", "validated"]'
@@ -140,7 +140,7 @@ fi
 if wanted rerun; then
   echo "rerun: a G16 failure is rerun once; the last attempt decides"
   newbatch rerun
-  FAKE_VPLAN="k7-1=notval-g16" run rerun -gates "$GATES" -slots K7
+  FAKE_VPLAN="k7-1=notval-g16" run rerun -date "$DATE" -gates "$GATES" -slots K7
   check "exit 0" test "$EXIT" = 0
   check "k7 ran twice: an exit-1 attempt stays eligible for the rerun" test "$(attempts k7)" = 2
   check "attempt 1 kept: not-validated, G16 fail" lq '.slots[1].attempts[0] | .result == "not-validated" and .g16 == "fail"'
@@ -150,7 +150,7 @@ fi
 if wanted repeat; then
   echo "repeat: a G16 failure on the rerun too is g16-repeat and plan-amendment-required"
   newbatch repeat
-  FAKE_VPLAN="k7-1=validated-g16,k7-2=validated-g16" run repeat -gates "$GATES" -slots K7
+  FAKE_VPLAN="k7-1=validated-g16,k7-2=validated-g16" run repeat -date "$DATE" -gates "$GATES" -slots K7
   check "exit 1" test "$EXIT" = 1
   check "k7 not-validated g16-repeat, both attempts validated" lq \
     '.slots[1].effective == {result: "not-validated", reasons: ["g16-repeat"]} and all(.slots[1].attempts[]; .result == "validated")'
@@ -171,7 +171,7 @@ if wanted layers; then
     config-nested:config config-fraction:config config-overflow:config config-fifo:config; do
     b=${c%%:*} layer=${c#*:}
     newbatch "layer-$b"
-    FAKE_VPLAN="k7-1=$b" run "layer-$b" -gates "$GATES" -slots K7 >/dev/null
+    FAKE_VPLAN="k7-1=$b" run "layer-$b" -date "$DATE" -gates "$GATES" -slots K7 >/dev/null
     check "$b: exit 3, unresolved at layer $layer" bash -c "test '$EXIT' = 3 && jq -e '.slots[1].attempts[0] | .state == \"unresolved\" and .layer == \"$layer\"' '$BATCH/validation-state.json' >/dev/null"
     check "$b: terminal unresolved; control-close never ran" lq '.batch.terminal.state == "unresolved" and .batch.terminal.slot == "k7" and (.slots[2].attempts | length) == 0'
   done
@@ -242,7 +242,7 @@ fi
 if wanted stop; then
   echo "stop: systemctl stop of the batch unit stops the running attempt first; nothing more is submitted"
   newbatch stop
-  FAKE_VPLAN="k7-1=hang" start stop -gates "$GATES" -slots K7
+  FAKE_VPLAN="k7-1=hang" start stop -date "$DATE" -gates "$GATES" -slots K7
   for _ in $(seq 150); do [[ -e "$BATCH/attempts/k7-1/hanging" ]] && break; sleep 0.2; done
   systemctl --user stop "$UNIT"
   finish
@@ -253,7 +253,7 @@ if wanted stop; then
 
   echo "term: a direct SIGTERM to the runner stops the attempt's unit and records it interrupted"
   newbatch term
-  FAKE_VPLAN="control-open-1=hang" start term -gates "$GATES" -slots K7
+  FAKE_VPLAN="control-open-1=hang" start term -date "$DATE" -gates "$GATES" -slots K7
   for _ in $(seq 150); do [[ -e "$BATCH/attempts/control-open-1/hanging" ]] && break; sleep 0.2; done
   sent=$SECONDS
   systemctl --user kill --kill-whom=main -s TERM "$UNIT"
