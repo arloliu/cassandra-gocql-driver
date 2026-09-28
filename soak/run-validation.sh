@@ -155,8 +155,8 @@ render_md() {
     (if .batch.terminal != null then "**Terminal: \(.batch.terminal.state)** at \(.batch.terminal.slot): \(.batch.terminal.reason)\n" else empty end),
     "| slot | kind | attempt root | exec dir | seed | status | failing gates | G16 | attempt result | slot result | reasons |",
     "|---|---|---|---|---|---|---|---|---|---|---|",
-    (.slots[] as $s | $s.attempts[] |
-      "| \($s.slot) #\(.n) | \(.kind) | \(.root) | \(.exec_dir | cell) | \(.seed | cell) | \(.status // .state) | \(.failing_gates | cell) | \(.g16 | cell) | \(.result // ("unresolved: " + (.layer // "?"))) | \($s.effective.result // (if $s.rerun_owed then "rerun owed" else "-" end)) | \(((.reasons // []) + ($s.effective.reasons // []) + (if .reason then [.reason] else [] end)) | unique | join("; ") | if . == "" then "-" else . end) |")
+    (.slots[] as $s | ($s.attempts | length) as $last | $s.attempts[] |
+      "| \($s.slot) #\(.n) | \(.kind) | \(.root) | \(.exec_dir | cell) | \(.seed | cell) | \(.status // .state) | \(.failing_gates | cell) | \(.g16 | cell) | \(.result // ("unresolved: " + (.layer // "?"))) | \($s.effective.result // (if $s.rerun_owed then "rerun owed" else "-" end)) | \(((.reasons // []) + (if .n == $last then ($s.effective.reasons // []) else [] end) + (if .reason then [.reason] else [] end)) | unique | join("; ") | if . == "" then "-" else . end) |")
   ' <<<"$LEDGER" 2>/dev/null) || return 1
   bwrite "$REPORT_MD.tmp" <<<"$md" && timeout -k 2 "$HELPER_BOUND_S" mv -f -- "$REPORT_MD.tmp" "$REPORT_MD"
 }

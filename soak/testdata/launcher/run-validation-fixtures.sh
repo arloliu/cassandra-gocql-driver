@@ -155,6 +155,8 @@ if wanted repeat; then
   check "k7 not-validated g16-repeat, both attempts validated" lq \
     '.slots[1].effective == {result: "not-validated", reasons: ["g16-repeat"]} and all(.slots[1].attempts[]; .result == "validated")'
   check "terminal plan-amendment-required at k7" lq '.batch.terminal.state == "plan-amendment-required" and .batch.terminal.slot == "k7"'
+  check "validation.md: the slot's reasons only on its deciding row (PLAN v7.14 §48.5)" bash -c \
+    "! grep '^| k7 #1 ' '$BATCH/validation.md' | grep -q g16-repeat && grep '^| k7 #2 ' '$BATCH/validation.md' | grep -q g16-repeat"
   check "control-close never ran" test "$(attempts control-close)" = 0
   run repeat2
   check "a terminal batch is not resumed (exit 2)" test "$EXIT" = 2
