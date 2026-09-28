@@ -35,12 +35,12 @@ func TestRegistryIsTheCanaryTable(t *testing.T) {
 		"K6b": {min(12), []string{"G6"}, nil, nil, true, false},
 		"K7":  {min(12), []string{"G8"}, nil, nil, true, false},
 		"K8":  {min(12), []string{"G10"}, nil, nil, true, false},
-		"K10": {0, []string{"G12", "G13"}, []string{"G2"}, nil, false, false},
-		"K11": {min(20), []string{"G11"}, []string{"G14"}, []string{"G14: missing evidence: class lwt has no cool-down p99"}, false, false},
+		"K10": {0, []string{"G12", "G13"}, []string{"G2"}, nil, true, false},
+		"K11": {min(20), []string{"G11"}, []string{"G14"}, []string{"G14: missing evidence: class lwt has no cool-down p99"}, true, false},
 		"K12": {0, nil, nil, nil, true, true},
-		"K13": {0, []string{"G5"}, nil, nil, false, false},
+		"K13": {0, []string{"G5"}, nil, nil, true, false},
 		"K15": {0, []string{"G15"}, nil, nil, true, false},
-		"K16": {min(20), []string{"G14"}, nil, nil, false, false},
+		"K16": {min(20), []string{"G14"}, nil, nil, true, false},
 		"K17": {0, nil, []string{"G15"}, nil, true, false},
 	}
 	for _, s := range All() {
@@ -63,8 +63,10 @@ func TestRegistryIsTheCanaryTable(t *testing.T) {
 // The session and Env hooks are data too, one seam each (PLAN §44.5); every other canary installs none of them.
 func TestRegistryHooks(t *testing.T) {
 	for _, s := range All() {
-		wantSkip, wantPin, wantSwitches := int64(0), false, workload.Switches{}
+		wantSkip, wantPin, wantSwitches, wantStop := int64(0), false, workload.Switches{}, ""
 		switch s.ID {
+		case "K13":
+			wantStop = "node2"
 		case "K6b":
 			wantSkip = 500
 		case "K8":
@@ -77,6 +79,7 @@ func TestRegistryHooks(t *testing.T) {
 		require.Equal(t, wantSkip, s.SkipFinished, s.ID)
 		require.Equal(t, wantPin, s.PinKey, s.ID)
 		require.Equal(t, wantSwitches, s.Switches, s.ID)
+		require.Equal(t, wantStop, s.StopTarget, s.ID)
 	}
 	none, ok := Lookup("")
 	require.False(t, ok)

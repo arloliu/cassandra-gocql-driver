@@ -45,7 +45,9 @@ type Spec struct {
 	PinKey bool
 	// Switches are set on every Env, primary and aux (K15, K17).
 	Switches workload.Switches
-	// Implemented is false for the canaries of the second batch (§44.1), which cmd/soak refuses.
+	// StopTarget pins the validation F-stop to this node (K13); empty keeps the drawn target.
+	StopTarget string
+	// Implemented is false for a canary cmd/soak refuses; since the second batch (§44.1) every phase-1 canary is implemented.
 	Implemented bool
 }
 
@@ -59,12 +61,12 @@ var registry = []Spec{
 	{ID: "K6b", Start: 12 * minute, MustFail: []string{"G6"}, SkipFinished: 500, Implemented: true},
 	{ID: "K7", Start: 12 * minute, MustFail: []string{"G8"}, Implemented: true},
 	{ID: "K8", Start: 12 * minute, MustFail: []string{"G10"}, PinKey: true, Implemented: true},
-	{ID: "K10", MustFail: []string{"G12", "G13"}, Collateral: []string{"G2"}},
-	{ID: "K11", Start: 20 * minute, MustFail: []string{"G11"}, Collateral: []string{"G14"}, Declared: []string{k11Declared}},
+	{ID: "K10", MustFail: []string{"G12", "G13"}, Collateral: []string{"G2"}, Implemented: true},
+	{ID: "K11", Start: 20 * minute, MustFail: []string{"G11"}, Collateral: []string{"G14"}, Declared: []string{k11Declared}, Implemented: true},
 	{ID: "K12", ExpectedVersion: "0.0.0-k12", Implemented: true},
-	{ID: "K13", MustFail: []string{"G5"}},
+	{ID: "K13", MustFail: []string{"G5"}, StopTarget: "node2", Implemented: true},
 	{ID: "K15", MustFail: []string{"G15"}, Switches: workload.Switches{NoEarlyClose: true}, Implemented: true},
-	{ID: "K16", Start: 20 * minute, MustFail: []string{"G14"}},
+	{ID: "K16", Start: 20 * minute, MustFail: []string{"G14"}, Implemented: true},
 	{ID: "K17", Collateral: []string{"G15"}, Switches: workload.Switches{NoSpeculation: true}, Implemented: true},
 }
 

@@ -49,6 +49,8 @@ type Churner struct {
 	CloseSession func(*cell.Session)
 	// Measure takes an aux session's residue after its grace period; nil means the /proc-based probe.
 	Measure func(id string) (measured bool, live, sockets int, groups map[string]int, err error)
+	// AfterClose is called with an aux session's id once its Close returned (the K10 canary); may be nil.
+	AfterClose func(id string)
 	// Switches are the configuration canaries' Env flags, set on every aux Env too (K15, K17).
 	Switches workload.Switches
 	// StartLoad starts the aux load; nil means workload.Start.
@@ -350,9 +352,12 @@ func (o *auxOwner) close(ctx context.Context, budget time.Duration) error {
 func (o *auxOwner) doClose() {
 	if o.c.CloseSession != nil {
 		o.c.CloseSession(o.sess)
-		return
+	} else {
+		o.sess.Close()
 	}
-	o.sess.Close()
+	if o.c.AfterClose != nil {
+		o.c.AfterClose(o.id)
+	}
 }
 
 // residue measures the session's residue into its slot's record and drops it from the sampler.

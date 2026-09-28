@@ -251,3 +251,94 @@ func TestK12ArmBeforeG0(t *testing.T) {
 		require.False(t, ok, id)
 	}
 }
+
+// K11 drops LWT offers from minute 20, and only them; before its arm, and for every other canary, nothing is dropped.
+func TestK11DropsLWTOffersFromMinute20(t *testing.T) {
+	for _, id := range []string{"", "K7", "K10", "K16"} {
+		require.Nil(t, NewHooks(id).Drop(), "%q installs no drop", id)
+	}
+	h := NewHooks("K11")
+	drop := h.Drop()
+	require.NotNil(t, drop)
+	events, waits := runFor(t, "K11", 0, Deps{Hooks: h})
+	require.Equal(t, []time.Duration{20 * time.Minute}, waits)
+	require.Empty(t, events)
+	require.False(t, drop(workload.ClassLWT), "not before minute 20")
+
+	events, waits = runFor(t, "K11", 3, Deps{Hooks: h})
+	require.Equal(t, []time.Duration{20 * time.Minute}, waits, "armed once, nothing after")
+	require.Equal(t, []string{KindArm}, kinds(events))
+	require.True(t, drop(workload.ClassLWT))
+	for _, s := range workload.DefaultMix() {
+		if s.Class != workload.ClassLWT {
+			require.False(t, drop(s.Class), s.Class)
+		}
+	}
+}
+
+// K13 arms once G0 has passed: a one-shot rewrite of the primary's next dial to the pinned node's proxy port,
+// recorded as its injection with the rewritten destination and whether the dial succeeded (PLAN §44.2, §44.8).
+func TestK13ArmAfterG0(t *testing.T) {
+	node := netip.MustParseAddr("127.0.1.2")
+	at := time.Unix(5, 0)
+	for _, id := range []string{"", "K7", "K12", "K16"} {
+		reg := view.NewRegistry()
+		_, ok := ArmAfterG0(id, G0Deps{Registry: reg, Node: node, Now: at, Event: func(Event) { t.Fatal("no event") }})
+		require.False(t, ok, id)
+	}
+	reg := view.NewRegistry()
+	var events []Event
+	e, ok := ArmAfterG0("K13", G0Deps{Registry: reg, Node: node, Now: at, Event: func(e Event) { events = append(events, e) }})
+	require.True(t, ok)
+	require.Equal(t, Event{Canary: "K13", Kind: KindArm, Time: at,
+		Detail: "the primary's next dial to 127.0.1.2:19042 is rewritten to 127.0.1.2:9042"}, e)
+
+	d := reg.Dialer("aux1", 0, 200*time.Millisecond, 0)
+	c, _ := d.DialContext(t.Context(), "tcp", "127.0.1.2:19042")
+	if c != nil {
+		c.Close()
+	}
+	require.Empty(t, events, "an aux dial is not rewritten")
+	d = reg.Dialer("primary", 0, 200*time.Millisecond, 0)
+	_, err := d.DialContext(t.Context(), "tcp", "127.0.1.2:19042")
+	require.ErrorContains(t, err, "rewritten")
+	require.Len(t, events, 1)
+	require.Equal(t, "K13", events[0].Canary)
+	require.Equal(t, KindInject, events[0].Kind)
+	require.Equal(t, "127.0.1.2:9042", events[0].Dest)
+	require.NotNil(t, events[0].DialOK)
+	require.Len(t, reg.DialsToPort("9042"), 1)
+}
+
+// K10's churner close hook leaves 50 goroutines per aux session, under one creator group, blocked on a package-level
+// channel, so they are not leaks in goroutineleak's sense (PLAN §44.4); no other canary installs the hook.
+func TestK10LeavesGoroutinesAfterEachAuxClose(t *testing.T) {
+	for _, id := range []string{"", "K1", "K11", "K13"} {
+		_, _, ok := AuxClose(id, time.Now, func(Event) { t.Fatal("no event") })
+		require.False(t, ok, id)
+	}
+	at := time.Unix(7, 0)
+	var events []Event
+	hook, arm, ok := AuxClose("K10", func() time.Time { return at }, func(e Event) { events = append(events, e) })
+	require.True(t, ok)
+	require.Equal(t, Event{Canary: "K10", Kind: KindArm, Time: at, Detail: "every aux session leaves 50 goroutines after its Close"}, arm)
+
+	leaks0, hasLeaks, err := probe.GoroutineLeaks(nil)
+	require.NoError(t, err)
+	groups0, _, err := probe.GoroutineGroups()
+	require.NoError(t, err)
+	hook("aux3")
+	hook("aux4")
+	groups, _, err := probe.GoroutineGroups()
+	require.NoError(t, err)
+	require.Equal(t, 2*k10Goroutines, groups[K10Group]-groups0[K10Group], "one creator group")
+	require.Equal(t, []Event{
+		{Canary: "K10", Kind: KindInject, Time: at, Detail: "aux3: 50 goroutines outlive its Close"},
+		{Canary: "K10", Kind: KindInject, Time: at, Detail: "aux4: 50 goroutines outlive its Close"},
+	}, events)
+	if hasLeaks {
+		leaks, _, err := probe.GoroutineLeaks(nil)
+		require.NoError(t, err)
+		require.Equal(t, leaks0, leaks, "K10's goroutines are not leaks in goroutineleak's sense")
+	}
+}

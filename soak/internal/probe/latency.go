@@ -164,6 +164,24 @@ func (l *Latency) Counts(class string, from, to float64) (total, delayed int64) 
 	return m.n, m.delayed
 }
 
+// WorkSeconds returns the sum of each operation's bucket upper bound, in seconds, over the minutes that start in the window:
+// an overestimate of the worker time the class's completed operations took (K16's occupancy estimate, PLAN §44.6).
+//
+// Parameters:
+//   - class: the operation class
+//   - from, to: the window in seconds since the epoch, rounded down to whole slices
+//
+// Returns:
+//   - float64: the worker-seconds; 0 when the window holds no observation
+func (l *Latency) WorkSeconds(class string, from, to float64) float64 {
+	m := l.merge(class, from, to)
+	var sum float64
+	for b, n := range m.buckets {
+		sum += float64(n) * bucketUpper(b).Seconds()
+	}
+	return sum
+}
+
 // Classes returns the classes observed so far.
 //
 // Returns:

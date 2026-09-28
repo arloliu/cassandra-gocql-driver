@@ -4,8 +4,10 @@ package view
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"slices"
 	"sync"
 	"syscall"
@@ -45,6 +47,8 @@ type Registry struct {
 	live   map[uint64]liveDial
 	seq    uint64
 	onDial func(Dial)
+	// rewrite is an armed one-shot rewrite (the K13 canary), or nil.
+	rewrite *rewrite
 }
 
 // liveDial is a live entry with the sequence number it was recorded at.
@@ -64,6 +68,13 @@ type Dialer struct {
 }
 
 var _ gocql.Dialer = (*Dialer)(nil)
+
+// rewrite is one session's pending dial rewrite.
+type rewrite struct {
+	session  string
+	from, to netip.AddrPort
+	done     func(Dial)
+}
 
 // NewRegistry returns an empty registry.
 //
@@ -195,6 +206,22 @@ func (r *Registry) DialsToPort(port string) []Dial {
 	return out
 }
 
+// RewriteOnce arms a one-shot rewrite (the K13 canary, PLAN §44.2): the next dial of session to from goes to to instead.
+// That dial is recorded with its real destination, a successful conn is closed at once,
+// and the driver gets an error either way; done receives the recorded dial.
+// Arming again replaces a pending rewrite.
+//
+// Parameters:
+//   - session: the harness's session id, e.g. "primary"
+//   - from: the destination to rewrite
+//   - to: the destination dialled instead
+//   - done: called once with the rewritten dial, from the dialling goroutine
+func (r *Registry) RewriteOnce(session string, from, to netip.AddrPort, done func(Dial)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rewrite = &rewrite{session: session, from: from, to: to, done: done}
+}
+
 func (r *Registry) record(d Dial) {
 	r.mu.Lock()
 	r.audit = append(r.audit, d)
@@ -210,6 +237,22 @@ func (r *Registry) record(d Dial) {
 	}
 }
 
+// takeRewrite returns and disarms the pending rewrite when it matches a session's dial to addr.
+func (r *Registry) takeRewrite(session, addr string) (*rewrite, bool) {
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rw := r.rewrite
+	if rw == nil || rw.session != session || rw.from != ap {
+		return nil, false
+	}
+	r.rewrite = nil
+	return rw, true
+}
+
 // DialContext dials addr and records the attempt.
 //
 // Parameters:
@@ -221,12 +264,29 @@ func (r *Registry) record(d Dial) {
 //   - net.Conn: the raw connection
 //   - error: the dial error
 func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if rw, ok := d.reg.takeRewrite(d.session, addr); ok {
+		rec, conn, err := d.dial(ctx, network, rw.to.String())
+		if conn != nil {
+			conn.Close()
+		}
+		rw.done(rec)
+		if err == nil {
+			err = errors.New("the harness closed it")
+		}
+		return nil, fmt.Errorf("dial to %s rewritten to %s: %w", addr, rw.to, err)
+	}
+	_, conn, err := d.dial(ctx, network, addr)
+	return conn, err
+}
+
+// dial dials addr and records the attempt.
+func (d *Dialer) dial(ctx context.Context, network, addr string) (Dial, net.Conn, error) {
 	conn, err := d.d.DialContext(ctx, network, addr)
 	rec := Dial{Session: d.session, Generation: d.generation, Dest: addr, Time: time.Now(), OK: err == nil}
 	if err != nil {
 		rec.Err = err.Error()
 		d.reg.record(rec)
-		return nil, err
+		return rec, nil, err
 	}
 	rec.Local, rec.Remote = conn.LocalAddr().String(), conn.RemoteAddr().String()
 	ino, ierr := socketInode(conn)
@@ -235,7 +295,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	}
 	rec.Inode = ino
 	d.reg.record(rec)
-	return conn, nil
+	return rec, conn, nil
 }
 
 // socketInode reads the inode of a connection's socket without keeping the connection.

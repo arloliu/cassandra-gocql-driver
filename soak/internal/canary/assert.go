@@ -2,11 +2,13 @@ package canary
 
 import (
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/proxy"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/workload"
 )
 
@@ -18,6 +20,10 @@ const (
 	KindInject = "inject"
 	// KindSkip is written when K7 skips a minute that falls in a fault window.
 	KindSkip = "skip"
+	// KindSelect is K16's selection, written at its arm.
+	KindSelect = "select"
+	// KindFinalCounts is K16's per-class cool-down counts, written at teardown.
+	KindFinalCounts = "final-counts"
 )
 
 // Event is the payload of a canary event in events.jsonl (PLAN §44.8).
@@ -30,6 +36,12 @@ type Event struct {
 	OpID uint64 `json:"op_id,omitempty"`
 	// Key is K8's poisoned key.
 	Key *workload.Key `json:"key,omitempty"`
+	// Dest is K13's rewritten destination; DialOK whether that dial succeeded.
+	Dest   string `json:"dest,omitempty"`
+	DialOK *bool  `json:"dial_ok,omitempty"`
+	// Selection is K16's selection; Counts its final counts, per class.
+	Selection *Selection             `json:"selection,omitempty"`
+	Counts    map[string]ClassCounts `json:"counts,omitempty"`
 	// Detail identifies any other injection, e.g. K2's pair of endpoints.
 	Detail string `json:"detail,omitempty"`
 }
@@ -100,6 +112,23 @@ func Assert(id string, v gate.Verdict, rec Records) []string {
 			}
 		}
 		return []string{"no G10 violation names the pinned " + strings.TrimSuffix(name, ":")}
+	case "K10":
+		want := fmt.Sprintf("group %q ", K10Group)
+		for _, r := range v.Gates {
+			if r.Gate != "G13" {
+				continue
+			}
+			for _, d := range r.Details {
+				if strings.Contains(d, want) {
+					return nil
+				}
+			}
+		}
+		return []string{"no G13 detail names a drift of " + K10Group}
+	case "K13":
+		return assertK13(v, rec.Events, own)
+	case "K16":
+		return assertK16(rec.Events)
 	case "K15":
 		switch {
 		case rec.Coverage == nil:
@@ -116,4 +145,42 @@ func Assert(id string, v gate.Verdict, rec Records) []string {
 		}
 	}
 	return nil
+}
+
+// assertK13 checks that the rewritten dial is a :9042 dial in G5's dial audit, made after the arm that followed G0.
+func assertK13(v gate.Verdict, events, own []Event) []string {
+	var arms []Event
+	for _, e := range events {
+		if e.Canary == "K13" && e.Kind == KindArm {
+			arms = append(arms, e)
+		}
+	}
+	if len(arms) != 1 || len(own) != 1 {
+		return []string{fmt.Sprintf("%d K13 arms and %d injections are recorded, want 1 and 1", len(arms), len(own))}
+	}
+	arm, inj := arms[0].Time, own[0]
+	ap, err := netip.ParseAddrPort(inj.Dest)
+	switch {
+	case err != nil || ap.Port() != proxy.NodePort:
+		return []string{fmt.Sprintf("the rewritten destination %q is not a :%d address", inj.Dest, proxy.NodePort)}
+	case inj.Time.Before(arm):
+		return []string{"the rewritten dial precedes the arm"}
+	}
+	// G5's audit lines have the form "dial to <dest> at <RFC3339>", at second resolution.
+	prefix := "dial to " + inj.Dest + " at "
+	for _, r := range v.Gates {
+		if r.Gate != "G5" {
+			continue
+		}
+		for _, d := range r.Details {
+			rest, ok := strings.CutPrefix(d, prefix)
+			if !ok {
+				continue
+			}
+			if at, err := time.Parse(time.RFC3339, rest); err == nil && !at.Before(arm.Truncate(time.Second)) {
+				return nil
+			}
+		}
+	}
+	return []string{"G5's dial audit holds no dial to " + inj.Dest + " after the arm"}
 }

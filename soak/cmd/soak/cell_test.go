@@ -42,7 +42,6 @@ func TestCellCanaryFlag(t *testing.T) {
 		"a canary kind, none":  {"-mode", "validate", "-kind", "k7"},
 		"unknown id":           {"-mode", "validate", "-canary", "K9"},
 		"lowercase id":         {"-mode", "validate", "-canary", "k7"},
-		"batch 2":              {"-mode", "validate", "-canary", "K13"},
 		"unknown mode":         {"-mode", "calibrate"},
 	} {
 		_, err := parse(args...)

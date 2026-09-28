@@ -337,6 +337,14 @@ func (r *cellRun) prepare() error {
 		optional = r.conf.Base.Shared.Optional
 	}
 	sch, planErr := chaos.Plan(r.o.Seed, slots, assignment, !fixed, r.nodes, optional, chaos.Specs())
+	// K13 pins the validation F-stop after the draw and before schedule.json is written (PLAN §44.5).
+	if target := r.conf.Overrides.StopTarget; target != "" && planErr == nil {
+		for i, p := range sch.Mandatory {
+			if p.Kind == chaos.FaultStop {
+				sch.Mandatory[i].Targets = []string{target}
+			}
+		}
+	}
 	r.sch = sch
 
 	attempt := r.o.AttemptID
@@ -534,6 +542,12 @@ func (r *cellRun) setup(ctx context.Context) bool {
 	if !r.g0(ctx) {
 		return false
 	}
+	if node := slices.Index(r.nodes, r.conf.Overrides.StopTarget); node >= 0 {
+		if e, ok := canary.ArmAfterG0(r.canary.ID, canary.G0Deps{Registry: r.reg, Node: r.addrs[node], Now: time.Now(),
+			Event: func(e canary.Event) { r.rec.Event("canary", e.Time, e) }}); ok {
+			r.rec.Event("canary", e.Time, e)
+		}
+	}
 	dc, _, _ := cell.NodeFacts(ctx, r.primary.Session)
 	if err := workload.CreateSchema(ctx, r.primary.Session, dc); err != nil {
 		return fixture("schema: %v", err)
@@ -558,6 +572,10 @@ func (r *cellRun) setup(ctx context.Context) bool {
 		OpIDs: r.env.OpIDs, Violations: r.violation, Rate: r.o.Rate, Workers: r.o.Workers, Seed: r.o.Seed,
 		Registry: r.reg, FDDir: "/proc/self/fd", NetDir: "/proc/net"}
 	applyEnvHooks(r.canary, r.env, r.churner)
+	if hook, e, ok := canary.AuxClose(r.canary.ID, time.Now, func(e canary.Event) { r.rec.Event("canary", e.Time, e) }); ok {
+		r.churner.AfterClose = hook
+		r.rec.Event("canary", e.Time, e)
+	}
 	return true
 }
 
@@ -622,6 +640,9 @@ func (r *cellRun) workload(ctx context.Context) {
 	r.rec.SetEpoch(r.epoch)
 	r.env.Progress = workload.NewProgress(r.epoch)
 	r.env.Latency = probe.NewLatencySlice(r.epoch, CheapInterval)
+	// The timeline canaries' Env hooks are installed before the workload starts and armed by the canary goroutine.
+	hooks := canary.NewHooks(r.canary.ID)
+	r.env.Drop, r.env.Inject = hooks.Drop(), hooks.Inject()
 	r.sampler.Start(r.epoch, r.primary, r.env.Progress, r.env.Latency)
 	r.col.Ran = true
 	r.logf("workload epoch; %s warm-up, %s workload", r.tl.Warmup, r.tl.Workload)
@@ -642,7 +663,11 @@ func (r *cellRun) workload(ctx context.Context) {
 	bg.Go(func() { r.sampler.Run(bgCtx) })
 	bg.Go(func() { r.health.Run(healthCtx, r.epoch) })
 	// The canary goroutine (PLAN §44.5) stops with the background work; what it leaked stays leaked.
+	kL, kLErr := r.th.Get(gate.KL)
+	k16 := canary.K16Params{Latency: r.env.Latency, Warmup: r.tl.Warmup, KL: kL, KLErr: kLErr, Rate: r.o.Rate, Workers: r.o.Workers,
+		Mix: workload.DefaultMix()}
 	bg.Go(canary.Start(bgCtx, r.canary.ID, canary.Deps{Epoch: r.epoch, Session: r.primary.Session, Env: r.env, Streams: r.primary.Streams,
+		Hooks: hooks, K16: k16,
 		Event:    func(e canary.Event) { r.rec.Event("canary", e.Time, e) },
 		InWindow: func(t time.Time) bool { _, in := r.windows.At(t); return in }}))
 	bg.Go(func() {
@@ -721,6 +746,8 @@ wait:
 	r.sampler.FlushLatency()
 	// The sampler writes verdict.json from its own goroutine, so r.col changes only after it stopped.
 	r.col.WorkloadSeconds = ran
+	// K16's invalid-config, raised by the canary goroutine, reaches the verdict here (PLAN §44.5).
+	r.col.InvalidConfig = append(r.col.InvalidConfig, hooks.InvalidConfig()...)
 	r.col.Windows = r.windows.Intervals(r.epoch, stop)
 	for _, w := range r.windows.All() {
 		r.rec.Event("window", w.Start, w)
@@ -738,6 +765,9 @@ wait:
 		ShortDeadlineTimeouts: r.col.ShortDeadlineTimeouts, ErrorClasses: r.rec.ClassCounts()})
 	r.latency()
 	r.rec.Event("latency", time.Now(), map[string]any{"warmup_p99_s": r.col.WarmupP99, "cooldown_p99_s": r.col.CooldownP99})
+	if e, ok := canary.FinalCounts(r.canary.ID, r.env.Latency, r.col.Classes, r.tl.Cooldown, r.tl.Workload, time.Now()); ok {
+		r.rec.Event("canary", e.Time, e)
+	}
 
 	if len(r.col.Incomplete) > 0 || len(r.col.FixtureInvalid) > 0 {
 		r.col.Profiles = r.sampler.Profiles()

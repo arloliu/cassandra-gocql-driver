@@ -89,3 +89,22 @@ func TestRebuildLatencyRejectsBadSlices(t *testing.T) {
 	}})
 	require.Error(t, err, "the same slice twice")
 }
+
+// WorkSeconds sums each operation's bucket upper bound over the minutes that start in the window (K16's occupancy, PLAN §44.6).
+func TestWorkSeconds(t *testing.T) {
+	epoch := time.Unix(1000, 0)
+	l := NewLatencySlice(epoch, 5*time.Second)
+	for range 10 {
+		l.Observe("write", epoch.Add(time.Second), time.Millisecond, false)
+	}
+	for range 5 {
+		l.Observe("write", epoch.Add(599*time.Second), 10*time.Millisecond, true)
+	}
+	l.Observe("write", epoch.Add(600*time.Second), time.Second, false)
+	l.Observe("read", epoch.Add(2*time.Second), time.Second, false)
+	want := 10*bucketUpper(bucketOf(time.Millisecond)).Seconds() + 5*bucketUpper(bucketOf(10*time.Millisecond)).Seconds()
+	require.InDelta(t, want, l.WorkSeconds("write", 0, 600), 1e-12)
+	require.GreaterOrEqual(t, l.WorkSeconds("write", 0, 600), 0.06, "upper bounds: never below the latencies")
+	require.LessOrEqual(t, l.WorkSeconds("write", 0, 600), 0.06*bucketGrowth)
+	require.Zero(t, l.WorkSeconds("scan", 0, 600))
+}

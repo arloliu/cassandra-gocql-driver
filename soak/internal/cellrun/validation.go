@@ -29,8 +29,8 @@ func applyEnvHooks(spec canary.Spec, primary *workload.Env, churner *Churner) {
 }
 
 // judgeRun decides a validation run (PLAN §44.3) from its final verdict and evidence,
-// and from the persisted records its canary's extra assertion reads (§44.8): the canary's events, the coverage event,
-// and for K7 the errors.jsonl lines. Every record is strict-decoded with its writer's type;
+// and from the persisted records its canary's extra assertion reads (§44.8): the canary's events (K16's final counts among them),
+// the coverage event, and for K7 the errors.jsonl lines. Every record is strict-decoded with its writer's type;
 // a missing or altered input is a reason, never a zero.
 //
 // Parameters:
@@ -44,7 +44,7 @@ func applyEnvHooks(spec canary.Spec, primary *workload.Env, churner *Churner) {
 func judgeRun(dir, id string, v gate.Verdict, ev Evidence) canary.Validation {
 	var assertion []string
 	switch id {
-	case "K7", "K8", "K15", "K17":
+	case "K7", "K8", "K10", "K13", "K15", "K16", "K17":
 		rec, problems := readRecords(dir, id == "K7")
 		assertion = append(problems, canary.Assert(id, v, rec)...)
 	}

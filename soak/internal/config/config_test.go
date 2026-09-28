@@ -199,4 +199,17 @@ func TestNoCanaryNoOverrideField(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(raw), "canary")
 	require.NotContains(t, string(raw), "expected_version")
+	require.NotContains(t, string(raw), "stop_target")
+}
+
+// Only K13 pins the validation F-stop, to node2 (PLAN §44.5).
+func TestStopTarget(t *testing.T) {
+	for _, s := range canary.All() {
+		want := ""
+		if s.ID == "K13" {
+			want = "node2"
+		}
+		require.Equal(t, want, ValidationOverrides(s.ID).StopTarget, s.ID)
+	}
+	require.Empty(t, ValidationOverrides("").StopTarget)
 }

@@ -2,6 +2,7 @@ package view
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -297,4 +298,99 @@ func TestCheckListeners(t *testing.T) {
 	m := NewMembership("primary", nil)
 	m.events = []HostEvent{{HostID: "a", Kind: HostEventDown}, {HostID: "a", Kind: HostEventUp}, {HostID: "b", Kind: HostEventDown}}
 	require.Equal(t, map[string]HostEventKind{"a": HostEventUp, "b": HostEventDown}, m.Last())
+}
+
+// K13's rewrite takes the armed session's next dial to from, once, only after it is armed (PLAN §44.2):
+// the rewritten dial is recorded with its real destination, a successful conn is closed, and the driver gets an error.
+func TestRewriteOnce(t *testing.T) {
+	from, to := listen(t), listen(t)
+	fromAP, toAP := netip.MustParseAddrPort(from.Addr().String()), netip.MustParseAddrPort(to.Addr().String())
+	reg := NewRegistry()
+	primary, aux := reg.Dialer("primary", 0, time.Second, 0), reg.Dialer("aux1", 0, time.Second, 0)
+	ctx := t.Context()
+	dial := func(d *Dialer, addr string) error {
+		c, err := d.DialContext(ctx, "tcp", addr)
+		if c != nil {
+			c.Close()
+		}
+		return err
+	}
+
+	require.NoError(t, dial(primary, from.Addr().String()), "not armed yet")
+	var got []Dial
+	reg.RewriteOnce("primary", fromAP, toAP, func(d Dial) { got = append(got, d) })
+	require.NoError(t, dial(aux, from.Addr().String()), "another session is not rewritten")
+	require.NoError(t, dial(primary, to.Addr().String()), "another destination is not rewritten")
+	require.Empty(t, got)
+
+	accepted := make(chan net.Conn, 1)
+	to2, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer to2.Close()
+	go func() {
+		c, err := to2.Accept()
+		if err == nil {
+			accepted <- c
+		}
+	}()
+	reg2 := NewRegistry()
+	p2 := reg2.Dialer("primary", 0, time.Second, 0)
+	reg2.RewriteOnce("primary", fromAP, netip.MustParseAddrPort(to2.Addr().String()), func(d Dial) { got = append(got, d) })
+	conn, err := p2.DialContext(ctx, "tcp", from.Addr().String())
+	require.Nil(t, conn, "the driver gets no conn")
+	require.ErrorContains(t, err, "rewritten")
+	require.Len(t, got, 1)
+	require.Equal(t, to2.Addr().String(), got[0].Dest)
+	require.True(t, got[0].OK)
+	audit := reg2.Audit()
+	require.Len(t, audit, 1)
+	require.Equal(t, got[0], audit[0], "the rewritten dial is in the audit, with its real destination")
+	c := <-accepted
+	defer c.Close()
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, err = c.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "the harness closed its end: EOF, not a timeout")
+	require.Zero(t, ownedTo(t, netip.MustParseAddrPort(to2.Addr().String())), "no process-owned socket to the rewritten destination")
+	require.NoError(t, dial(p2, from.Addr().String()), "once only")
+	require.Len(t, got, 1)
+
+	// A rewritten dial that fails is recorded as failed, and the driver still gets an error.
+	closed := netip.MustParseAddrPort(listenClosed(t))
+	reg3 := NewRegistry()
+	p3 := reg3.Dialer("primary", 0, time.Second, 0)
+	reg3.RewriteOnce("primary", fromAP, closed, func(d Dial) { got = append(got, d) })
+	conn, err = p3.DialContext(ctx, "tcp", from.Addr().String())
+	require.Nil(t, conn)
+	require.ErrorContains(t, err, "rewritten")
+	require.Zero(t, ownedTo(t, closed))
+	require.Len(t, got, 2)
+	require.False(t, got[1].OK)
+	require.Equal(t, closed.String(), got[1].Dest)
+	require.Len(t, reg3.DialsToPort(strconv.Itoa(int(closed.Port()))), 1)
+}
+
+// ownedTo counts the process-owned sockets whose remote end is addr.
+func ownedTo(t *testing.T, addr netip.AddrPort) int {
+	t.Helper()
+	owned, err := OwnedSocketInodes("/proc/self/fd")
+	require.NoError(t, err)
+	socks, err := ReadSockets("/proc/net")
+	require.NoError(t, err)
+	n := 0
+	for _, s := range socks {
+		if owned[s.Inode] && s.Remote == addr {
+			n++
+		}
+	}
+	return n
+}
+
+// listenClosed returns an address nothing listens on.
+func listenClosed(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := l.Addr().String()
+	require.NoError(t, l.Close())
+	return addr
 }

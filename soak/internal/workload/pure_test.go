@@ -7,12 +7,15 @@ import (
 	"math"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/probe"
 )
 
 func TestRanges(t *testing.T) {
@@ -445,4 +448,30 @@ func TestSpecAttemptsWithoutSpeculation(t *testing.T) {
 		require.Equal(t, a.Uint64(), b.Uint64(), "the same draws")
 	}
 	require.Equal(t, map[int]bool{1: true, 2: true}, seen)
+}
+
+// K11: a dropped offer returns before the driver call, Latency.Observe and Progress.Completed, and takes no op id;
+// an offer the hook keeps runs as before (PLAN §44.2).
+func TestDropReturnsBeforeTheDriverCall(t *testing.T) {
+	epoch := time.Now().Add(-time.Second)
+	var errs []ErrorRecord
+	e := &Env{OpIDs: &atomic.Uint64{}, Progress: NewProgress(epoch), Latency: probe.NewLatency(epoch),
+		Errors: func(r ErrorRecord) { errs = append(errs, r) }, Drop: func(c Class) bool { return c == ClassLWT }}
+	rng := rand.New(rand.NewPCG(1, 2))
+	e.Do(t.Context(), 0, rng, Offer{Class: ClassLWT})
+	require.Zero(t, e.OpIDs.Load(), "no op id")
+	total, _ := e.Latency.Counts(string(ClassLWT), 0, 3600)
+	require.Zero(t, total, "no latency observation")
+	_, completed := e.Progress.PerSecond()
+	require.Empty(t, completed[string(ClassLWT)], "no completion")
+	require.Empty(t, errs)
+
+	// An unknown class is kept, runs and records its error: the hook's false changes nothing.
+	e.Do(t.Context(), 0, rng, Offer{Class: "bogus"})
+	require.Equal(t, uint64(1), e.OpIDs.Load())
+	total, _ = e.Latency.Counts("bogus", 0, 3600)
+	require.Equal(t, int64(1), total)
+	_, completed = e.Progress.PerSecond()
+	require.NotEmpty(t, completed["bogus"])
+	require.Len(t, errs, 1)
 }

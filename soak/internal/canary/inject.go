@@ -5,13 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
+	"reflect"
+	"runtime"
 	"sync"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/probe"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/proxy"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/view"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/workload"
 )
 
@@ -20,6 +25,12 @@ const k4Bytes = 2 << 20
 
 // k5Statement returns a row, so the driver attaches its Iter leak detector (session.go attachLeakDetector).
 const k5Statement = "SELECT release_version FROM system.local"
+
+// k10Goroutines is how many goroutines K10 leaves behind per aux session.
+const k10Goroutines = 50
+
+// K10Group is the goroutine group of K10's goroutines: their creator function, as a debug=2 dump names it.
+var K10Group = runtime.FuncForPC(reflect.ValueOf(parkGoroutines).Pointer()).Name()
 
 // held keeps what the canaries leak reachable from a package-level variable (PLAN §44.2),
 // so only K1's goroutines are leaks in goroutineleak's sense (§44.4).
@@ -52,7 +63,26 @@ type Deps struct {
 	SleepUntil func(ctx context.Context, t time.Time) bool
 	// Now is the clock; nil uses time.Now.
 	Now func() time.Time
+	// Hooks are the primary Env's hooks, which K11 and K16 arm.
+	Hooks *Hooks
+	// K16 is what K16's selection reads.
+	K16 K16Params
 }
+
+// G0Deps is what K13's arm acts through once G0 has passed.
+type G0Deps struct {
+	// Registry is the D8 dial registry the primary dials through.
+	Registry *view.Registry
+	// Node is the address of the node the validation F-stop is pinned to.
+	Node netip.Addr
+	// Event records the injection, from the driver's dialling goroutine.
+	Event func(Event)
+	// Now is the time of the arm.
+	Now time.Time
+}
+
+// injectFunc makes one injection and returns its event; more is false for a one-shot canary.
+type injectFunc func(ctx context.Context, d Deps) (ev Event, more bool)
 
 // PinnedKey returns K8's key: a preloaded primary key that no writer touches (Env.Excluded) and the oracle always samples.
 //
@@ -64,7 +94,7 @@ func PinnedKey() workload.Key {
 
 // Start starts a canary's goroutine, for the canaries armed on the workload timeline (PLAN §44.5):
 // it arms at Epoch + Start and records it; K1–K5 and K7 then inject once, and once per minute after, until ctx ends;
-// K6b and K8 inject once; K15 and K17, whose switches are set with the Env, only record their arm (Codex AT03).
+// K6b and K8 inject once; K11 and K16 arm their Env hooks; K15 and K17, whose switches are set with the Env, only record their arm (Codex AT03).
 // Every other id starts nothing.
 //
 // Parameters:
@@ -76,9 +106,122 @@ func PinnedKey() workload.Key {
 //   - func(): waits until the goroutine has returned; what it leaked stays leaked
 func Start(ctx context.Context, id string, d Deps) func() {
 	spec, _ := Lookup(id)
-	// inject makes one injection and returns its event; more is false for a one-shot canary.
-	var inject func(ctx context.Context, d Deps) (ev Event, more bool)
-	var arm func() (string, error)
+	arm, inject, ok := seams(id, spec, d)
+	if !ok {
+		return func() {}
+	}
+	if d.SleepUntil == nil {
+		d.SleepUntil = sleepUntil
+	}
+	if d.Now == nil {
+		d.Now = time.Now
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run(ctx, id, spec, d, arm, inject)
+	}()
+	return func() { <-done }
+}
+
+// ArmBeforeG0 returns the arm event of a canary armed before G0 runs (K12, PLAN §44.2), which cellrun records.
+//
+// Parameters:
+//   - id: the canary id
+//   - now: the time of the arm
+//
+// Returns:
+//   - Event: the arm event, naming the version G0 will expect
+//   - bool: false for every other canary
+func ArmBeforeG0(id string, now time.Time) (Event, bool) {
+	s, ok := Lookup(id)
+	if !ok || s.ExpectedVersion == "" {
+		return Event{}, false
+	}
+	return Event{Canary: id, Kind: KindArm, Time: now, Detail: "G0 expects release_version " + s.ExpectedVersion}, true
+}
+
+// ArmAfterG0 arms a canary whose injection follows G0 (K13, PLAN §44.2) and returns its arm event, which cellrun records:
+// the primary session's next dial to the node's proxy port goes to its native port instead, once,
+// and the rewritten dial is recorded as K13's injection.
+//
+// Parameters:
+//   - id: the canary id
+//   - d: the dependencies
+//
+// Returns:
+//   - Event: the arm event, naming both destinations
+//   - bool: false for every other canary, which arms nothing
+func ArmAfterG0(id string, d G0Deps) (Event, bool) {
+	if id != "K13" {
+		return Event{}, false
+	}
+	from, to := netip.AddrPortFrom(d.Node, proxy.ProxyPort), netip.AddrPortFrom(d.Node, proxy.NodePort)
+	d.Registry.RewriteOnce("primary", from, to, func(dl view.Dial) {
+		ok := dl.OK
+		d.Event(Event{Canary: id, Kind: KindInject, Time: dl.Time, Dest: dl.Dest, DialOK: &ok})
+	})
+	return Event{Canary: id, Kind: KindArm, Time: d.Now, Detail: fmt.Sprintf("the primary's next dial to %s is rewritten to %s", from, to)}, true
+}
+
+// AuxClose returns K10's churner close hook (PLAN §44.2): after each aux session's Close,
+// 50 goroutines blocked on a package-level channel outlive it.
+//
+// Parameters:
+//   - id: the canary id
+//   - now: the clock
+//   - event: records each injection
+//
+// Returns:
+//   - func(string): the hook, called with the aux session's id
+//   - Event: the arm event, which cellrun records when it installs the hook
+//   - bool: false for every other canary, which installs no hook
+func AuxClose(id string, now func() time.Time, event func(Event)) (func(string), Event, bool) {
+	if id != "K10" {
+		return nil, Event{}, false
+	}
+	hook := func(session string) {
+		parkGoroutines(k10Goroutines)
+		event(Event{Canary: id, Kind: KindInject, Time: now(), Detail: fmt.Sprintf("%s: %d goroutines outlive its Close", session, k10Goroutines)})
+	}
+	return hook, Event{Canary: id, Kind: KindArm, Time: now(), Detail: fmt.Sprintf("every aux session leaves %d goroutines after its Close", k10Goroutines)}, true
+}
+
+// run arms a canary at its minute, records the arm, and injects until ctx ends or a one-shot injection is made.
+func run(ctx context.Context, id string, spec Spec, d Deps, arm func() (string, error), inject injectFunc) {
+	at := d.Epoch.Add(spec.Start)
+	if !d.SleepUntil(ctx, at) {
+		return
+	}
+	arming := Event{Canary: id, Kind: KindArm, Time: d.Now()}
+	if arm != nil {
+		detail, err := arm()
+		if arming.Detail = detail; err != nil {
+			arming.Detail = "arm failed: " + err.Error()
+			d.Event(arming)
+			return
+		}
+	}
+	d.Event(arming)
+	if inject == nil {
+		return
+	}
+	for i := 1; ctx.Err() == nil; i++ {
+		now := d.Now()
+		ev, more := inject(ctx, d)
+		ev.Canary, ev.Time = id, now
+		if ev.Kind == "" {
+			ev.Kind = KindInject
+		}
+		d.Event(ev)
+		if !more || !d.SleepUntil(ctx, at.Add(time.Duration(i)*minute)) {
+			return
+		}
+	}
+}
+
+// seams returns a timeline canary's arm and injection; ok is false for an id that starts nothing.
+func seams(id string, spec Spec, d Deps) (arm func() (string, error), inject injectFunc, ok bool) {
 	switch id {
 	case "K1":
 		inject = func(context.Context, Deps) (Event, bool) { leakGoroutine(); return Event{}, true }
@@ -114,68 +257,30 @@ func Start(ctx context.Context, id string, d Deps) func() {
 			d.Env.Ledger.Poison(key)
 			return Event{Key: &key}, false
 		}
+	case "K11":
+		arm = func() (string, error) {
+			if d.Hooks == nil {
+				return "", errors.New("no Env hooks")
+			}
+			d.Hooks.dropping.Store(true)
+			return "the primary Env drops every LWT offer before the driver call", nil
+		}
+	case "K16":
+		// The selection is made at the arm and recorded right after it, as K16's one injection event.
+		var sel Selection
+		arm = func() (string, error) {
+			var detail string
+			var err error
+			sel, detail, err = armK16(d)
+			return detail, err
+		}
+		inject = func(context.Context, Deps) (Event, bool) { return Event{Kind: KindSelect, Selection: &sel}, false }
 	case "K15", "K17":
 		arm = func() (string, error) { return fmt.Sprintf("switches %+v on every Env", spec.Switches), nil }
 	default:
-		return func() {}
+		return nil, nil, false
 	}
-	if d.SleepUntil == nil {
-		d.SleepUntil = sleepUntil
-	}
-	if d.Now == nil {
-		d.Now = time.Now
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		at := d.Epoch.Add(spec.Start)
-		if !d.SleepUntil(ctx, at) {
-			return
-		}
-		arming := Event{Canary: id, Kind: KindArm, Time: d.Now()}
-		if arm != nil {
-			detail, err := arm()
-			if arming.Detail = detail; err != nil {
-				arming.Detail = "arm failed: " + err.Error()
-				d.Event(arming)
-				return
-			}
-		}
-		d.Event(arming)
-		if inject == nil {
-			return
-		}
-		for i := 1; ctx.Err() == nil; i++ {
-			now := d.Now()
-			ev, more := inject(ctx, d)
-			ev.Canary, ev.Time = id, now
-			if ev.Kind == "" {
-				ev.Kind = KindInject
-			}
-			d.Event(ev)
-			if !more || !d.SleepUntil(ctx, at.Add(time.Duration(i)*minute)) {
-				return
-			}
-		}
-	}()
-	return func() { <-done }
-}
-
-// ArmBeforeG0 returns the arm event of a canary armed before G0 runs (K12, PLAN §44.2), which cellrun records.
-//
-// Parameters:
-//   - id: the canary id
-//   - now: the time of the arm
-//
-// Returns:
-//   - Event: the arm event, naming the version G0 will expect
-//   - bool: false for every other canary
-func ArmBeforeG0(id string, now time.Time) (Event, bool) {
-	s, ok := Lookup(id)
-	if !ok || s.ExpectedVersion == "" {
-		return Event{}, false
-	}
-	return Event{Canary: id, Kind: KindArm, Time: now, Detail: "G0 expects release_version " + s.ExpectedVersion}, true
+	return arm, inject, true
 }
 
 // sleepUntil waits for t on a timer.
@@ -187,6 +292,13 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 		return false
 	case <-timer.C:
 		return true
+	}
+}
+
+// parkGoroutines starts n goroutines blocked on the package-level channel never, one creator group (K10).
+func parkGoroutines(n int) {
+	for range n {
+		go func() { <-never }()
 	}
 }
 

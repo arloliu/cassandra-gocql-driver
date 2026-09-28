@@ -190,6 +190,9 @@ type Env struct {
 	// FailedAttempt returns and forgets the coordinator and elapsed of an operation's last failed attempt,
 	// for operations whose terminal call gives no Iter (LWT); may be nil.
 	FailedAttempt func(op uint64) FailedAttempt
+	// Drop reports whether to drop an offer before its op id, the driver call, Latency.Observe and Progress.Completed
+	// (K11); may be nil.
+	Drop func(class Class) bool
 	// Inject returns a delay to add inside the latency boundary, before the driver call (K16); may be nil.
 	Inject func(class Class, seq uint64) time.Duration
 	// ShortDeadlineTimeouts counts short-deadline operations that timed out (G15).
@@ -251,6 +254,9 @@ func scanVariantOf(v int, noEarlyClose bool) scanVariant {
 //   - rng: the worker's generator
 //   - o: the offer
 func (e *Env) Do(ctx context.Context, w int, rng *rand.Rand, o Offer) {
+	if e.Drop != nil && e.Drop(o.Class) {
+		return
+	}
 	info := OpInfo{ID: e.OpIDs.Add(1), Session: e.SessionID, Class: o.Class}
 	delayed := false
 	start := time.Now()

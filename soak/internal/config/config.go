@@ -167,6 +167,8 @@ type Overrides struct {
 	// ExpectedVersion replaces the Cassandra version G0 expects (K12); empty keeps Base.Cell.Version,
 	// which also names the ccm install directory.
 	ExpectedVersion string `json:"expected_version,omitempty"`
+	// StopTarget pins the validation F-stop to this node (K13); empty keeps the drawn target.
+	StopTarget string `json:"stop_target,omitempty"`
 	// G15Scale scales the G15 minimums; zero means 1.
 	G15Scale float64 `json:"g15_scale,omitempty"`
 }
@@ -252,7 +254,7 @@ func NightBase(c Cell, driver Driver, rate float64, workers int) Base {
 // ValidationOverrides returns the overrides of a validation run (PLAN §7): its own timeline and timetable,
 // F-stop then F-pause as the fixed faults, and the scaled G15 minimums.
 //
-// A canary's overrides are its id and, for K12, the expected version (PLAN §44.4); every other hook follows from the id.
+// A canary's overrides are its id, K12's expected version and K13's F-stop pin (PLAN §44.4); every other hook follows from the id.
 //
 // Parameters:
 //   - id: the canary id, empty for the control run
@@ -266,7 +268,7 @@ func ValidationOverrides(id string) Overrides {
 		Canary: id, G15Scale: ValidationG15Scale,
 	}
 	if s, ok := canary.Lookup(id); ok {
-		o.ExpectedVersion = s.ExpectedVersion
+		o.ExpectedVersion, o.StopTarget = s.ExpectedVersion, s.StopTarget
 	}
 	return o
 }
