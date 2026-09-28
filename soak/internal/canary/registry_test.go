@@ -30,7 +30,7 @@ func TestRegistryIsTheCanaryTable(t *testing.T) {
 		"K1":  {min(12), []string{"G1", "G2"}, []string{"G12"}, nil, true, false},
 		"K2":  {min(12), []string{"G2", "G4"}, []string{"G12"}, nil, true, false},
 		"K3":  {min(12), []string{"G4"}, []string{"G12"}, nil, true, false},
-		"K4":  {min(12), []string{"G3"}, nil, nil, true, false},
+		"K4":  {min(12), []string{"G3"}, []string{"G14"}, nil, true, false},
 		"K5":  {min(12), []string{"G7"}, nil, nil, true, false},
 		"K6b": {min(12), []string{"G6"}, nil, nil, true, false},
 		"K7":  {min(12), []string{"G8"}, nil, nil, true, false},

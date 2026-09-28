@@ -54,7 +54,7 @@ var registry = []Spec{
 	{ID: "K1", Start: 12 * minute, MustFail: []string{"G1", "G2"}, Collateral: []string{"G12"}, Implemented: true},
 	{ID: "K2", Start: 12 * minute, MustFail: []string{"G2", "G4"}, Collateral: []string{"G12"}, Implemented: true},
 	{ID: "K3", Start: 12 * minute, MustFail: []string{"G4"}, Collateral: []string{"G12"}, Implemented: true},
-	{ID: "K4", Start: 12 * minute, MustFail: []string{"G3"}, Implemented: true},
+	{ID: "K4", Start: 12 * minute, MustFail: []string{"G3"}, Collateral: []string{"G14"}, Implemented: true},
 	{ID: "K5", Start: 12 * minute, MustFail: []string{"G7"}, Implemented: true},
 	{ID: "K6b", Start: 12 * minute, MustFail: []string{"G6"}, SkipFinished: 500, Implemented: true},
 	{ID: "K7", Start: 12 * minute, MustFail: []string{"G8"}, Implemented: true},

@@ -181,6 +181,16 @@ func TestRule5MustFailCollateralAndOthers(t *testing.T) {
 	requireValidated(t, Judge(Input{Canary: "K17", Verdict: withGates(allPass(), gate.StatusFail, "G15"), Complete: true}))
 }
 
+// K4's growing heap slows the cool-down, so G14 is collateral (PLAN v7.14 §48.3); no evidence entry is declared.
+func TestRule5K4LatencyCollateral(t *testing.T) {
+	k4 := withGates(allPass(), gate.StatusFail, "G3")
+	requireValidated(t, judge("K4", k4))
+	requireValidated(t, judge("K4", withGates(k4, gate.StatusFail, "G14")))
+	requireNot(t, judge("K4", withGates(allPass(), gate.StatusFail, "G14")), "G3")
+	missing := Input{Canary: "K4", Verdict: withGates(k4, gate.StatusFail, "G14"), Complete: false, Problems: []string{"G14: missing evidence: class read has no cool-down p99"}}
+	requireNot(t, Judge(missing), "missing evidence")
+}
+
 func TestRule5Assertion(t *testing.T) {
 	v := withGates(allPass(), gate.StatusFail, "G8")
 	requireNot(t, Judge(Input{Canary: "K7", Verdict: v, Complete: true, Assertion: []string{"no canary error record out of a window with class unknown"}}), "class unknown")
