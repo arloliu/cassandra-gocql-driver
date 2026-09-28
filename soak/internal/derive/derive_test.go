@@ -92,6 +92,8 @@ func TestCombineFloorsAndNegatives(t *testing.T) {
 	require.InDelta(t, 1.02*1.02-1, th[gate.KL], 1e-15)
 	require.InDelta(t, 3600.0/2100, th[gate.KG], 1e-12)
 	require.InDelta(t, 3600.0/2100, th[gate.KH], 1e-12)
+	require.InDelta(t, 3600.0/2100, th[gate.KSs], 1e-12)
+	require.InDelta(t, 6, th[gate.KFs], 0, "PLAN v7.14 §48.2")
 	require.InDelta(t, 0.5, th[gate.KCh], 0)
 	require.InDelta(t, 0, th[gate.KE], 0, "kE is exempt from degeneracy")
 	require.True(t, derivedOf(t, ds, gate.KL).FloorApplied)
@@ -103,6 +105,25 @@ func TestCombineFloorsAndNegatives(t *testing.T) {
 	th, ds, _ = Combine(cellIDs, obs, nil)
 	require.InDelta(t, 0.06, th[gate.KL], 1e-15)
 	require.False(t, derivedOf(t, ds, gate.KL).FloorApplied)
+}
+
+// kFs's floor holds a one-fd step in the quiet series of batch 1's validation timings, and no more (PLAN v7.14 §48.2).
+func TestFloorKFsContract(t *testing.T) {
+	th := gate.Thresholds{gate.KF: 20, gate.KFs: Floors[gate.KFs]}
+	pass := map[string]gate.Series{
+		"three points (K1)":           {{T: 1223, V: 22}, {T: 1732, V: 22}, {T: 2400, V: 23}},
+		"three points (K4)":           {{T: 1178, V: 22}, {T: 1748, V: 22}, {T: 2400, V: 23}},
+		"a step at the middle point":  {{T: 1152, V: 22}, {T: 1744, V: 23}, {T: 2400, V: 23}},
+		"four points with 2700 s":     {{T: 1162, V: 22}, {T: 1736, V: 22}, {T: 2400, V: 23}, {T: 2700, V: 23}},
+		"four points, step at 2700 s": {{T: 1162, V: 22}, {T: 1736, V: 22}, {T: 2400, V: 22}, {T: 2700, V: 23}},
+	}
+	for name, s := range pass {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, gate.StatusPass, gate.G4(s, 22, th).Status)
+		})
+	}
+	short := gate.Series{{T: 1225, V: 22}, {T: 1711, V: 23}}
+	require.Equal(t, gate.StatusFail, gate.G4(short, 22, th).Status, "a two-point series shorter than 600 s is the stated limit")
 }
 
 func TestCombineDegenerateNeedsAcceptance(t *testing.T) {
@@ -428,6 +449,99 @@ func withLatency(c Cell) Cell {
 		c.Cal.Collected.WarmupP99[class], c.Cal.Collected.CooldownP99[class] = w.Seconds(), k.Seconds()
 	}
 	return c
+}
+
+func TestApplyRaises(t *testing.T) {
+	base := func() (gate.Thresholds, []Derived) {
+		th := gate.Thresholds{}
+		var ds []Derived
+		for _, k := range gate.AllThresholds {
+			th[k] = 1
+			ds = append(ds, Derived{Name: k, Value: 1})
+		}
+		return th, ds
+	}
+
+	th, ds := base()
+	problems := ApplyRaises(th, ds, []Raise{{Name: gate.KL, Value: 0.5, Reason: "too low"}, {Name: gate.KFs, Value: 2, Reason: "one fd"}})
+	require.Empty(t, problems)
+	require.InDelta(t, 1, th[gate.KL], 0, "a raise never lowers")
+	require.InDelta(t, 2, th[gate.KFs], 0)
+	kl, kfs := derivedOf(t, ds, gate.KL), derivedOf(t, ds, gate.KFs)
+	require.Equal(t, &Raised{From: 1, Given: 0.5, Reason: "too low", Applied: false}, kl.Raised)
+	require.InDelta(t, 1, kl.Value, 0)
+	require.Equal(t, &Raised{From: 1, Given: 2, Reason: "one fd", Applied: true}, kfs.Raised)
+	require.InDelta(t, 2, kfs.Value, 0, "the report's value is gates.json's")
+	require.Nil(t, derivedOf(t, ds, gate.KG).Raised)
+
+	for name, tc := range map[string]struct {
+		raises []Raise
+		want   string
+	}{
+		"unknown":   {[]Raise{{Name: "kX", Value: 1, Reason: "r"}}, "kX"},
+		"duplicate": {[]Raise{{Name: gate.KL, Value: 1, Reason: "r"}, {Name: gate.KL, Value: 2, Reason: "r"}}, "twice"},
+		"negative":  {[]Raise{{Name: gate.KL, Value: -1, Reason: "r"}}, "finite"},
+		"NaN":       {[]Raise{{Name: gate.KL, Value: math.NaN(), Reason: "r"}}, "finite"},
+		"infinite":  {[]Raise{{Name: gate.KL, Value: math.Inf(1), Reason: "r"}}, "finite"},
+		"no reason": {[]Raise{{Name: gate.KL, Value: 2, Reason: " "}}, "reason"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			th, ds := base()
+			problems := ApplyRaises(th, ds, tc.raises)
+			require.Len(t, problems, 1)
+			require.Contains(t, problems[0], tc.want)
+			require.InDelta(t, 1, th[gate.KL], 0, "a refused raise changes nothing")
+		})
+	}
+}
+
+// A reason cannot break derivation.md's table (Codex AY01).
+func TestMarkdownEscapesRaiseReasons(t *testing.T) {
+	r := Report{Thresholds: []Derived{
+		{Name: gate.KL, Value: 2, Raised: &Raised{From: 1, Given: 2, Reason: "warm | cool\\ne\nline", Applied: true}},
+		{Name: gate.KFs, Value: 6, Raised: &Raised{From: 6, Given: 1, Reason: "a|b\nc", Applied: false}},
+	}}
+	rows := 0
+	for _, line := range strings.Split(r.Markdown(), "\n") {
+		if !strings.HasPrefix(line, "| "+gate.KL+" |") && !strings.HasPrefix(line, "| "+gate.KFs+" |") {
+			continue
+		}
+		unescaped := strings.Count(line, "|") - strings.Count(line, "\\|")
+		require.Equal(t, 10, unescaped, "a row keeps its nine cells: %s", line)
+		require.True(t, strings.HasSuffix(line, " |"), "a row ends on its own line: %s", line)
+		rows++
+	}
+	require.Equal(t, 2, rows)
+	md := r.Markdown()
+	require.Contains(t, md, `warm \| cool\\ne<br>line`)
+	require.Contains(t, md, `a\|b<br>c`)
+}
+
+// A raise lands in gates.json and the report, and never bypasses a refusal.
+func TestEvaluateRaise(t *testing.T) {
+	s, cells := night(t)
+	for i := range cells {
+		cells[i] = withLatency(cells[i])
+	}
+	o := Options{SourceUnchanged: unchanged, AcceptZero: map[string]string{gate.KD: "no drops"}, Raise: []Raise{{Name: gate.KL, Value: 0.4, Reason: "§48.1"}}}
+	th, r := Evaluate("summary.json", s, cells, o)
+	require.False(t, r.Refused, "%v", r.Problems)
+	require.InDelta(t, 0.4, th[gate.KL], 0)
+	d := derivedOf(t, r.Thresholds, gate.KL)
+	require.InDelta(t, 0.4, d.Value, 0)
+	require.Equal(t, &Raised{From: 1.02*1.02 - 1, Given: 0.4, Reason: "§48.1", Applied: true}, d.Raised)
+	require.Contains(t, r.Markdown(), "raised from")
+
+	o.Raise = []Raise{{Name: "kX", Value: 1, Reason: "r"}}
+	th, r = Evaluate("summary.json", s, cells, o)
+	require.True(t, r.Refused)
+	require.Nil(t, th)
+
+	o = Options{SourceUnchanged: unchanged, Raise: []Raise{{Name: gate.KD, Value: 5, Reason: "r"}}}
+	th, r = Evaluate("summary.json", s, cells, o)
+	require.True(t, r.Refused, "a raise does not accept a degenerate zero")
+	require.Nil(t, th)
+	require.True(t, slices.ContainsFunc(r.Problems, func(p string) bool { return strings.HasPrefix(p, gate.KD+": degenerate") }), "%v", r.Problems)
 }
 
 func TestEvaluateSucceedsOnTheFixture(t *testing.T) {

@@ -77,6 +77,8 @@ type Options struct {
 	AcceptZero map[string]string
 	// AcceptProvenance admits a build whose driver_dirty is not the string "false" (§41.5 item 5).
 	AcceptProvenance string
+	// Raise sets minimums applied after the rule and the floors (PLAN v7.14 §48.5).
+	Raise []Raise
 	// SourceUnchanged reports whether the tree outside soak/ is unchanged between a driver commit and HEAD.
 	SourceUnchanged func(driverSHA string) (bool, error)
 }

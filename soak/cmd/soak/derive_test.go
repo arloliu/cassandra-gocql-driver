@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,6 +146,68 @@ func TestDeriveCommandWritesGates(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(md), "gates.json was written")
 	require.Contains(t, string(md), "degenerate; accepted: no drops in steady state")
+}
+
+// -raise sets a minimum after the rule and the floors, recorded in the report (PLAN v7.14 §48.5).
+func TestDeriveCommandRaise(t *testing.T) {
+	withSourceCheck(t, true)
+	summary := nightDirs(t)
+	out := filepath.Join(t.TempDir(), "gates.json")
+	require.Equal(t, 0, deriveMain([]string{"-summary", summary, "-out", out, "-accept-zero", "kD:r", "-raise", "kL=0.4:§48.1: batch-1 evidence"}))
+	raw, err := os.ReadFile(out)
+	require.NoError(t, err)
+	var th map[string]float64
+	require.NoError(t, json.Unmarshal(raw, &th))
+	require.InDelta(t, 0.4, th["kL"], 0)
+	md, err := os.ReadFile(filepath.Join(filepath.Dir(out), "derivation.md"))
+	require.NoError(t, err)
+	require.Contains(t, string(md), "§48.1: batch-1 evidence")
+
+	out = filepath.Join(t.TempDir(), "gates.json")
+	require.Equal(t, 1, deriveMain([]string{"-summary", summary, "-out", out, "-accept-zero", "kD:r", "-raise", "kX=1:r"}))
+	require.NoFileExists(t, out)
+}
+
+// captureStderr runs fn with os.Stderr redirected and returns what it wrote.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	saved := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = saved }()
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	fn()
+	require.NoError(t, w.Close())
+	return <-done
+}
+
+// A malformed -raise is a usage error before anything is derived or written, on a readable night (Codex AY02).
+func TestDeriveCommandRaiseUsage(t *testing.T) {
+	withSourceCheck(t, true)
+	summary := nightDirs(t)
+	for name, flag := range map[string]string{
+		"no value":     "kL",
+		"no reason":    "kL=0.4",
+		"not a number": "kL=abc:r",
+		"blank reason": "kL=0.4: ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "gates.json")
+			var code int
+			stderr := captureStderr(t, func() {
+				code = deriveMain([]string{"-summary", summary, "-out", out, "-accept-zero", "kD:r", "-raise", flag})
+			})
+			require.Equal(t, 2, code)
+			require.Contains(t, stderr, fmt.Sprintf("-raise %q: want k=value:reason", flag))
+			require.NoFileExists(t, out)
+			require.NoFileExists(t, filepath.Join(filepath.Dir(out), "derivation.json"))
+		})
+	}
 }
 
 func TestDeriveCommandRefusalWritesNoGates(t *testing.T) {

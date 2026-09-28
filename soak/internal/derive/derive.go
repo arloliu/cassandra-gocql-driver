@@ -33,10 +33,11 @@ const (
 )
 
 // Floors are PLAN §41.3's policy floors, applied to the final value; every other threshold's floor is 0.
+// kFs's is one fd across a 600 s quiet span, since G4's slope rests on about three quiet checkpoints (PLAN v7.14 §48.2).
 var Floors = map[string]float64{
 	gate.KL:  1.02*1.02 - 1,
 	gate.KG:  3600 / SlopeWindow,
-	gate.KFs: 3600 / SlopeWindow,
+	gate.KFs: 6,
 	gate.KSs: 3600 / SlopeWindow,
 	gate.KH:  3600 / SlopeWindow,
 	gate.KCh: 1.0 / (ChurnRun - 1),
@@ -218,6 +219,25 @@ type Derived struct {
 	// Degenerate marks a 0 that needs written acceptance; AcceptedZero is that acceptance.
 	Degenerate   bool   `json:"degenerate"`
 	AcceptedZero string `json:"accepted_zero,omitempty"`
+	// Raised records a -raise of this threshold (PLAN v7.14 §48.5); nil when none was given.
+	Raised *Raised `json:"raised,omitempty"`
+}
+
+// Raise is the maintainer's minimum for one threshold, applied after the rule and the floors.
+type Raise struct {
+	Name   string
+	Value  float64
+	Reason string
+}
+
+// Raised is how a raise met the derived value.
+type Raised struct {
+	// From is the value after the rule and the floors, before the raise; Given the raise's value.
+	From  float64 `json:"from"`
+	Given float64 `json:"given"`
+	// Reason is the maintainer's written reason; Applied whether the raise set the value.
+	Reason  string `json:"reason"`
+	Applied bool   `json:"applied"`
 }
 
 // Combine applies PLAN §41.3 to every cell's observations.
@@ -313,6 +333,48 @@ func Combine(cells []string, obs map[string]map[string]Observation, acceptZero m
 	}
 	sort.Strings(problems)
 	return th, derived, problems
+}
+
+// ApplyRaises raises each named threshold to at least its given value (PLAN v7.14 §48.5).
+// It never lowers a threshold, and it applies nothing when any raise is invalid.
+//
+// Parameters:
+//   - th: the derived thresholds, updated in place
+//   - derived: the derivation records, updated in place
+//   - raises: the maintainer's raises
+//
+// Returns:
+//   - []string: one entry per invalid raise; empty when every raise was applied or was a no-op
+func ApplyRaises(th gate.Thresholds, derived []Derived, raises []Raise) []string {
+	var problems []string
+	seen := map[string]bool{}
+	for _, r := range raises {
+		switch {
+		case !slices.Contains(gate.AllThresholds, r.Name):
+			problems = append(problems, fmt.Sprintf("-raise names %s, which is not a threshold", r.Name))
+		case seen[r.Name]:
+			problems = append(problems, fmt.Sprintf("-raise names %s twice", r.Name))
+		case math.IsNaN(r.Value) || math.IsInf(r.Value, 0) || r.Value < 0:
+			problems = append(problems, fmt.Sprintf("-raise %s: the value must be finite and ≥ 0, got %v", r.Name, r.Value))
+		case strings.TrimSpace(r.Reason) == "":
+			problems = append(problems, fmt.Sprintf("-raise %s: a reason is required", r.Name))
+		}
+		seen[r.Name] = true
+	}
+	if len(problems) > 0 {
+		return problems
+	}
+	for _, r := range raises {
+		i := slices.IndexFunc(derived, func(d Derived) bool { return d.Name == r.Name })
+		d := &derived[i]
+		rec := &Raised{From: d.Value, Given: r.Value, Reason: strings.TrimSpace(r.Reason), Applied: r.Value > d.Value}
+		if rec.Applied {
+			d.Value = r.Value
+		}
+		d.Raised = rec
+		th[r.Name] = d.Value
+	}
+	return nil
 }
 
 // calibratedGates are the gates whose thresholds gates.json holds.

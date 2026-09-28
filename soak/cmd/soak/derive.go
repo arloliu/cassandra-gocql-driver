@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/artifact"
@@ -42,15 +43,16 @@ func deriveMain(args []string) int {
 	summary := fs.String("summary", "", "the calibration night's summary, night-<start>-<token>.json")
 	out := fs.String("out", "gates.json", "the gates.json to write; derivation.json and derivation.md go beside it")
 	repo := fs.String("repo", "..", "the driver repository, for the source check")
-	var accepts, zeros repeated
+	var accepts, zeros, raises repeated
 	fs.Var(&accepts, "accept", "cell:gate:reason — admit a failing non-calibrated gate (repeatable)")
 	fs.Var(&zeros, "accept-zero", "k:reason — admit a degenerate threshold of 0 (repeatable)")
 	provenance := fs.String("accept-provenance", "", `reason — admit builds whose driver_dirty is not "false"`)
+	fs.Var(&raises, "raise", "k=value:reason — raise a threshold to at least value after the rule and floors (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *summary == "" || fs.NArg() > 0 {
-		fmt.Fprintln(os.Stderr, "usage: soak derive -summary <night json> [-out gates.json] [-accept cell:gate:reason]… [-accept-zero k:reason]… [-accept-provenance reason]")
+		fmt.Fprintln(os.Stderr, "usage: soak derive -summary <night json> [-out gates.json] [-accept cell:gate:reason]… [-accept-zero k:reason]… [-accept-provenance reason] [-raise k=value:reason]…")
 		return 2
 	}
 	o := derive.Options{AcceptZero: map[string]string{}, AcceptProvenance: strings.TrimSpace(*provenance)}
@@ -69,6 +71,16 @@ func deriveMain(args []string) int {
 			return 2
 		}
 		o.AcceptZero[k] = strings.TrimSpace(reason)
+	}
+	for _, r := range raises {
+		k, rest, okK := strings.Cut(r, "=")
+		num, reason, okR := strings.Cut(rest, ":")
+		v, err := strconv.ParseFloat(num, 64)
+		if !okK || !okR || err != nil || strings.TrimSpace(reason) == "" {
+			fmt.Fprintf(os.Stderr, "-raise %q: want k=value:reason\n", r)
+			return 2
+		}
+		o.Raise = append(o.Raise, derive.Raise{Name: k, Value: v, Reason: strings.TrimSpace(reason)})
 	}
 	o.SourceUnchanged = func(sha string) (bool, error) { return sourceUnchanged(*repo, sha) }
 

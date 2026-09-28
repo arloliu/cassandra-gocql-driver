@@ -9,6 +9,9 @@ import (
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
 )
 
+// mdCellEscaper keeps free text inside one Markdown table cell: backslashes and pipes escaped, line breaks as <br>.
+var mdCellEscaper = strings.NewReplacer(`\`, `\\`, "|", `\|`, "\r\n", "<br>", "\n", "<br>", "\r", "<br>")
+
 // Report is derivation.json (PLAN §41.9): what was derived, how, and every reason to refuse.
 type Report struct {
 	// Summary is the night summary's path; Night its runner token.
@@ -86,8 +89,9 @@ func Evaluate(summaryPath string, s Summary, cells []Cell, o Options) (gate.Thre
 		problems = append(problems, p...)
 	}
 	th, derived, p := Combine(ids, obs, o.AcceptZero)
-	r.Thresholds = derived
 	problems = append(problems, p...)
+	problems = append(problems, ApplyRaises(th, derived, o.Raise)...)
+	r.Thresholds = derived
 	if len(problems) == 0 {
 		problems = SelfCheck(cells, th)
 	}
@@ -106,6 +110,15 @@ func newReport(summaryPath string, s Summary, o Options) Report {
 	}
 	return r
 }
+
+// mdCell escapes free text, such as a maintainer's reason, for one Markdown table cell (Codex AY01).
+//
+// Parameters:
+//   - s: the text
+//
+// Returns:
+//   - string: the text, safe inside one cell
+func mdCell(s string) string { return mdCellEscaper.Replace(s) }
 
 // Markdown renders the report as derivation.md.
 //
@@ -153,8 +166,15 @@ func (r Report) Markdown() string {
 		if d.Degenerate {
 			notes = append(notes, "degenerate; accepted: "+d.AcceptedZero)
 		}
+		if d.Raised != nil {
+			if d.Raised.Applied {
+				notes = append(notes, fmt.Sprintf("raised from %.6g to %.6g: %s", d.Raised.From, d.Raised.Given, d.Raised.Reason))
+			} else {
+				notes = append(notes, fmt.Sprintf("raise to %.6g not applied (derived %.6g): %s", d.Raised.Given, d.Raised.From, d.Raised.Reason))
+			}
+		}
 		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %.6g | %.6g | %.6g | %s |\n",
-			d.Name, d.Rule, strings.Join(cells, "<br>"), strings.Join(windows, " "), p95, d.Observed, d.Floor, d.Value, strings.Join(notes, "; "))
+			d.Name, d.Rule, strings.Join(cells, "<br>"), strings.Join(windows, " "), p95, d.Observed, d.Floor, d.Value, mdCell(strings.Join(notes, "; ")))
 	}
 	if len(r.Accepted) > 0 || r.Provenance != "" {
 		b.WriteString("\n## Accepted by the maintainer\n\n")
