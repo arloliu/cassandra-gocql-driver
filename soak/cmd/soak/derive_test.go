@@ -57,13 +57,13 @@ func nightDirs(t *testing.T) string {
 	}
 	lat, err := probe.RebuildLatency(5, byClass)
 	require.NoError(t, err)
-	p99, _, _ := lat.Quantile(classes[0], 0, 900, 0.99)
-	p99s := map[string]float64{}
+	p99, _, _ := lat.Quantile(classes[0], probe.Window{From: 0, To: 900}, 0.99)
+	p99s, late := map[string]float64{}, map[string]int64{}
 	for _, c := range classes {
-		p99s[c] = p99.Seconds()
+		p99s[c], late[c] = p99.Seconds(), 0
 	}
 	latencyEvent, err := json.Marshal(map[string]any{"t": 7200.3, "time": time.Now(), "kind": "latency",
-		"data": map[string]any{"warmup_p99_s": p99s, "cooldown_p99_s": p99s}})
+		"data": map[string]any{"warmup_p99_s": p99s, "cooldown_p99_s": p99s, "late": late}})
 	require.NoError(t, err)
 
 	type cellEntry map[string]any
@@ -78,7 +78,7 @@ func nightDirs(t *testing.T) string {
 		editJSON(t, filepath.Join(dir, "verdict.json"), func(m map[string]any) { m["cell"] = id })
 		var digest string
 		editJSON(t, filepath.Join(dir, "build.json"), func(m map[string]any) {
-			m["cell"], m["attempt"], m["driver_dirty"] = id, "att-"+id, "false"
+			m["cell"], m["attempt"], m["source_clean"] = id, "att-"+id, "true"
 			digest = m["soak_sha256"].(string)
 		})
 		cells = append(cells, cellEntry{"cell": id, "completion": "done", "problems": []string{},

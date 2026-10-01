@@ -639,7 +639,7 @@ func (r *cellRun) workload(ctx context.Context) {
 	r.epoch = time.Now()
 	r.rec.SetEpoch(r.epoch)
 	r.env.Progress = workload.NewProgress(r.epoch)
-	r.env.Latency = probe.NewLatencySlice(r.epoch, CheapInterval)
+	r.env.Latency = newPrimaryLatency(r.epoch, r.tl)
 	// The timeline canaries' Env hooks are installed before the workload starts and armed by the canary goroutine.
 	hooks := canary.NewHooks(r.canary.ID)
 	r.env.Drop, r.env.Inject = hooks.Drop(), hooks.Inject()
@@ -763,11 +763,7 @@ wait:
 	r.col.Churns = r.churner.Residue()
 	r.rec.Event("coverage", time.Now(), coverageEvent{Settlement: r.col.Settlement,
 		ShortDeadlineTimeouts: r.col.ShortDeadlineTimeouts, ErrorClasses: r.rec.ClassCounts()})
-	r.latency()
-	r.rec.Event("latency", time.Now(), map[string]any{"warmup_p99_s": r.col.WarmupP99, "cooldown_p99_s": r.col.CooldownP99})
-	if e, ok := canary.FinalCounts(r.canary.ID, r.env.Latency, r.col.Classes, r.tl.Cooldown, r.tl.Workload, time.Now()); ok {
-		r.rec.Event("canary", e.Time, e)
-	}
+	r.finalLatency()
 
 	if len(r.col.Incomplete) > 0 || len(r.col.FixtureInvalid) > 0 {
 		r.col.Profiles = r.sampler.Profiles()
@@ -820,17 +816,45 @@ func (r *cellRun) phaseAt(now time.Time) string {
 	}
 }
 
+// finalLatency runs the record's last live queries once the sampler has flushed it: G14's p99s, the latency event
+// with the late counts, and K16's final counts; then the record's errors become invalid-config reasons, before the verdict (PLAN §51.3).
+func (r *cellRun) finalLatency() {
+	r.latency()
+	r.rec.Event("latency", time.Now(), map[string]any{"warmup_p99_s": r.col.WarmupP99, "cooldown_p99_s": r.col.CooldownP99,
+		"late": r.lateCounts()})
+	if e, ok := canary.FinalCounts(r.canary.ID, r.env.Latency, r.col.Classes, r.tl.Cooldown, r.tl.Workload, time.Now()); ok {
+		r.rec.Event("canary", e.Time, e)
+	}
+	r.col.InvalidConfig = append(r.col.InvalidConfig, r.env.Latency.Errors()...)
+}
+
 // latency takes the primary's warm-up and cool-down p99 per class (G14).
 func (r *cellRun) latency() {
 	r.col.WarmupP99, r.col.CooldownP99 = map[string]float64{}, map[string]float64{}
 	for _, class := range r.env.Latency.Classes() {
-		if p, _, ok := r.env.Latency.Quantile(class, 0, r.tl.Warmup.Seconds(), 0.99); ok {
+		if p, _, ok := r.env.Latency.Quantile(class, probe.Span(0, r.tl.Warmup), 0.99); ok {
 			r.col.WarmupP99[class] = p.Seconds()
 		}
-		if p, _, ok := r.env.Latency.Quantile(class, r.tl.Cooldown.Seconds(), r.tl.Workload.Seconds(), 0.99); ok {
+		if p, _, ok := r.env.Latency.Quantile(class, probe.Span(r.tl.Cooldown, r.tl.Workload), 0.99); ok {
 			r.col.CooldownP99[class] = p.Seconds()
 		}
 	}
+}
+
+// lateCounts returns the primary's late observations for every class of the mix, zeros included (PLAN §51.2);
+// a class the record observed outside the mix is an invalid-config reason, since the event's key set is the mix.
+func (r *cellRun) lateCounts() map[string]int64 {
+	late := r.env.Latency.Late()
+	out := map[string]int64{}
+	for _, class := range r.col.Classes {
+		out[class] = late[class]
+	}
+	for class := range late {
+		if _, ok := out[class]; !ok {
+			r.col.InvalidConfig = append(r.col.InvalidConfig, fmt.Sprintf("latency: class %s is not in the mix", class))
+		}
+	}
+	return out
 }
 
 // oracles runs the final register and LWT checks (PLAN §4.3, §4.4).
@@ -1130,6 +1154,12 @@ func (r *cellRun) closeStreams() {
 			r.artifactFailure("%s: close: %v", name, err)
 		}
 	}
+}
+
+// newPrimaryLatency returns the primary's live latency record: it answers G14's and K16's windows only,
+// and keeps each slice until the sampler seals it (PLAN §51.3).
+func newPrimaryLatency(epoch time.Time, tl config.Timeline) *probe.Latency {
+	return probe.NewLiveLatency(epoch, CheapInterval, probe.Span(0, tl.Warmup), probe.Span(tl.Cooldown, tl.Workload))
 }
 
 // openBounded runs cell.Open in an owner goroutine; a late session is closed when it arrives.

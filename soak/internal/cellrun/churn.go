@@ -164,7 +164,7 @@ func (o *auxOwner) load(ctx context.Context, rng workload.Range, index int) erro
 	env := &workload.Env{
 		Session: o.sess.Session, SessionID: o.id, Range: rng, Workers: max(c.Workers/workload.AuxWorkersDivisor, 1),
 		ChurnSpace: cell.ChurnSpace(), Ledger: c.Ledger, Settlement: c.Settlement,
-		Progress: workload.NewProgress(time.Now()), Latency: probe.NewLatency(time.Now()), OpIDs: c.OpIDs,
+		Progress: workload.NewProgress(time.Now()), Latency: probe.NewAggregateLatency(time.Now()), OpIDs: c.OpIDs,
 		Errors: c.Recorder.Error, Violations: c.Violations, Switches: c.Switches,
 	}
 	start := c.StartLoad

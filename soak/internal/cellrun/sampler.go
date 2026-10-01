@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -142,11 +143,9 @@ type Sampler struct {
 	primary  *cell.Session
 	progress *workload.Progress
 	latency  *probe.Latency
-	// latencyNext is the first slice whose histogram is not yet written.
-	latencyNext int
-	sessions    map[string]*cell.Session
-	profiles    []Profile
-	requests    chan string
+	sessions map[string]*cell.Session
+	profiles []Profile
+	requests chan string
 }
 
 // CaptureBaseline measures baseline₀: goroutine groups and fds, before the primary session opens.
@@ -232,8 +231,8 @@ func (s *Sampler) Run(ctx context.Context) {
 		case <-cheap.C:
 			now := time.Now()
 			s.Out.Write(s.cheap(now))
-			// Each 5 s slice's latency histogram is written once the slice is over (PLAN §6, Codex J08).
-			s.writeLatency(int(now.Sub(epoch) / CheapInterval))
+			// Each 5 s slice's latency histogram is sealed and written one full slice after it ends (PLAN §6, §51.2).
+			s.writeLatency(sealBound(now.Sub(epoch)))
 		case <-timer.C:
 			s.profile(time.Now(), ReasonPeriodic)
 			for !nextProfile.After(time.Now()) {
@@ -263,25 +262,21 @@ func (s *Sampler) RequestCheckpoint(reason string) {
 	}
 }
 
-// FlushLatency writes the latency histograms not yet written, the last partial slice included;
-// call it after the workload stopped.
+// FlushLatency seals and writes every latency histogram not yet written, the last partial slice included;
+// call it after the workload stopped and Run returned, so no observation can follow.
 func (s *Sampler) FlushLatency() {
-	s.writeLatency(int(^uint(0) >> 1))
+	s.writeLatency(math.MaxInt)
 }
 
-// writeLatency writes the histogram of every unwritten slice before upTo, and of the last observed one
-// when upTo is past every observation.
+// writeLatency seals every slice before upTo and writes each one that holds an observation (PLAN §51.2).
 func (s *Sampler) writeLatency(upTo int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.latency == nil {
 		return
 	}
-	last := s.latency.LastSlice()
-	for ; s.latencyNext < upTo && s.latencyNext <= last; s.latencyNext++ {
-		if h := s.latency.Slice(s.latencyNext); len(h) > 0 {
-			s.Out.Write(map[string]any{"kind": "latency", "slice": s.latencyNext, "classes": h})
-		}
+	for _, sealed := range s.latency.Seal(upTo) {
+		s.Out.Write(map[string]any{"kind": "latency", "slice": sealed.Slice, "classes": sealed.Classes})
 	}
 }
 
@@ -442,6 +437,12 @@ func (s *Sampler) writeFile(name string, data []byte, p *Profile) {
 	if err := os.WriteFile(filepath.Join(s.PprofDir, name), data, 0o644); err != nil {
 		p.WriteErrors = append(p.WriteErrors, err.Error())
 	}
+}
+
+// sealBound is the first slice a cheap tick at offset since from the epoch must not seal:
+// every slice that ended at least one full slice ago is sealed (PLAN §51.2), so the tick at 10 s seals slice 0.
+func sealBound(since time.Duration) int {
+	return int(since/CheapInterval) - 1
 }
 
 // diskFreeGiB returns the free space available to the user under dir, or -1 when it cannot be read.

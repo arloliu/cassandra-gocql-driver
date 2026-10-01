@@ -841,13 +841,13 @@ func TestPIDWatcherPublishesChanges(t *testing.T) {
 	r.stopWatchingPIDs() // idempotent
 }
 
-// Each 5 s slice is written once when it ends; the flush writes the rest, skipping empty slices (Codex J08).
+// Each 5 s slice is sealed and written once; the flush writes the rest, skipping empty slices (Codex J08, PLAN §51.2).
 func TestSamplerLatencySlices(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "samples.jsonl")
 	out, err := artifact.OpenJSONL(path)
 	require.NoError(t, err)
 	epoch := time.Now()
-	lat := probe.NewLatencySlice(epoch, 5*time.Second)
+	lat := probe.NewLiveLatency(epoch, 5*time.Second)
 	for _, sec := range []int{1, 7, 17} {
 		lat.Observe("read", epoch.Add(time.Duration(sec)*time.Second), time.Millisecond, false)
 	}
@@ -862,6 +862,36 @@ func TestSamplerLatencySlices(t *testing.T) {
 		slices = append(slices, l["slice"].(float64))
 	}
 	require.Equal(t, []float64{0, 1, 3}, slices, "slice 2 had no observation; nothing is written twice")
+}
+
+// A tick seals a slice only one full slice after it ends; an observation filed after its slice was sealed
+// is counted late and never written (PLAN §51.2).
+func TestSamplerSealsWithGrace(t *testing.T) {
+	require.Equal(t, -1, sealBound(4*time.Second))
+	require.Equal(t, 0, sealBound(5*time.Second+6*time.Millisecond), "the tick just after slice 0 ends seals nothing")
+	require.Equal(t, 0, sealBound(9999*time.Millisecond))
+	require.Equal(t, 1, sealBound(10*time.Second), "slice 0 is sealed 5 s after it ends")
+	require.Equal(t, 3, sealBound(21*time.Second), "a late tick seals every slice it owes")
+
+	path := filepath.Join(t.TempDir(), "samples.jsonl")
+	out, err := artifact.OpenJSONL(path)
+	require.NoError(t, err)
+	epoch := time.Now()
+	lat := probe.NewLiveLatency(epoch, CheapInterval)
+	s := &Sampler{Out: out}
+	s.Start(epoch, &cell.Session{ID: "primary"}, nil, lat)
+	lat.Observe("read", epoch.Add(4*time.Second), time.Millisecond, false)
+	s.writeLatency(sealBound(5*time.Second + 6*time.Millisecond)) // the old tick would have written slice 0 here
+	lat.Observe("read", epoch.Add(4900*time.Millisecond), time.Millisecond, false)
+	s.writeLatency(sealBound(10 * time.Second))
+	lat.Observe("read", epoch.Add(3*time.Second), time.Millisecond, false) // a worker stalled past the grace
+	s.FlushLatency()
+	require.NoError(t, out.Close())
+	lines := readLines(t, path)
+	require.Len(t, lines, 1)
+	require.EqualValues(t, 0, lines[0]["slice"])
+	require.EqualValues(t, 2, lines[0]["classes"].(map[string]any)["read"].(map[string]any)["n"], "both on-time observations")
+	require.Equal(t, map[string]int64{"read": 1}, lat.Late())
 }
 
 // blockingStop is a load whose Stop waits for release, like a driver call that ignores its deadline.

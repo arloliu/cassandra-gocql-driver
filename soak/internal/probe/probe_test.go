@@ -3,6 +3,7 @@ package probe
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -134,7 +135,8 @@ func TestCountingLogger(t *testing.T) {
 
 func TestLatency(t *testing.T) {
 	epoch := time.Unix(1_000_000, 0)
-	l := NewLatency(epoch)
+	m0, m1, both, later := Window{From: 0, To: 60}, Window{From: 60, To: 120}, Window{From: 0, To: 120}, Window{From: 120, To: 180}
+	l := NewLiveLatency(epoch, time.Minute, m0, m1, both, later)
 	// Minute 0: 100 ops of 1 ms; minute 1: 99 of 1 ms and 1 of 100 ms, delayed.
 	for i := range 100 {
 		l.Observe("read", epoch.Add(time.Duration(i)*100*time.Millisecond), time.Millisecond, false)
@@ -144,34 +146,36 @@ func TestLatency(t *testing.T) {
 	}
 	l.Observe("read", epoch.Add(time.Minute+30*time.Second), 100*time.Millisecond, true)
 
-	p, n, ok := l.Quantile("read", 0, 60, 0.99)
+	p, n, ok := l.Quantile("read", m0, 0.99)
 	require.True(t, ok)
 	require.Equal(t, int64(100), n)
 	require.InDelta(t, float64(time.Millisecond), float64(p), 0.02*float64(time.Millisecond))
 
-	p, _, ok = l.Quantile("read", 60, 120, 1)
+	p, _, ok = l.Quantile("read", m1, 1)
 	require.True(t, ok)
 	require.GreaterOrEqual(t, p, 100*time.Millisecond)
 	require.LessOrEqual(t, p, 102*time.Millisecond)
 
-	total, delayed := l.Counts("read", 0, 120)
+	total, delayed := l.Counts("read", both)
 	require.Equal(t, int64(200), total)
 	require.Equal(t, int64(1), delayed)
 
-	_, _, ok = l.Quantile("read", 120, 180, 0.5)
+	_, _, ok = l.Quantile("read", later, 0.5)
 	require.False(t, ok)
 	require.Equal(t, []string{"read"}, l.Classes())
+	require.Empty(t, l.Errors())
 }
 
-func TestLatencySliceHistograms(t *testing.T) {
+func TestLatencySealedHistograms(t *testing.T) {
 	epoch := time.Now()
-	l := NewLatency(epoch)
-	require.Equal(t, -1, l.LastSlice())
+	l := NewLiveLatency(epoch, time.Minute)
 	l.Observe("read", epoch.Add(10*time.Second), time.Millisecond, false)
 	l.Observe("read", epoch.Add(20*time.Second), time.Millisecond, true)
 	l.Observe("write", epoch.Add(130*time.Second), 5*time.Millisecond, false)
-	require.Equal(t, 2, l.LastSlice())
-	m0 := l.Slice(0)
+	sealed := l.Seal(math.MaxInt)
+	require.Len(t, sealed, 2, "slice 1 had no observation")
+	require.Equal(t, 0, sealed[0].Slice)
+	m0 := sealed[0].Classes
 	require.Len(t, m0, 1)
 	require.EqualValues(t, 2, m0["read"].N)
 	require.EqualValues(t, 1, m0["read"].Delayed)
@@ -181,15 +185,16 @@ func TestLatencySliceHistograms(t *testing.T) {
 		total += n
 	}
 	require.EqualValues(t, 2, total)
-	require.Empty(t, l.Slice(1))
-	require.EqualValues(t, 1, l.Slice(2)["write"].N)
+	require.Equal(t, 2, sealed[1].Slice)
+	require.EqualValues(t, 1, sealed[1].Classes["write"].N)
 
-	fine := NewLatencySlice(epoch, 5*time.Second)
+	fine := NewLiveLatency(epoch, 5*time.Second, Window{From: 0, To: 60})
 	fine.Observe("read", epoch.Add(12*time.Second), time.Millisecond, false)
-	require.Equal(t, 2, fine.LastSlice())
-	require.Equal(t, 10, fine.Slice(2)["read"].Start)
-	require.Equal(t, 5, fine.Slice(2)["read"].Seconds)
-	q, n, ok := fine.Quantile("read", 0, 60, 0.99)
+	s := fine.Seal(math.MaxInt)
+	require.Equal(t, 2, s[0].Slice)
+	require.Equal(t, 10, s[0].Classes["read"].Start)
+	require.Equal(t, 5, s[0].Classes["read"].Seconds)
+	q, n, ok := fine.Quantile("read", Window{From: 0, To: 60}, 0.99)
 	require.True(t, ok)
 	require.EqualValues(t, 1, n)
 	require.GreaterOrEqual(t, q, time.Millisecond)

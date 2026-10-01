@@ -13,6 +13,7 @@ import (
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/cellrun"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/config"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/probe"
 )
 
 // Windows of PLAN §41.4.
@@ -26,8 +27,8 @@ const (
 	// ChurnRun is how many consecutive churns make one kCh window: a validation run's churn slots.
 	ChurnRun = 3
 	// LatencyWarmup and LatencyCooldown are the validation run's warm-up and cool-down lengths, seconds (kL).
-	LatencyWarmup   = float64(config.ValidationWarmup / time.Second)
-	LatencyCooldown = float64((config.ValidationWorkload - config.ValidationCooldown) / time.Second)
+	LatencyWarmup   = int(config.ValidationWarmup / time.Second)
+	LatencyCooldown = int((config.ValidationWorkload - config.ValidationCooldown) / time.Second)
 	// Factor is the rule's multiplier.
 	Factor = 2.0
 )
@@ -142,36 +143,63 @@ func addWindow(out map[string]Observation, k string, points int, value func() ga
 	out[k] = o
 }
 
+// rebuiltP99 returns each mix class's p99 over a window of the rebuilt histograms;
+// a class with no p99, or whose p99 falls in an ambiguous bucket, is a problem instead.
+func rebuiltP99(id string, cal *cellrun.Calibration, w probe.Window) (map[string]float64, []string) {
+	m := map[string]float64{}
+	var problems []string
+	for _, class := range cal.Collected.Classes {
+		d, _, ok, ambiguous := cal.Latency.QuantileChecked(class, w, 0.99)
+		switch {
+		case !ok:
+			problems = append(problems, fmt.Sprintf("%s: class %s has no p99 in [%d, %d) s", id, class, w.From, w.To))
+		case ambiguous:
+			problems = append(problems, fmt.Sprintf("%s: class %s's p99 in [%d, %d) s falls in an ambiguous bucket", id, class, w.From, w.To))
+		default:
+			m[class] = d.Seconds()
+		}
+	}
+	return m, problems
+}
+
+// CrossCheckLatency compares the warm-up and cool-down p99s rebuilt from samples.jsonl with those the run recorded
+// in its latency event (§41.2); the derivation and `soak latency-check` share it (PLAN §51.5).
+//
+// Parameters:
+//   - id: the cell's name in the problems
+//   - cal: the loaded execution directory
+//
+// Returns:
+//   - warm, cool: the rebuilt p99 per class
+//   - []string: the problems; empty when every class agrees
+func CrossCheckLatency(id string, cal *cellrun.Calibration) (warm, cool map[string]float64, problems []string) {
+	col := cal.Collected
+	tl := col.Timeline
+	warm, wp := rebuiltP99(id, cal, probe.Span(0, tl.Warmup))
+	cool, cp := rebuiltP99(id, cal, probe.Span(tl.Cooldown, tl.Workload))
+	problems = append(wp, cp...)
+	for _, class := range col.Classes {
+		if warm[class] != col.WarmupP99[class] || cool[class] != col.CooldownP99[class] {
+			problems = append(problems, fmt.Sprintf("%s: class %s's rebuilt p99 (%v, %v) differs from the recorded (%v, %v)",
+				id, class, warm[class], cool[class], col.WarmupP99[class], col.CooldownP99[class]))
+		}
+	}
+	return warm, cool, problems
+}
+
 // observeLatency adds kL's comparisons (§41.4): the validation-length warm-up against each validation-length
 // cool-down window of the night's cool-down, and the night's own comparison.
 func observeLatency(c Cell, out map[string]Observation) []string {
 	col := c.Cal.Collected
 	o := out[gate.KL]
 	tl := col.Timeline
-	var problems []string
-	warmEnd, coolStart, end := tl.Warmup.Seconds(), tl.Cooldown.Seconds(), tl.Workload.Seconds()
-	p99 := func(from, to float64) map[string]float64 {
-		m := map[string]float64{}
-		for _, class := range col.Classes {
-			d, _, ok, ambiguous := c.Cal.Latency.QuantileChecked(class, from, to, 0.99)
-			switch {
-			case !ok:
-				problems = append(problems, fmt.Sprintf("%s: class %s has no p99 in [%.0f, %.0f) s", c.ID, class, from, to))
-			case ambiguous:
-				problems = append(problems, fmt.Sprintf("%s: class %s's p99 in [%.0f, %.0f) s falls in an ambiguous bucket", c.ID, class, from, to))
-			default:
-				m[class] = d.Seconds()
-			}
-		}
-		return m
-	}
+	end := int(tl.Workload / time.Second)
 	// The cross-check runs on every cell, a contaminated one too (Codex AK04).
-	nightWarm, nightCool := p99(0, warmEnd), p99(coolStart, end)
-	for _, class := range col.Classes {
-		if nightWarm[class] != col.WarmupP99[class] || nightCool[class] != col.CooldownP99[class] {
-			problems = append(problems, fmt.Sprintf("%s: class %s's rebuilt p99 (%v, %v) differs from the recorded (%v, %v)",
-				c.ID, class, nightWarm[class], nightCool[class], col.WarmupP99[class], col.CooldownP99[class]))
-		}
+	nightWarm, nightCool, problems := CrossCheckLatency(c.ID, &c.Cal)
+	p99 := func(w probe.Window) map[string]float64 {
+		m, p := rebuiltP99(c.ID, &c.Cal, w)
+		problems = append(problems, p...)
+		return m
 	}
 	if col.CooldownContaminated() {
 		o.Excluded, o.Full = true, gate.Critical{}
@@ -186,9 +214,9 @@ func observeLatency(c Cell, out map[string]Observation) []string {
 			o.Windows = append(o.Windows, v.Value)
 		}
 	}
-	short := p99(0, LatencyWarmup)
-	for from := coolStart; from+LatencyCooldown <= end; from += LatencyCooldown {
-		addComparison(gate.G14Critical(short, p99(from, from+LatencyCooldown)))
+	short := p99(probe.Window{From: 0, To: LatencyWarmup})
+	for from := int(tl.Cooldown / time.Second); from+LatencyCooldown <= end; from += LatencyCooldown {
+		addComparison(gate.G14Critical(short, p99(probe.Window{From: from, To: from + LatencyCooldown})))
 	}
 	addComparison(gate.G14Critical(nightWarm, nightCool))
 	out[gate.KL] = o

@@ -14,7 +14,7 @@ import (
 // warmLatency is a primary latency record whose warm-up holds 1000 operations of latency d per class of the mix,
 // plus one slow operation after the warm-up, which no warm-up statistic may see.
 func warmLatency(epoch time.Time, warmup, d time.Duration) *probe.Latency {
-	l := probe.NewLatencySlice(epoch, 5*time.Second)
+	l := probe.NewLiveLatency(epoch, 5*time.Second, probe.Span(0, warmup))
 	for _, s := range workload.DefaultMix() {
 		for i := range 1000 {
 			l.Observe(string(s.Class), epoch.Add(time.Duration(i)*warmup/1000), d, false)
@@ -32,7 +32,7 @@ func k16Params(l *probe.Latency, workers int) K16Params {
 func TestK16Select(t *testing.T) {
 	epoch := time.Unix(1_000_000, 0)
 	l := warmLatency(epoch, 10*time.Minute, time.Millisecond)
-	p99, _, ok := l.Quantile("write", 0, 600, 0.99)
+	p99, _, ok := l.Quantile("write", probe.Window{From: 0, To: 600}, 0.99)
 	require.True(t, ok)
 	upper := p99.Seconds() // every warm-up operation sits in the 1 ms bucket
 
@@ -58,7 +58,7 @@ func TestK16Select(t *testing.T) {
 	// A W that n = 20 overloads: the smallest n whose check passes.
 	// One-second operations make the steps between consecutive n larger than one worker.
 	slow := warmLatency(epoch, 10*time.Minute, time.Second)
-	p99, _, _ = slow.Quantile("write", 0, 600, 0.99)
+	p99, _, _ = slow.Quantile("write", probe.Window{From: 0, To: 600}, 0.99)
 	slowWork, slowOcc := 1500*3*p99.Seconds(), float64(len(workload.DefaultMix()))*1000*p99.Seconds()/600
 	w := func(n int) float64 { return (slowWork/float64(n) + slowOcc) / 0.75 }
 	workers := int(w(30)) + 1 // passes at 30 (and after), not at 29
@@ -76,7 +76,7 @@ func TestK16Select(t *testing.T) {
 	require.Greater(t, sel.LHS, sel.RHS)
 
 	// A class with no warm-up p99 cannot be selected.
-	empty := probe.NewLatencySlice(epoch, 5*time.Second)
+	empty := probe.NewLiveLatency(epoch, 5*time.Second, probe.Window{From: 0, To: 600})
 	_, err = Select(k16Params(empty, 32))
 	require.ErrorContains(t, err, "no warm-up p99")
 }
@@ -152,7 +152,7 @@ func TestK16ArmsAtMinute20(t *testing.T) {
 // The final-counts event holds each class's cool-down completions and delayed completions (PLAN §44.8).
 func TestFinalCounts(t *testing.T) {
 	epoch := time.Unix(1_000_000, 0)
-	l := probe.NewLatencySlice(epoch, 5*time.Second)
+	l := probe.NewLiveLatency(epoch, 5*time.Second, probe.Window{From: 2400, To: 2700})
 	for i := range 100 {
 		l.Observe("write", epoch.Add(2400*time.Second+time.Duration(i)*time.Second), time.Millisecond, i%20 == 0)
 	}

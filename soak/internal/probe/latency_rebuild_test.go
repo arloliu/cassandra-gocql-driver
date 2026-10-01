@@ -1,17 +1,18 @@
 package probe
 
 import (
+	"math"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-// persisted writes every slice of l the way the sampler does, by class.
+// persisted seals every slice of l the way the sampler's final flush does, by class.
 func persisted(l *Latency) map[string][]SliceHistogram {
 	out := map[string][]SliceHistogram{}
-	for s := 0; s <= l.LastSlice(); s++ {
-		for class, h := range l.Slice(s) {
+	for _, s := range l.Seal(math.MaxInt) {
+		for class, h := range s.Classes {
 			out[class] = append(out[class], h)
 		}
 	}
@@ -20,7 +21,8 @@ func persisted(l *Latency) map[string][]SliceHistogram {
 
 func TestRebuildLatencyMatchesTheLiveQuantiles(t *testing.T) {
 	epoch := time.Unix(1000, 0)
-	live := NewLatencySlice(epoch, 5*time.Second)
+	ranges := []Window{{From: 0, To: 120}, {From: 0, To: 60}, {From: 60, To: 120}, {From: 15, To: 40}}
+	live := NewLiveLatency(epoch, 5*time.Second, ranges...)
 	for i := range 600 {
 		at := epoch.Add(time.Duration(i) * 200 * time.Millisecond)
 		live.Observe("read", at, time.Duration(300+i*7)*time.Microsecond, false)
@@ -29,18 +31,18 @@ func TestRebuildLatencyMatchesTheLiveQuantiles(t *testing.T) {
 	rebuilt, err := RebuildLatency(5, persisted(live))
 	require.NoError(t, err)
 	for _, class := range []string{"read", "scan"} {
-		for _, r := range [][2]float64{{0, 120}, {0, 60}, {60, 120}, {15, 40}} {
+		for _, r := range ranges {
 			for _, q := range []float64{0.5, 0.99} {
-				want, wantN, wantOK := live.Quantile(class, r[0], r[1], q)
-				got, n, ok, ambiguous := rebuilt.QuantileChecked(class, r[0], r[1], q)
+				want, wantN, wantOK := live.Quantile(class, r, q)
+				got, n, ok, ambiguous := rebuilt.QuantileChecked(class, r, q)
 				require.Equal(t, wantOK, ok)
 				require.Equal(t, wantN, n)
 				require.Equal(t, want, got, "class %s range %v q %v", class, r, q)
 				require.False(t, ambiguous)
 			}
 		}
-		total, delayed := rebuilt.Counts(class, 0, 120)
-		wantTotal, wantDelayed := live.Counts(class, 0, 120)
+		total, delayed := rebuilt.Counts(class, ranges[0])
+		wantTotal, wantDelayed := live.Counts(class, ranges[0])
 		require.Equal(t, wantTotal, total)
 		require.Equal(t, wantDelayed, delayed)
 	}
@@ -58,19 +60,19 @@ func TestRebuildLatencyAmbiguousKeys(t *testing.T) {
 	require.Greater(t, len(shared), 1, "key 12 µs must be shared by several buckets")
 
 	epoch := time.Unix(0, 0)
-	live := NewLatencySlice(epoch, 5*time.Second)
+	live := NewLiveLatency(epoch, 5*time.Second)
 	low := bucketUpper(shared[0]) - 1 // lands in the lowest bucket of the shared key
 	live.Observe("read", epoch, low, false)
 	live.Observe("read", epoch, 3*time.Millisecond, false)
 	rebuilt, err := RebuildLatency(5, persisted(live))
 	require.NoError(t, err)
 
-	got, _, ok, ambiguous := rebuilt.QuantileChecked("read", 0, 5, 0.5)
+	got, _, ok, ambiguous := rebuilt.QuantileChecked("read", Window{From: 0, To: 5}, 0.5)
 	require.True(t, ok)
 	require.True(t, ambiguous)
 	require.Equal(t, bucketUpper(shared[len(shared)-1]), got, "the highest bucket of the key")
 
-	_, _, _, ambiguous = rebuilt.QuantileChecked("read", 0, 5, 0.99)
+	_, _, _, ambiguous = rebuilt.QuantileChecked("read", Window{From: 0, To: 5}, 0.99)
 	require.False(t, ambiguous, "the 3 ms bucket is unique")
 }
 
@@ -90,10 +92,11 @@ func TestRebuildLatencyRejectsBadSlices(t *testing.T) {
 	require.Error(t, err, "the same slice twice")
 }
 
-// WorkSeconds sums each operation's bucket upper bound over the minutes that start in the window (K16's occupancy, PLAN §44.6).
+// WorkSeconds sums each operation's bucket upper bound over the slices that start in the window (K16's occupancy, PLAN §44.6).
 func TestWorkSeconds(t *testing.T) {
 	epoch := time.Unix(1000, 0)
-	l := NewLatencySlice(epoch, 5*time.Second)
+	warm := Window{From: 0, To: 600}
+	l := NewLiveLatency(epoch, 5*time.Second, warm)
 	for range 10 {
 		l.Observe("write", epoch.Add(time.Second), time.Millisecond, false)
 	}
@@ -103,8 +106,8 @@ func TestWorkSeconds(t *testing.T) {
 	l.Observe("write", epoch.Add(600*time.Second), time.Second, false)
 	l.Observe("read", epoch.Add(2*time.Second), time.Second, false)
 	want := 10*bucketUpper(bucketOf(time.Millisecond)).Seconds() + 5*bucketUpper(bucketOf(10*time.Millisecond)).Seconds()
-	require.InDelta(t, want, l.WorkSeconds("write", 0, 600), 1e-12)
-	require.GreaterOrEqual(t, l.WorkSeconds("write", 0, 600), 0.06, "upper bounds: never below the latencies")
-	require.LessOrEqual(t, l.WorkSeconds("write", 0, 600), 0.06*bucketGrowth)
-	require.Zero(t, l.WorkSeconds("scan", 0, 600))
+	require.InDelta(t, want, l.WorkSeconds("write", warm), 1e-12)
+	require.GreaterOrEqual(t, l.WorkSeconds("write", warm), 0.06, "upper bounds: never below the latencies")
+	require.LessOrEqual(t, l.WorkSeconds("write", warm), 0.06*bucketGrowth)
+	require.Zero(t, l.WorkSeconds("scan", warm))
 }

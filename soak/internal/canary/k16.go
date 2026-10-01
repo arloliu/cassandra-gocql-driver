@@ -75,11 +75,12 @@ type ClassCounts struct {
 //   - error: when a class of the mix has no warm-up p99
 func Select(p K16Params) (Selection, error) {
 	warm := p.Warmup.Seconds()
+	warmup := probe.Span(0, p.Warmup)
 	sel := Selection{Classes: map[string]ClassDelay{}, RHS: k16CapacityShare * float64(p.Workers)}
 	var delayWork float64
 	for _, s := range p.Mix {
 		class := string(s.Class)
-		p99, _, ok := p.Latency.Quantile(class, 0, warm, 0.99)
+		p99, _, ok := p.Latency.Quantile(class, warmup, 0.99)
 		if !ok {
 			return Selection{}, fmt.Errorf("class %s has no warm-up p99", class)
 		}
@@ -88,7 +89,7 @@ func Select(p K16Params) (Selection, error) {
 		c.D = 2 * c.T
 		sel.Classes[class] = c
 		delayWork += c.Rate * c.D
-		sel.Occupancy += p.Latency.WorkSeconds(class, 0, warm) / warm
+		sel.Occupancy += p.Latency.WorkSeconds(class, warmup) / warm
 	}
 	for n := k16MinN; n <= k16MaxN; n++ {
 		sel.LHS = delayWork/float64(n) + sel.Occupancy
@@ -118,7 +119,7 @@ func FinalCounts(id string, l *probe.Latency, classes []string, cooldown, worklo
 	}
 	counts := map[string]ClassCounts{}
 	for _, class := range classes {
-		total, delayed := l.Counts(class, cooldown.Seconds(), workload.Seconds())
+		total, delayed := l.Counts(class, probe.Span(cooldown, workload))
 		counts[class] = ClassCounts{Total: total, Delayed: delayed}
 	}
 	return Event{Canary: id, Kind: KindFinalCounts, Time: now, Counts: counts}, true

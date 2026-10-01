@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
-# A fake git for the run-night.sh fixtures: FAKE_GIT=stall makes it hang, as a stuck build-fact command would.
+# A fake git for the run-night.sh fixtures. Every call is logged to $FIX/git.log.
+# FAKE_GIT=stall makes it hang, as a stuck build-fact command would; the other FAKE_GIT modes break `archive` or `rev-parse`.
+# FAKE_REPO redirects `-C ..` to that repository, so the default-build fixtures run against a repository they own.
+[[ -n "${FIX:-}" ]] && echo "$*" >>"$FIX/git.log"
 [[ "${FAKE_GIT:-}" == stall ]] && exec sleep 1000
-exec /usr/bin/git "$@"
+args=("$@")
+if [[ -n "${FAKE_REPO:-}" && "${args[0]:-}" == -C && "${args[1]:-}" == .. ]]; then
+  args[1]=$FAKE_REPO
+fi
+case "${FAKE_GIT:-} ${args[2]:-}" in
+"fail-archive archive") exit 128 ;;
+"archive-then-fail archive") /usr/bin/git "${args[@]}" ; exit 1 ;; # a whole archive, then failure: pipefail must see it
+"bad-archive archive") echo "not a tar archive"; exit 0 ;;          # tar must fail
+"stall-archive archive") exec sleep 1000 ;;
+"sha-then-fail rev-parse") /usr/bin/git "${args[@]}" ; exit 1 ;;    # a valid SHA on stdout, then failure
+esac
+# FAKE_GIT_COMMIT_AT=N answers the Nth `rev-parse HEAD`, then commits an edit in FAKE_REPO, so HEAD moves right after
+# the launcher captured it.
+if [[ -n "${FAKE_GIT_COMMIT_AT:-}" && "${args[2]:-}" == rev-parse ]]; then
+  n=$(($(cat "$FIX/git-head-calls" 2>/dev/null || echo 0) + 1))
+  echo "$n" >"$FIX/git-head-calls"
+  if ((n == FAKE_GIT_COMMIT_AT)); then
+    /usr/bin/git "${args[@]}" || exit
+    echo "// moved" >>"$FAKE_REPO/soak/internal/x/x.go"
+    /usr/bin/git -C "$FAKE_REPO" -c user.name=f -c user.email=f@f commit -qam moved
+    exit 0
+  fi
+fi
+exec /usr/bin/git "${args[@]}"

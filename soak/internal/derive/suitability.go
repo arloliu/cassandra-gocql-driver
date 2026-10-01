@@ -75,7 +75,7 @@ type Options struct {
 	Accept []Accept
 	// AcceptZero admits degenerate thresholds, by name (§41.3).
 	AcceptZero map[string]string
-	// AcceptProvenance admits a build whose driver_dirty is not the string "false" (§41.5 item 5).
+	// AcceptProvenance admits a build whose source_clean is not the string "true" (§41.5 item 5, PLAN §51.4).
 	AcceptProvenance string
 	// Raise sets minimums applied after the rule and the floors (PLAN v7.14 §48.5).
 	Raise []Raise
@@ -222,6 +222,12 @@ func cellChecks(id string, cal cellrun.Calibration, accepts []Accept) []string {
 	if len(c.Churns) != c.Report.ChurnExecuted {
 		add("%d churn residues for %d executed churns", len(c.Churns), c.Report.ChurnExecuted)
 	}
+	// A late observation is missing from samples.jsonl, so the cell's persisted latency is incomplete; no flag accepts it (PLAN §51.2).
+	for _, class := range slices.Sorted(maps.Keys(cal.Late)) {
+		if n := cal.Late[class]; n > 0 {
+			add("%d late latency observations of class %s: samples.jsonl does not hold them", n, class)
+		}
+	}
 	classes := slices.Sorted(slices.Values(c.Classes))
 	if !slices.Equal(classes, slices.Sorted(maps.Keys(c.WarmupP99))) || !slices.Equal(classes, slices.Sorted(maps.Keys(c.CooldownP99))) {
 		add("the mix's classes %v differ from the latency event's", classes)
@@ -236,7 +242,7 @@ func provenance(cells []Cell, o Options) []string {
 	dirty := false
 	for _, c := range cells {
 		shas[c.Cal.Build.DriverSHA], digests[c.Cal.Build.SoakSHA256] = true, true
-		if s, ok := c.Cal.Build.DriverDirty.(string); !ok || s != "false" {
+		if s, ok := c.Cal.Build.SourceClean.(string); !ok || s != "true" {
 			dirty = true
 		}
 	}
@@ -262,7 +268,7 @@ func provenance(cells []Cell, o Options) []string {
 		}
 	}
 	if dirty && strings.TrimSpace(o.AcceptProvenance) == "" {
-		p = append(p, `a cell's driver_dirty is not the string "false", and -accept-provenance was not given`)
+		p = append(p, `a cell's source_clean is not the string "true", and -accept-provenance was not given`)
 	}
 	return p
 }

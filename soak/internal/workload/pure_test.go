@@ -455,12 +455,12 @@ func TestSpecAttemptsWithoutSpeculation(t *testing.T) {
 func TestDropReturnsBeforeTheDriverCall(t *testing.T) {
 	epoch := time.Now().Add(-time.Second)
 	var errs []ErrorRecord
-	e := &Env{OpIDs: &atomic.Uint64{}, Progress: NewProgress(epoch), Latency: probe.NewLatency(epoch),
+	e := &Env{OpIDs: &atomic.Uint64{}, Progress: NewProgress(epoch), Latency: probe.NewAggregateLatency(epoch, probe.AllTime),
 		Errors: func(r ErrorRecord) { errs = append(errs, r) }, Drop: func(c Class) bool { return c == ClassLWT }}
 	rng := rand.New(rand.NewPCG(1, 2))
 	e.Do(t.Context(), 0, rng, Offer{Class: ClassLWT})
 	require.Zero(t, e.OpIDs.Load(), "no op id")
-	total, _ := e.Latency.Counts(string(ClassLWT), 0, 3600)
+	total, _ := e.Latency.Counts(string(ClassLWT), probe.AllTime)
 	require.Zero(t, total, "no latency observation")
 	_, completed := e.Progress.PerSecond()
 	require.Empty(t, completed[string(ClassLWT)], "no completion")
@@ -469,7 +469,7 @@ func TestDropReturnsBeforeTheDriverCall(t *testing.T) {
 	// An unknown class is kept, runs and records its error: the hook's false changes nothing.
 	e.Do(t.Context(), 0, rng, Offer{Class: "bogus"})
 	require.Equal(t, uint64(1), e.OpIDs.Load())
-	total, _ = e.Latency.Counts("bogus", 0, 3600)
+	total, _ = e.Latency.Counts("bogus", probe.AllTime)
 	require.Equal(t, int64(1), total)
 	_, completed = e.Progress.PerSecond()
 	require.NotEmpty(t, completed["bogus"])

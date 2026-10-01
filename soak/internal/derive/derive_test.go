@@ -1,6 +1,7 @@
 package derive
 
 import (
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -200,7 +201,7 @@ func syntheticCell(t *testing.T, id string) Cell {
 	for i := range 7 {
 		col.Churns = append(col.Churns, gate.ChurnResidue{Index: i, Measured: true, Before: map[string]int{"a": 5}, After: map[string]int{"a": 5 + i%2}})
 	}
-	lat := probe.NewLatencySlice(time.Unix(0, 0), 5*time.Second)
+	lat := probe.NewLiveLatency(time.Unix(0, 0), 5*time.Second)
 	for s := 0; s < 7200; s += 5 {
 		d := 2 * time.Millisecond
 		switch {
@@ -211,8 +212,9 @@ func syntheticCell(t *testing.T, id string) Cell {
 		}
 		lat.Observe("read", time.Unix(int64(s), 0), d, false)
 	}
-	warm, _, _ := lat.Quantile("read", 0, 900, 0.99)
-	cool, _, _ := lat.Quantile("read", 6300, 7200, 0.99)
+	lat = rebuilt(lat)
+	warm, _, _ := lat.Quantile("read", probe.Window{From: 0, To: 900}, 0.99)
+	cool, _, _ := lat.Quantile("read", probe.Window{From: 6300, To: 7200}, 0.99)
 	col.WarmupP99, col.CooldownP99 = map[string]float64{"read": warm.Seconds()}, map[string]float64{"read": cool.Seconds()}
 	return Cell{ID: id, Cal: cellrun.Calibration{Collected: col, Latency: lat}}
 }
@@ -298,7 +300,7 @@ func night(t *testing.T) (Summary, []Cell) {
 		c := cal
 		c.Verdict.Cell, c.Build.Cell = id, id
 		c.Build.Attempt = "a" + id
-		c.Build.DriverDirty = "false"
+		c.Build.SourceClean = "true"
 		c.Verdict.Gates = slices.Clone(cal.Verdict.Gates)
 		cells = append(cells, Cell{ID: id, Cal: c})
 		s.Cells = append(s.Cells, SummaryCell{Cell: id, Completion: "done", Report: &CleanupReport{Unresolved: &[]any{}}, Problems: &[]string{}, Receipt: Receipt{
@@ -355,8 +357,14 @@ func TestSuitabilityRefusals(t *testing.T) {
 		{"source changed", func(_ *Summary, _ []Cell, o *Options) {
 			o.SourceUnchanged = func(string) (bool, error) { return false, nil }
 		}, "changed between"},
-		{"dirty", func(_ *Summary, cells []Cell, _ *Options) { cells[0].Cal.Build.DriverDirty = "true" }, "-accept-provenance"},
-		{"dirty as a boolean", func(_ *Summary, cells []Cell, _ *Options) { cells[0].Cal.Build.DriverDirty = false }, "-accept-provenance"},
+		{"source not clean", func(_ *Summary, cells []Cell, _ *Options) { cells[0].Cal.Build.SourceClean = "false" }, "-accept-provenance"},
+		{"source unknown", func(_ *Summary, cells []Cell, _ *Options) { cells[0].Cal.Build.SourceClean = "unknown" }, "-accept-provenance"},
+		{"source unverified", func(_ *Summary, cells []Cell, _ *Options) { cells[0].Cal.Build.SourceClean = "unverified" }, "-accept-provenance"},
+		{"source clean as a boolean", func(_ *Summary, cells []Cell, _ *Options) { cells[0].Cal.Build.SourceClean = true }, "-accept-provenance"},
+		{"late observations", func(_ *Summary, cells []Cell, _ *Options) {
+			cells[1].Cal.Late = maps.Clone(cells[1].Cal.Late)
+			cells[1].Cal.Late["read"] = 3
+		}, "3 late latency observations of class read"},
 		{"not final", func(_ *Summary, cells []Cell, _ *Options) { cells[1].Cal.Verdict.Final = false }, "not final"},
 		{"incomplete", func(_ *Summary, cells []Cell, _ *Options) { cells[1].Cal.Verdict.Evidence.Complete = false }, "incomplete"},
 		{"short", func(_ *Summary, cells []Cell, _ *Options) { cells[1].Cal.Verdict.WorkloadSeconds = 7000 }, "less than 7200"},
@@ -374,7 +382,7 @@ func TestSuitabilityRefusals(t *testing.T) {
 			cells[0].Cal.Collected.Classes = cells[0].Cal.Collected.Classes[1:]
 		}, "classes"},
 		{"bad accept", func(_ *Summary, _ []Cell, o *Options) { o.Accept = []Accept{{Cell: "c99", Gate: "G8", Reason: "r"}} }, "names no cell"},
-		{"no driver_dirty", func(_ *Summary, cells []Cell, _ *Options) { cells[2].Cal.Build.DriverDirty = nil }, "-accept-provenance"},
+		{"no source_clean", func(_ *Summary, cells []Cell, _ *Options) { cells[2].Cal.Build.SourceClean = nil }, "-accept-provenance"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -391,16 +399,30 @@ func TestSuitabilityAcceptances(t *testing.T) {
 	s, cells := night(t)
 	i := slices.IndexFunc(cells[0].Cal.Verdict.Gates, func(r gate.Result) bool { return r.Gate == "G8" })
 	cells[0].Cal.Verdict.Gates[i].Status = gate.StatusFail
-	cells[1].Cal.Build.DriverDirty = "true"
+	cells[1].Cal.Build.SourceClean = "unverified"
 	o := Options{SourceUnchanged: unchanged}
 	require.Len(t, Suitability(s, cells, o), 2)
 	o.Accept = []Accept{{Cell: "c41p4", Gate: "G8", Reason: "admitted by v7.11"}}
 	o.AcceptProvenance = "no uncommitted driver change"
 	require.Empty(t, Suitability(s, cells, o))
 
-	// An absent driver_dirty goes through the same acceptance (Codex AO05).
-	cells[2].Cal.Build.DriverDirty = nil
+	// An absent source_clean goes through the same acceptance (Codex AO05); driver_dirty is no longer judged (PLAN §51.4).
+	cells[2].Cal.Build.SourceClean = nil
+	cells[3].Cal.Build.DriverDirty = "true"
 	require.Empty(t, Suitability(s, cells, o))
+}
+
+// A late latency observation refuses an otherwise suitable cell, and no acceptance admits it (PLAN §51.2).
+func TestSuitabilityRefusesLateObservations(t *testing.T) {
+	s, cells := night(t)
+	o := Options{SourceUnchanged: unchanged, AcceptProvenance: "r", Accept: []Accept{{Cell: "c41p4", Gate: "G8", Reason: "r"}},
+		AcceptZero: map[string]string{gate.KL: "r", gate.KE: "r"}}
+	require.Empty(t, Suitability(s, cells, o), "the fixture night is suitable")
+	cells[2].Cal.Late = maps.Clone(cells[2].Cal.Late) // night shares one loaded map
+	cells[2].Cal.Late["lwt"] = 1
+	problems := Suitability(s, cells, o)
+	require.Len(t, problems, 1)
+	require.Contains(t, problems[0], "c50p4: 1 late latency observations of class lwt")
 }
 
 func TestSelfCheck(t *testing.T) {
@@ -435,17 +457,18 @@ func TestSelfCheck(t *testing.T) {
 // withLatency replaces a cell's latency with 2 ms everywhere over the ranges kL reads,
 // and its recorded p99 with the rebuilt ones, so the fixture can be derived end to end.
 func withLatency(c Cell) Cell {
-	lat := probe.NewLatencySlice(time.Unix(0, 0), 5*time.Second)
+	lat := probe.NewLiveLatency(time.Unix(0, 0), 5*time.Second)
 	for _, class := range c.Cal.Collected.Classes {
 		for s := 0; s < 7200; s += 5 {
 			lat.Observe(class, time.Unix(int64(s), 0), 2*time.Millisecond, false)
 		}
 	}
+	lat = rebuilt(lat)
 	c.Cal.Latency = lat
 	c.Cal.Collected.WarmupP99, c.Cal.Collected.CooldownP99 = map[string]float64{}, map[string]float64{}
 	for _, class := range c.Cal.Collected.Classes {
-		w, _, _ := lat.Quantile(class, 0, 900, 0.99)
-		k, _, _ := lat.Quantile(class, 6300, 7200, 0.99)
+		w, _, _ := lat.Quantile(class, probe.Window{From: 0, To: 900}, 0.99)
+		k, _, _ := lat.Quantile(class, probe.Window{From: 6300, To: 7200}, 0.99)
 		c.Cal.Collected.WarmupP99[class], c.Cal.Collected.CooldownP99[class] = w.Seconds(), k.Seconds()
 	}
 	return c
@@ -576,4 +599,19 @@ func TestEvaluateOnTheFixture(t *testing.T) {
 		}
 		require.False(t, math.IsNaN(d.Value), d.Name)
 	}
+}
+
+// rebuilt seals a live record and rebuilds it the way the derivation's loader does, so any window can be queried.
+func rebuilt(live *probe.Latency) *probe.Latency {
+	byClass := map[string][]probe.SliceHistogram{}
+	for _, s := range live.Seal(math.MaxInt) {
+		for class, h := range s.Classes {
+			byClass[class] = append(byClass[class], h)
+		}
+	}
+	l, err := probe.RebuildLatency(5, byClass)
+	if err != nil {
+		panic(err)
+	}
+	return l
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,6 +43,8 @@ type Calibration struct {
 	Build BuildFacts
 	// NumConns and NodeCount come from config.json.
 	NumConns, NodeCount int
+	// Late is the latency event's late-observation count per class (PLAN §51.2); nil when the event has none.
+	Late map[string]int64
 	// HasBaseline is true when the g12 event carried baseline₀, the only place it is persisted.
 	HasBaseline bool
 	// Missing lists every record that is not exactly what the harness writes, every absent required event,
@@ -73,8 +76,10 @@ type BuildFacts struct {
 	Kind       string `json:"kind"`
 	SoakSHA256 string `json:"soak_sha256"`
 	DriverSHA  string `json:"driver_sha"`
-	// DriverDirty is kept raw: run-night.sh writes a string, and PLAN §41.5 accepts only the exact string "false".
+	// DriverDirty is kept raw: run-night.sh writes a string. It is recorded, no longer judged (PLAN §51.4).
 	DriverDirty any `json:"driver_dirty"`
+	// SourceClean is kept raw: run-night.sh writes a string, and PLAN §41.5 item 5 (§51.4) accepts only the exact string "true".
+	SourceClean any `json:"source_clean"`
 }
 
 // The writer types of the records the derivation reads that the harness writes as maps (sampler.go, run.go, churn.go).
@@ -112,6 +117,7 @@ type (
 	latencyEvent struct {
 		Warmup   map[string]float64 `json:"warmup_p99_s"`
 		Cooldown map[string]float64 `json:"cooldown_p99_s"`
+		Late     map[string]int64   `json:"late"`
 	}
 )
 
@@ -364,9 +370,29 @@ func (cal *Calibration) event(e envelope, what string, check func(string, []byte
 			if d.Warmup == nil || d.Cooldown == nil {
 				cal.Missing = append(cal.Missing, what+": a null p99 map")
 			}
+			cal.Late = d.Late
+			cal.Missing = append(cal.Missing, lateMissing(what, d.Late, c.Classes)...)
 		}
 	}
 	return nil
+}
+
+// lateMissing checks the latency event's late-observation counts (PLAN §51.2): present, keyed by exactly the mix's classes,
+// and non-negative; a fractional or non-numeric count already failed the strict decode.
+func lateMissing(what string, late map[string]int64, classes []string) []string {
+	if late == nil {
+		return []string{what + ": the late-observation count is absent (the artifact predates v7.15)"}
+	}
+	var missing []string
+	if want := slices.Sorted(slices.Values(classes)); !slices.Equal(want, slices.Sorted(maps.Keys(late))) {
+		missing = append(missing, fmt.Sprintf("%s: the late-observation classes %v are not the mix's %v", what, slices.Sorted(maps.Keys(late)), want))
+	}
+	for _, class := range slices.Sorted(maps.Keys(late)) {
+		if late[class] < 0 {
+			missing = append(missing, fmt.Sprintf("%s: class %s has a negative late-observation count %d", what, class, late[class]))
+		}
+	}
+	return missing
 }
 
 // profileInventory checks what the sampler guarantees of a completed cell's profiles (Codex AO02, AP03):

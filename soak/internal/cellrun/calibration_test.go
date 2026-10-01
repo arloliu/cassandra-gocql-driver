@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/probe"
 )
 
 // calibrationFixture is a trimmed night-A cell (c50p5): every profile, the events the loader reads,
@@ -67,9 +68,10 @@ func TestLoadCalibrationFixture(t *testing.T) {
 
 	require.Len(t, c.TP, 97)
 	require.Empty(t, cal.Missing)
+	require.Len(t, cal.Late, 10, "the synthetic all-zero late map (night A predates the field)")
 	require.InDelta(t, 0.001746886, c.WarmupP99["batch-logged"], 0, "the recorded latency event")
 
-	d, n, ok, ambiguous := cal.Latency.QuantileChecked("read", 0, 15, 1)
+	d, n, ok, ambiguous := cal.Latency.QuantileChecked("read", probe.Window{From: 0, To: 15}, 1)
 	require.True(t, ok)
 	require.False(t, ambiguous)
 	require.Equal(t, int64(6271), n, "slices 0–2 of read")
@@ -129,6 +131,27 @@ func TestLoadCalibrationRefusesMissingPieces(t *testing.T) {
 		t.Run("no "+tc.want+" field", func(t *testing.T) {
 			dir := copyFixture(t)
 			replaceIn(t, filepath.Join(dir, "events.jsonl"), tc.from, tc.to)
+			cal, err := LoadCalibration(dir)
+			require.NoError(t, err)
+			require.True(t, slices.ContainsFunc(cal.Missing, func(m string) bool { return strings.Contains(m, tc.want) }), "%v", cal.Missing)
+		})
+	}
+	// The latency event's late-observation counts: present, keyed by exactly the mix, non-negative integers (PLAN §51.2).
+	// The fixture's all-zero map is synthetic: night A predates the field.
+	allZero := `"late":{"batch-logged":0,"batch-unlogged":0,"churn":0,"large-read":0,"lwt":0,"read":0,"scan":0,"short-deadline":0,"spec-read":0,"write":0}`
+	for _, tc := range []struct{ name, to, want string }{
+		{"absent", `"latex":{}`, "the late-observation count is absent"},
+		{"null", `"late":null`, "the late-observation count is absent"},
+		{"empty", `"late":{}`, "are not the mix's"},
+		{"a class missing", strings.Replace(allZero, `"batch-logged":0,`, "", 1), "are not the mix's"},
+		{"an extra class", strings.Replace(allZero, `"write":0`, `"write":0,"bogus":0`, 1), "are not the mix's"},
+		{"negative", strings.Replace(allZero, `"lwt":0`, `"lwt":-1`, 1), "negative late-observation count -1"},
+		{"fractional", strings.Replace(allZero, `"lwt":0`, `"lwt":0.5`, 1), "latency"},
+		{"a string", strings.Replace(allZero, `"lwt":0`, `"lwt":"0"`, 1), "latency"},
+	} {
+		t.Run("late "+tc.name, func(t *testing.T) {
+			dir := copyFixture(t)
+			replaceIn(t, filepath.Join(dir, "events.jsonl"), allZero, tc.to)
 			cal, err := LoadCalibration(dir)
 			require.NoError(t, err)
 			require.True(t, slices.ContainsFunc(cal.Missing, func(m string) bool { return strings.Contains(m, tc.want) }), "%v", cal.Missing)

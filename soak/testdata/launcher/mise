@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# A fake mise for the run-night.sh default-build fixtures (PLAN §51.4): `mise exec -- [env K=V…] go [-C dir] version|build …`.
+# `go build` records what it would compile (the files under -C, and x.go's content) in $FIX/built.txt, runs FAKE_BUILD_HOOK,
+# then writes a wrapper around fake-soak.sh at its -o path. Every call is logged to $FIX/mise.log.
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+echo "$*" >>"$FIX/mise.log"
+[[ "${1:-}" == exec && "${2:-}" == -- ]] && shift 2
+[[ "${1:-}" == env ]] && shift
+while [[ "${1:-}" == *=* ]]; do shift; done
+[[ "${1:-}" == go ]] || exit 2
+shift
+if [[ "${1:-}" == -C ]]; then
+  cd "$2" || exit 1
+  shift 2
+fi
+case "${1:-}" in
+version) echo "go version go1.27.1 linux/amd64" ;;
+build)
+  out=""
+  while (($#)); do
+    [[ "$1" == -o ]] && out=$2
+    shift
+  done
+  { (cd .. && find . -type f | LC_ALL=C sort); echo "x.go: $(cat internal/x/x.go 2>/dev/null)"; } >"$FIX/built.txt"
+  [[ -n "${FAKE_BUILD_HOOK:-}" ]] && bash -c "$FAKE_BUILD_HOOK"
+  printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$HERE/fake-soak.sh" >"$out" && chmod +x "$out"
+  ;;
+*) exit 2 ;;
+esac

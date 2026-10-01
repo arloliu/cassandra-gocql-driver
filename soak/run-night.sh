@@ -44,6 +44,7 @@ KILL_AFTER_S=30                        # SIGQUIT to SIGKILL (PLAN §8.1)
 STOP_GRACE_S=${SOAK_STOP_GRACE_S:-600} # a forwarded INT/TERM gives the harness this long to tear itself down
 BUILD_STOP_S=60                        # a stop during the build waits this long before SIGKILL
 META_BOUND_S=20                        # each build-fact command; KILL 5 s later
+EXPORT_BOUND_S=30                      # exporting the source tree for the default build; KILL 5 s later
 POST_KILL_S=60                         # after SIGKILL, stop waiting for the supervisor and record it
 QUIESCE_S=15                           # after the supervisor exits, the harness group gets this long to vanish
 CLEANUP_BUDGET_S=540                   # every cleanup stage together, the report included
@@ -99,15 +100,30 @@ receipt_write() { # state [launcher-exit reason]
   RECEIPT_STATE=$1
 }
 
+# drop_build removes what the default build made (PLAN §51.4 r6): its exported source tree, and with an argument also
+# its binary. It fails, with DROP_LEFT naming what remains, when anything is left (Codex BJ03).
+SRC="" BUILT_BIN="" DROP_LEFT=""
+drop_build() { # [all]
+  local p remain=()
+  for p in "$SRC" ${1:+"$BUILT_BIN"}; do
+    [[ -n "$p" ]] || continue
+    timeout -k 2 30 rm -rf -- "$p" 2>/dev/null
+    [[ -e "$p" || -L "$p" ]] && remain+=("$p")
+  done
+  DROP_LEFT="${remain[*]}"
+  ((${#remain[@]} == 0))
+}
+
 # die ends the launcher before its harness started: `refused` before the attempt, `done` after it.
-# Any receipt write that has failed makes this exit, and every later one, 3.
+# Any receipt write that has failed makes this exit, and every later one, 3; so does a build artifact left behind.
 die() {
-  local code=${2:-2}
-  echo "run-night.sh: $1" >&2
+  local code=${2:-2} msg=$1
+  drop_build all || { code=3 && msg="$msg; not removed: $DROP_LEFT"; }
+  echo "run-night.sh: $msg" >&2
   ((RECEIPT_FAILED)) && code=3
   case "$RECEIPT_STATE" in
-  "") receipt_write refused "$code" "$1" || code=3 ;;
-  started) receipt_write "done" "$code" "$1" || code=3 ;;
+  "") receipt_write refused "$code" "$msg" || code=3 ;;
+  started) receipt_write "done" "$code" "$msg" || code=3 ;;
   esac
   exit "$code"
 }
@@ -463,22 +479,48 @@ meta() {
 }
 stop_before_run() {
   [[ -n "$STOPPING" ]] || return 0
-  log "stopped before the harness started: $1"
-  local code
+  local code msg="stopped before the harness started: $1"
   code=$(signal_status)
+  drop_build all || { code=3 && msg="$msg; not removed: $DROP_LEFT"; }
+  log "$msg"
   ((RECEIPT_FAILED)) && code=3
-  receipt_write "done" "$code" "stopped before the harness started: $1" || code=3
+  receipt_write "done" "$code" "$msg" || code=3
   exit "$code"
 }
 
 # --- build -------------------------------------------------------------------------------------------
-SOAK=${SOAK_BIN:-./bin/soak}
+# The default build compiles HEAD's committed tree, exported by `git archive` (PLAN §51.4 r6): the binary's source is
+# driver_sha's tree by construction, whatever the working tree holds, and source_clean is "true".
+# With SOAK_BIN or SOAK_BUILD_CMD the binary's source is not established, and source_clean is "unverified".
+# The default build writes this attempt's own binary, so concurrent launchers never run each other's (Codex BJ02);
+# SOAK_BUILD_OUT moves it, for the fixtures, and is not an override. SOAK_BUILD_CMD still writes bin/soak.
+# The go command runs with its user environment file off and GOFLAGS, GOWORK and GOTOOLCHAIN pinned, since an empty GOFLAGS
+# would fall back to the file (Codex BJ01, BJ04); the toolchain and the module cache stay trusted (PLAN §51.6).
+GO_ENV=(env GOENV=off GOTOOLCHAIN=local GOWORK=off GOFLAGS=-mod=readonly)
 BUILD_CMD=()
+SOURCE_CLEAN=unverified SOURCE_HEAD=""
 if [[ -n "${SOAK_BUILD_CMD:-}" ]]; then
+  BUILD_OUT=${SOAK_BUILD_OUT:-$PWD/bin/soak}
   read -r -a BUILD_CMD <<<"$SOAK_BUILD_CMD"
 elif [[ -z "${SOAK_BIN:-}" ]]; then
-  BUILD_CMD=(mise exec -- go build -buildvcs=false -o bin/soak ./cmd/soak)
+  BUILD_OUT=${SOAK_BUILD_OUT:-$PWD/$STAGE.soak}
+  BUILT_BIN=$BUILD_OUT
+  SOURCE_HEAD=$(meta git -C .. rev-parse HEAD) || SOURCE_HEAD=""
+  stop_before_run "while exporting the source"
+  [[ "$SOURCE_HEAD" =~ ^[0-9a-f]{40}$ ]] || die "cannot read HEAD"
+  SRC="$STAGE.src"
+  rm -rf -- "$SRC" && mkdir -p -- "$SRC" || die "cannot create $SRC"
+  if ! timeout -k 5 "$EXPORT_BOUND_S" git -C .. archive --format=tar "$SOURCE_HEAD" | timeout -k 5 "$EXPORT_BOUND_S" tar -x -C "$SRC"; then
+    stop_before_run "while exporting the source" # a stop first: the export may have been cut short by it
+    die "cannot export $SOURCE_HEAD"
+  fi
+  stop_before_run "while exporting the source"
+  # The build mode is fixed: no workspace, no GOFLAGS, -mod=readonly, no vendor directory; -trimpath keeps the build cache
+  # independent of the export's path.
+  [[ -e "$SRC/vendor" || -e "$SRC/soak/vendor" ]] && die "$SOURCE_HEAD has a vendor directory; the default build does not use one"
+  BUILD_CMD=(mise exec -- "${GO_ENV[@]}" go -C "$SRC/soak" build -mod=readonly -trimpath -buildvcs=false -o "$BUILD_OUT" ./cmd/soak)
 fi
+SOAK=${SOAK_BIN:-$BUILD_OUT}
 if ((${#BUILD_CMD[@]})); then
   log "building: ${BUILD_CMD[*]}"
   CHILD_KIND=build
@@ -489,9 +531,23 @@ if ((${#BUILD_CMD[@]})); then
   stop_before_run "during the build"
   ((CHILD_STATUS == 0)) || die "build failed (status $CHILD_STATUS)"
 fi
-GO_VERSION=$(meta mise exec -- go version)
+if [[ -n "$SOURCE_HEAD" ]]; then
+  SOURCE_CLEAN=true
+  drop_build || die "cannot remove the exported source"
+  SRC=""
+  log "built $SOURCE_HEAD's committed tree"
+  # The version of the compiler that built this binary, in the build's own environment (Codex BJ04).
+  GO_VERSION=$(meta mise exec -- "${GO_ENV[@]}" go version "$BUILD_OUT")
+else
+  GO_VERSION=$(meta mise exec -- go version)
+fi
 stop_before_run "while recording build facts"
-DRIVER_SHA=$(meta git -C .. rev-parse HEAD)
+# The commit the default build exported and compiled (PLAN §51.4).
+if [[ -n "$SOURCE_HEAD" ]]; then
+  DRIVER_SHA=$SOURCE_HEAD
+else
+  DRIVER_SHA=$(meta git -C .. rev-parse HEAD)
+fi
 stop_before_run "while recording build facts"
 DRIVER_DIRTY=false
 porcelain=$(meta git -C .. status --porcelain) || DRIVER_DIRTY=unknown
@@ -507,10 +563,10 @@ BUILD_OK=0
 if buildJSON=$(bj -n --arg t "$(date -u +%FT%TZ)" --arg go "$GO_VERSION" --arg sha "$DRIVER_SHA" \
   --arg dirty "$DRIVER_DIRTY" --arg ccm "$CCM_VERSION" --arg bin "$SOAK" --arg cell "$CELL" --arg mode "$MODE" \
   --arg kind "$KIND" --arg attempt "$ATTEMPT" --argjson keep "$KEEP" --argjson deadline "$DEADLINE_S" \
-  --arg ccmdir "$CCM_CONFIG" --arg digest "$DIGEST" \
+  --arg ccmdir "$CCM_CONFIG" --arg digest "$DIGEST" --arg srcclean "$SOURCE_CLEAN" \
   '{built_at: $t, go_version: $go, driver_sha: $sha, driver_dirty: $dirty, ccm_version: $ccm, soak_bin: $bin,
     soak_sha256: $digest, cell: $cell, mode: $mode, kind: $kind, attempt: $attempt, keep_failed: $keep,
-    deadline_s: $deadline, ccm_config_dir: $ccmdir}' 2>/dev/null) && bwrite "$STAGE.build.json" <<<"$buildJSON" && [[ -s "$STAGE.build.json" ]]; then
+    deadline_s: $deadline, ccm_config_dir: $ccmdir, source_clean: $srcclean}' 2>/dev/null) && bwrite "$STAGE.build.json" <<<"$buildJSON" && [[ -s "$STAGE.build.json" ]]; then
   BUILD_OK=1
 else
   log "could not write $STAGE.build.json"
@@ -931,6 +987,11 @@ fi
 # 10. The launcher's evidence joins the harness's (§8.2) only in a directory that is this launch's and quiescent;
 # otherwise it stays staged.
 # The report is written last, after the moves, and its absence is itself unresolved.
+# The default build's binary served this attempt only (PLAN §51.4 r6); its removal shares the cleanup deadline (Codex BK01).
+if [[ -n "$BUILT_BIN" ]]; then
+  run_bounded "$MOVE_BOUND_S" rm -f -- "$BUILT_BIN"
+  [[ -e "$BUILT_BIN" || -L "$BUILT_BIN" ]] && UNRESOLVED+=("build artifacts not removed: $BUILT_BIN")
+fi
 REQUIRED=(stdout.log stderr.log build.json launcher.log)
 if ((OURS)); then
   REPORT="$EXEC_DIR/launcher-cleanup.json"

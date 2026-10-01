@@ -46,7 +46,7 @@ func deriveMain(args []string) int {
 	var accepts, zeros, raises repeated
 	fs.Var(&accepts, "accept", "cell:gate:reason — admit a failing non-calibrated gate (repeatable)")
 	fs.Var(&zeros, "accept-zero", "k:reason — admit a degenerate threshold of 0 (repeatable)")
-	provenance := fs.String("accept-provenance", "", `reason — admit builds whose driver_dirty is not "false"`)
+	provenance := fs.String("accept-provenance", "", `reason — admit builds whose source_clean is not "true"`)
 	fs.Var(&raises, "raise", "k=value:reason — raise a threshold to at least value after the rule and floors (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2

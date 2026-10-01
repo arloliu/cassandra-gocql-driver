@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -153,7 +155,7 @@ func runSmoke(ctx context.Context, cfg smokeConfig) (err error) {
 	env := &workload.Env{
 		Session: primary.Session, SessionID: "primary", Range: workload.PrimaryRange(), Workers: cfg.workers,
 		ChurnSpace: 4000, Ledger: ledger, LWT: &workload.LWTLedger{}, Settlement: settlement, FailedAttempt: primary.Observer.FailedAttempt,
-		Progress: workload.NewProgress(epoch), Latency: probe.NewLatency(epoch), OpIDs: &atomic.Uint64{},
+		Progress: workload.NewProgress(epoch), Latency: newSmokeLatency(epoch), OpIDs: &atomic.Uint64{},
 		Errors: func(r workload.ErrorRecord) {
 			errCount.Add(1)
 			class, _ := gate.ClassifyOp(r.Err, r.Class == workload.ClassLWT, cfg.proto, r.Elapsed)
@@ -227,9 +229,8 @@ loop:
 	offered, completed := env.Progress.Span(0, secs+1)
 	logf("load: %d s, dropped offers %d, errors %d (G8 unexpected %d), attempt errors %d, short-deadline timeouts %d",
 		secs, load.Dropped(), errCount.Load(), unexpected.Load(), primary.Observer.AttemptErrors(), env.ShortDeadlineTimeouts.Load())
-	for class, n := range offered {
-		p99, _, _ := env.Latency.Quantile(class, 0, float64(secs+60), 0.99)
-		logf("  %-15s offered %6.0f completed %6.0f p99 %s", class, n, completed[class], p99)
+	if err := smokeLatencyReport(env.Latency, offered, completed, logf); err != nil {
+		return err
 	}
 	for c, n := range classCounts {
 		if n.Load() > 0 {
@@ -376,4 +377,22 @@ func smokeG11(cfg smokeConfig, logf func(string, ...any), progress *workload.Pro
 		return
 	}
 	logf("progress.json written: %d classes, %d s", len(offered), secs)
+}
+
+// newSmokeLatency returns smoke's latency record: aggregate-only, over the whole load (PLAN §51.3).
+func newSmokeLatency(epoch time.Time) *probe.Latency {
+	return probe.NewAggregateLatency(epoch, probe.AllTime)
+}
+
+// smokeLatencyReport logs each offered class's progress and p99 over the whole load;
+// a query the record cannot answer is an error, so the smoke command fails instead of printing a zero p99.
+func smokeLatencyReport(l *probe.Latency, offered, completed map[string]float64, logf func(string, ...any)) error {
+	for _, class := range slices.Sorted(maps.Keys(offered)) {
+		p99, _, _ := l.Quantile(class, probe.AllTime, 0.99)
+		logf("  %-15s offered %6.0f completed %6.0f p99 %s", class, offered[class], completed[class], p99)
+	}
+	if errs := l.Errors(); len(errs) > 0 {
+		return fmt.Errorf("smoke: latency record: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
