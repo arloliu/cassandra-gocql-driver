@@ -1,6 +1,7 @@
 package derive
 
 import (
+	"cmp"
 	"maps"
 	"math"
 	"slices"
@@ -90,7 +91,7 @@ func TestCombineFloorsAndNegatives(t *testing.T) {
 		gate.KG0: "r", gate.KHr: "r", gate.KF: "r", gate.KS: "r", gate.KC: "r", gate.KD: "r",
 	})
 	require.Empty(t, problems)
-	require.InDelta(t, 1.02*1.02-1, th[gate.KL], 1e-15)
+	require.InDelta(t, 0.48674869540553, th[gate.KL], 0, "PLAN v7.16 §55.2")
 	require.InDelta(t, 3600.0/2100, th[gate.KG], 1e-12)
 	require.InDelta(t, 3600.0/2100, th[gate.KH], 1e-12)
 	require.InDelta(t, 3600.0/2100, th[gate.KSs], 1e-12)
@@ -101,11 +102,15 @@ func TestCombineFloorsAndNegatives(t *testing.T) {
 	require.True(t, derivedOf(t, ds, gate.KS).Degenerate)
 	require.False(t, derivedOf(t, ds, gate.KE).Degenerate)
 
-	// A larger observation lifts kL over its floor.
-	obs = observations(Observation{Full: crit(0.03)}, nil)
+	// A larger observation lifts kL over its floor; one whose double is the floor leaves the floor.
+	obs = observations(Observation{Full: crit(0.3)}, nil)
 	th, ds, _ = Combine(cellIDs, obs, nil)
-	require.InDelta(t, 0.06, th[gate.KL], 1e-15)
+	require.InDelta(t, 0.6, th[gate.KL], 1e-15)
 	require.False(t, derivedOf(t, ds, gate.KL).FloorApplied)
+	obs = observations(Observation{Full: crit(0.243374347702765)}, nil)
+	th, ds, _ = Combine(cellIDs, obs, nil)
+	require.InDelta(t, Floors[gate.KL], th[gate.KL], 1e-15)
+	require.False(t, derivedOf(t, ds, gate.KL).FloorApplied, "equal is not below")
 }
 
 // kFs's floor holds a one-fd step in the quiet series of batch 1's validation timings, and no more (PLAN v7.14 §48.2).
@@ -244,6 +249,14 @@ func TestObserveWindows(t *testing.T) {
 	require.Len(t, obs[gate.KL].Windows, 4)
 	require.InDelta(t, 0.5, slices.Max(obs[gate.KL].Windows), 0.03, "the slow window, 3 ms, against the 10-min warm-up, 2 ms")
 	require.InDelta(t, 0.2, obs[gate.KL].Full.Value, 0.03, "the night's own comparison: 3 ms against 2.5 ms")
+
+	// Each comparison keeps its class and ranges for attribution (PLAN v7.16 §55.2).
+	src := obs[gate.KL].Sources
+	require.Len(t, src, 4)
+	top := slices.MaxFunc(src, func(a, b KLSource) int { return cmp.Compare(a.Value, b.Value) })
+	require.Equal(t, KLSource{Kind: "night", Cell: "c50p5", Class: "read", Warm: &probe.Window{From: 0, To: 600}, Cool: &probe.Window{From: 6600, To: 6900}, Value: top.Value}, top)
+	require.Equal(t, probe.Window{From: 0, To: 900}, *src[3].Warm, "the night's own comparison")
+	require.InDelta(t, obs[gate.KL].Full.Value, src[3].Value, 1e-15)
 }
 
 func TestObserveSkipsSparseWindows(t *testing.T) {
@@ -546,14 +559,21 @@ func TestEvaluateRaise(t *testing.T) {
 	for i := range cells {
 		cells[i] = withLatency(cells[i])
 	}
-	o := Options{SourceUnchanged: unchanged, AcceptZero: map[string]string{gate.KD: "no drops"}, Raise: []Raise{{Name: gate.KL, Value: 0.4, Reason: "§48.1"}}}
+	o := Options{SourceUnchanged: unchanged, AcceptZero: map[string]string{gate.KD: "no drops"}, Raise: []Raise{{Name: gate.KL, Value: 0.6, Reason: "§48.1"}}}
 	th, r := Evaluate("summary.json", s, cells, o)
 	require.False(t, r.Refused, "%v", r.Problems)
-	require.InDelta(t, 0.4, th[gate.KL], 0)
+	require.InDelta(t, 0.6, th[gate.KL], 0)
 	d := derivedOf(t, r.Thresholds, gate.KL)
-	require.InDelta(t, 0.4, d.Value, 0)
-	require.Equal(t, &Raised{From: 1.02*1.02 - 1, Given: 0.4, Reason: "§48.1", Applied: true}, d.Raised)
-	require.Contains(t, r.Markdown(), "raised from")
+	require.InDelta(t, 0.6, d.Value, 0)
+	require.Equal(t, &Raised{From: Floors[gate.KL], Given: 0.6, Reason: "§48.1", Applied: true}, d.Raised)
+
+	// A raise below the floor is a no-op, reported.
+	o.Raise = []Raise{{Name: gate.KL, Value: 0.4, Reason: "§48.1"}}
+	th, r = Evaluate("summary.json", s, cells, o)
+	require.False(t, r.Refused, "%v", r.Problems)
+	require.InDelta(t, Floors[gate.KL], th[gate.KL], 0)
+	require.Equal(t, &Raised{From: Floors[gate.KL], Given: 0.4, Reason: "§48.1", Applied: false}, derivedOf(t, r.Thresholds, gate.KL).Raised)
+	require.Contains(t, r.Markdown(), "raise to 0.4 not applied")
 
 	o.Raise = []Raise{{Name: "kX", Value: 1, Reason: "r"}}
 	th, r = Evaluate("summary.json", s, cells, o)
@@ -577,7 +597,7 @@ func TestEvaluateSucceedsOnTheFixture(t *testing.T) {
 	require.Len(t, th, len(gate.AllThresholds))
 	require.InDelta(t, 16, th[gate.KC], 0)
 	require.InDelta(t, 2*6820, th[gate.KLWTu], 0)
-	require.InDelta(t, 1.02*1.02-1, th[gate.KL], 1e-15, "flat latency: the floor")
+	require.InDelta(t, Floors[gate.KL], th[gate.KL], 0, "flat latency: the floor")
 	for _, k := range gate.AllThresholds {
 		require.False(t, math.IsNaN(th[k]) || math.IsInf(th[k], 0), k)
 	}

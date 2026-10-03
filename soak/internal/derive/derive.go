@@ -4,6 +4,7 @@ package derive
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"sort"
@@ -35,8 +36,9 @@ const (
 
 // Floors are PLAN §41.3's policy floors, applied to the final value; every other threshold's floor is 0.
 // kFs's is one fd across a 600 s quiet span, since G4's slope rests on about three quiet checkpoints (PLAN v7.14 §48.2).
+// kL's is twice batch 1 K8's 0.243374347702765, the largest o_kL of the evidence that predates late (PLAN v7.16 §55.2).
 var Floors = map[string]float64{
-	gate.KL:  1.02*1.02 - 1,
+	gate.KL:  0.48674869540553,
 	gate.KG:  3600 / SlopeWindow,
 	gate.KFs: 6,
 	gate.KSs: 3600 / SlopeWindow,
@@ -68,6 +70,8 @@ type Observation struct {
 	Excluded bool
 	// NonFinite counts the windows whose value was a NaN or an infinity; any refuses the derivation.
 	NonFinite int
+	// Sources are kL's comparisons per class, with their ranges, for attribution (PLAN v7.16 §55.2).
+	Sources []KLSource
 }
 
 // Observe computes a cell's observations for every threshold, and the problems that refuse the derivation.
@@ -206,19 +210,26 @@ func observeLatency(c Cell, out map[string]Observation) []string {
 		out[gate.KL] = o
 		return problems
 	}
-	addComparison := func(v gate.Critical) {
-		switch {
+	addComparison := func(warm, cool map[string]float64, ww, cw probe.Window) {
+		switch v := gate.G14Critical(warm, cool); {
 		case v.NonFinite:
 			o.NonFinite++
 		case v.OK:
 			o.Windows = append(o.Windows, v.Value)
 		}
+		for _, class := range slices.Sorted(maps.Keys(cool)) {
+			if v := gate.G14Critical(map[string]float64{class: warm[class]}, map[string]float64{class: cool[class]}); v.OK && !v.NonFinite {
+				o.Sources = append(o.Sources, KLSource{Kind: "night", Cell: c.ID, Class: class, Warm: &ww, Cool: &cw, Value: v.Value})
+			}
+		}
 	}
-	short := p99(probe.Window{From: 0, To: LatencyWarmup})
+	shortWindow := probe.Window{From: 0, To: LatencyWarmup}
+	short := p99(shortWindow)
 	for from := int(tl.Cooldown / time.Second); from+LatencyCooldown <= end; from += LatencyCooldown {
-		addComparison(gate.G14Critical(short, p99(probe.Window{From: from, To: from + LatencyCooldown})))
+		cw := probe.Window{From: from, To: from + LatencyCooldown}
+		addComparison(short, p99(cw), shortWindow, cw)
 	}
-	addComparison(gate.G14Critical(nightWarm, nightCool))
+	addComparison(nightWarm, nightCool, probe.Span(0, tl.Warmup), probe.Span(tl.Cooldown, tl.Workload))
 	out[gate.KL] = o
 	return problems
 }
@@ -249,6 +260,10 @@ type Derived struct {
 	AcceptedZero string `json:"accepted_zero,omitempty"`
 	// Raised records a -raise of this threshold (PLAN v7.14 §48.5); nil when none was given.
 	Raised *Raised `json:"raised,omitempty"`
+	// ValidationObserved is the largest validation o_kL, kL only; nil when no attempt contributed (PLAN v7.16 §55.2).
+	ValidationObserved *float64 `json:"validation_observed,omitempty"`
+	// Sources name what set kL's value before any raise, in §55.2's order; ties list every source.
+	Sources []KLSource `json:"sources,omitempty"`
 }
 
 // Raise is the maintainer's minimum for one threshold, applied after the rule and the floors.

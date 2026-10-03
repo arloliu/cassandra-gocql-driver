@@ -36,6 +36,54 @@ var sourceUnchanged = func(repo, sha string) (bool, error) {
 	}
 }
 
+// pathsChanged lists the paths under soak/ that differ between two driver commits (PLAN v7.16 §55.3 item 4).
+// --no-renames lists both sides of a rename, so a file moved into a derivation-only path still names its origin.
+// It is a variable so the command's tests can run without the repository's history.
+var pathsChanged = func(repo, from, to string) ([]string, error) {
+	out, err := exec.Command("git", "-C", repo, "diff", "--no-renames", "--name-only", "-z", from, to, "--", "soak/").Output()
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}
+
+// parseExclude parses -exclude-attempt's <batch dir>/<slot>-<n>:<reason>.
+func parseExclude(v string) (derive.ExcludeAttempt, bool) {
+	target, reason, ok := strings.Cut(v, ":")
+	if !ok || strings.TrimSpace(reason) == "" {
+		return derive.ExcludeAttempt{}, false
+	}
+	base := filepath.Base(target)
+	i := strings.LastIndex(base, "-")
+	if i <= 0 {
+		return derive.ExcludeAttempt{}, false
+	}
+	n, err := strconv.Atoi(base[i+1:])
+	if err != nil || n < 1 {
+		return derive.ExcludeAttempt{}, false
+	}
+	return derive.ExcludeAttempt{Batch: filepath.Clean(filepath.Dir(target)), Slot: base[:i], N: n, Reason: strings.TrimSpace(reason)}, true
+}
+
+// reasons parses repeated <key>:<reason> values into a map; ok is false on a malformed or repeated key.
+func reasons(values []string) (map[string]string, bool) {
+	m := map[string]string{}
+	for _, v := range values {
+		k, reason, ok := strings.Cut(v, ":")
+		if _, dup := m[k]; !ok || k == "" || strings.TrimSpace(reason) == "" || dup {
+			return nil, false
+		}
+		m[k] = strings.TrimSpace(reason)
+	}
+	return m, true
+}
+
 // deriveMain derives gates.json from a calibration night's summary (PLAN §41).
 // Exit status: 0 written, 1 refused, 2 bad usage or an unreadable summary.
 func deriveMain(args []string) int {
@@ -43,16 +91,21 @@ func deriveMain(args []string) int {
 	summary := fs.String("summary", "", "the calibration night's summary, night-<start>-<token>.json")
 	out := fs.String("out", "gates.json", "the gates.json to write; derivation.json and derivation.md go beside it")
 	repo := fs.String("repo", "..", "the driver repository, for the source check")
-	var accepts, zeros, raises repeated
+	var accepts, zeros, raises, batches, excludes, acceptBatches, acceptCompats repeated
 	fs.Var(&accepts, "accept", "cell:gate:reason — admit a failing non-calibrated gate (repeatable)")
 	fs.Var(&zeros, "accept-zero", "k:reason — admit a degenerate threshold of 0 (repeatable)")
 	provenance := fs.String("accept-provenance", "", `reason — admit builds whose source_clean is not "true"`)
 	fs.Var(&raises, "raise", "k=value:reason — raise a threshold to at least value after the rule and floors (repeatable)")
+	fs.Var(&batches, "validation", "batch dir — a validation batch whose attempts add to kL's evidence (repeatable, PLAN v7.16 §55.3)")
+	fs.Var(&excludes, "exclude-attempt", "batch dir/slot-n:reason — exclude one attempt for recorded host contention (repeatable)")
+	fs.Var(&acceptBatches, "accept-batch", "batch dir:reason — admit a terminal batch (repeatable)")
+	fs.Var(&acceptCompats, "accept-compat", "path:reason — admit a changed soak/ path that is not derivation-only (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *summary == "" || fs.NArg() > 0 {
-		fmt.Fprintln(os.Stderr, "usage: soak derive -summary <night json> [-out gates.json] [-accept cell:gate:reason]… [-accept-zero k:reason]… [-accept-provenance reason] [-raise k=value:reason]…")
+		fmt.Fprintln(os.Stderr, "usage: soak derive -summary <night json> [-out gates.json] [-accept cell:gate:reason]… [-accept-zero k:reason]… [-accept-provenance reason] [-raise k=value:reason]…"+
+			" [-validation <batch dir>]… [-exclude-attempt <batch dir>/<slot>-<n>:reason]… [-accept-batch <batch dir>:reason]… [-accept-compat <path>:reason]…")
 		return 2
 	}
 	o := derive.Options{AcceptZero: map[string]string{}, AcceptProvenance: strings.TrimSpace(*provenance)}
@@ -83,6 +136,80 @@ func deriveMain(args []string) int {
 		o.Raise = append(o.Raise, derive.Raise{Name: k, Value: v, Reason: strings.TrimSpace(reason)})
 	}
 	o.SourceUnchanged = func(sha string) (bool, error) { return sourceUnchanged(*repo, sha) }
+	o.PathsChanged = func(from, to string) ([]string, error) { return pathsChanged(*repo, from, to) }
+	// Batches are compared by their canonical paths, the identity derive itself uses (Codex BO02).
+	given := map[string]bool{}
+	canonical := func(flag, dir string) (string, bool) {
+		c, err := derive.CanonicalBatch(dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s %s: %v\n", flag, dir, err)
+			return "", false
+		}
+		return c, true
+	}
+	for _, b := range batches {
+		c, err := derive.CanonicalBatch(b)
+		if err != nil {
+			// An unresolvable batch is derive's refusal, with a report, not a usage error (Codex BP02).
+			o.Validation = append(o.Validation, b)
+			continue
+		}
+		if given[c] {
+			fmt.Fprintf(os.Stderr, "-validation %s: the batch %s is given twice\n", b, c)
+			return 2
+		}
+		given[c] = true
+		o.Validation = append(o.Validation, c)
+	}
+	accepted, ok := reasons(acceptBatches)
+	if !ok {
+		fmt.Fprintln(os.Stderr, "-accept-batch: want <batch dir>:reason, each batch once")
+		return 2
+	}
+	o.AcceptBatch = map[string]string{}
+	for b, reason := range accepted {
+		c, ok := canonical("-accept-batch", b)
+		if !ok {
+			return 2
+		}
+		if _, dup := o.AcceptBatch[c]; dup {
+			fmt.Fprintln(os.Stderr, "-accept-batch: want <batch dir>:reason, each batch once")
+			return 2
+		}
+		o.AcceptBatch[c] = reason
+	}
+	if o.AcceptCompat, ok = reasons(acceptCompats); !ok {
+		fmt.Fprintln(os.Stderr, "-accept-compat: want <path>:reason, each path once")
+		return 2
+	}
+	for b := range o.AcceptBatch {
+		if !given[b] {
+			fmt.Fprintf(os.Stderr, "-accept-batch %s: not a -validation batch\n", b)
+			return 2
+		}
+	}
+	for _, v := range excludes {
+		e, ok := parseExclude(v)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "-exclude-attempt %q: want <batch dir>/<slot>-<n>:reason\n", v)
+			return 2
+		}
+		c, ok := canonical("-exclude-attempt", e.Batch)
+		if !ok {
+			return 2
+		}
+		if !given[c] {
+			fmt.Fprintf(os.Stderr, "-exclude-attempt %q: %s is not a -validation batch\n", v, e.Batch)
+			return 2
+		}
+		e.Batch = c
+		l, err := derive.ReadLedger(e.Batch)
+		if err != nil || !l.HasAttempt(e.Slot, e.N) {
+			fmt.Fprintf(os.Stderr, "-exclude-attempt %q: the batch has no attempt %d of slot %s\n", v, e.N, e.Slot)
+			return 2
+		}
+		o.Exclude = append(o.Exclude, e)
+	}
 
 	raw, err := os.ReadFile(*summary)
 	if err != nil {

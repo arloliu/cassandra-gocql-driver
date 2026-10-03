@@ -28,6 +28,8 @@ type Report struct {
 	Provenance   string            `json:"provenance,omitempty"`
 	// Thresholds is each threshold's derivation, in PLAN §41.1's order.
 	Thresholds []Derived `json:"thresholds"`
+	// Validation is the validation evidence for kL (PLAN v7.16 §55.3); nil when no batch was given.
+	Validation *ValidationReport `json:"validation,omitempty"`
 }
 
 // CellRef names one cell's execution.
@@ -90,8 +92,11 @@ func Evaluate(summaryPath string, s Summary, cells []Cell, o Options) (gate.Thre
 	}
 	th, derived, p := Combine(ids, obs, o.AcceptZero)
 	problems = append(problems, p...)
+	val, vrep, vp := loadValidation(o, nightDriverSHA(cells))
+	problems = append(problems, vp...)
+	combineKL(th, derived, ids, obs, val)
 	problems = append(problems, ApplyRaises(th, derived, o.Raise)...)
-	r.Thresholds = derived
+	r.Thresholds, r.Validation = derived, vrep
 	if len(problems) == 0 {
 		problems = SelfCheck(cells, th)
 	}
@@ -163,6 +168,9 @@ func (r Report) Markdown() string {
 		if d.FloorApplied {
 			notes = append(notes, "floor applied")
 		}
+		if d.ValidationObserved != nil {
+			notes = append(notes, fmt.Sprintf("validation max %.6g", *d.ValidationObserved))
+		}
 		if d.Degenerate {
 			notes = append(notes, "degenerate; accepted: "+d.AcceptedZero)
 		}
@@ -176,6 +184,16 @@ func (r Report) Markdown() string {
 		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %.6g | %.6g | %.6g | %s |\n",
 			d.Name, d.Rule, strings.Join(cells, "<br>"), strings.Join(windows, " "), p95, d.Observed, d.Floor, d.Value, mdCell(strings.Join(notes, "; ")))
 	}
+	for _, d := range r.Thresholds {
+		if d.Name == gate.KL && len(d.Sources) > 0 {
+			var srcs []string
+			for _, s := range d.Sources {
+				srcs = append(srcs, s.String())
+			}
+			fmt.Fprintf(&b, "\nkL's source: %s.\n", mdCell(strings.Join(srcs, "; ")))
+		}
+	}
+	r.Validation.markdown(&b)
 	if len(r.Accepted) > 0 || r.Provenance != "" {
 		b.WriteString("\n## Accepted by the maintainer\n\n")
 		for _, a := range r.Accepted {

@@ -81,6 +81,15 @@ type Options struct {
 	Raise []Raise
 	// SourceUnchanged reports whether the tree outside soak/ is unchanged between a driver commit and HEAD.
 	SourceUnchanged func(driverSHA string) (bool, error)
+	// Validation names the validation batches whose attempts add to kL's evidence (PLAN v7.16 §55.3).
+	Validation []string
+	// Exclude removes attempts for host contention recorded beforehand; AcceptBatch admits terminal batches,
+	// and AcceptCompat changed paths that are not derivation-only, each with the maintainer's reason.
+	Exclude      []ExcludeAttempt
+	AcceptBatch  map[string]string
+	AcceptCompat map[string]string
+	// PathsChanged lists the paths under soak/ that differ between two driver commits, both sides of a rename.
+	PathsChanged func(from, to string) ([]string, error)
 }
 
 // Suitability checks PLAN §41.5 and the loader's own consistency checks (§41.2).
