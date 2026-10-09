@@ -91,8 +91,8 @@ func TestChangesMoveTheRightHash(t *testing.T) {
 		"version":     func(b *Base) { b.Cell.Version = "4.1.12" },
 		"protocol":    func(b *Base) { b.Cell.Proto = 4 },
 		"compression": func(b *Base) { b.Cell.Compression = "lz4-frame" },
-		"assignment":  func(b *Base) { b.Cell.Short[0] = chaos.FaultLat },
-		"long fault":  func(b *Base) { b.Cell.Long = chaos.FaultTopo },
+		"assignment":  func(b *Base) { b.Cell.Short[0] = chaos.FaultBW },
+		"long fault":  func(b *Base) { b.Cell.Long = chaos.FaultRoll },
 	}
 	for name, mutate := range cell {
 		c := base(t, "c50p5")
@@ -143,8 +143,10 @@ func TestEffective(t *testing.T) {
 	require.Equal(t, Timeline{Warmup: NightWarmup, Cooldown: NightCooldown, Workload: NightWorkload}, tl)
 	require.Equal(t, chaos.NightTimetable(), slots)
 	require.False(t, fixed)
-	require.Equal(t, chaos.FaultRoll, a.Long)
-	require.ElementsMatch(t, chaos.PhaseOneAssignment().Short, a.Short)
+	want, err := chaos.PhaseTwoAssignment("c50p5")
+	require.NoError(t, err)
+	require.Equal(t, chaos.FaultTopo, a.Long)
+	require.ElementsMatch(t, want.Short, a.Short)
 	require.InDelta(t, 1.0, night.G15Scale(), 0)
 
 	val, err := New(b, ValidationOverrides(""), 1)
@@ -212,4 +214,27 @@ func TestStopTarget(t *testing.T) {
 		require.Equal(t, want, ValidationOverrides(s.ID).StopTarget, s.ID)
 	}
 	require.Empty(t, ValidationOverrides("").StopTarget)
+}
+
+// The night runs phase 2 from batch 1 on: each cell's phase-2 row and every short kind as optional (PLAN §59.4).
+func TestCellsArePhaseTwo(t *testing.T) {
+	for _, c := range Cells() {
+		want, err := chaos.PhaseTwoAssignment(c.ID)
+		require.NoError(t, err)
+		require.ElementsMatch(t, want.Short, c.Short, c.ID)
+		require.Equal(t, want.Long, c.Long, c.ID)
+		b := NightBase(c, testDriver, 1500, 32)
+		require.ElementsMatch(t, chaos.PhaseTwoOptional(), b.Shared.Optional, c.ID)
+		require.Equal(t, 1500, b.Shared.Faults[chaos.FaultLat].ParamMax, "the parameter ranges are hashed")
+	}
+}
+
+// A phase-1 catalog entry encodes without the new fields, so night A's config.json keeps its form (PLAN §59.4).
+func TestSpecEncodingOmitsZeroParams(t *testing.T) {
+	raw, err := json.Marshal(chaos.Specs()[chaos.FaultStop])
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "ParamMin")
+	raw, err = json.Marshal(chaos.Specs()[chaos.FaultBW])
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"ParamMin":16`)
 }

@@ -1,4 +1,6 @@
-# Soak harness — phase 1 spikes S1–S3
+# Soak harness — spikes S1–S3 (phase 1) and S4–S5 (phase 2)
+
+Phase 2's spikes are in [S4](#s4--toxic-faults-under-load-phase-2) and [S5](#s5--f-topo-under-load-phase-2) below; this header and the fixture describe S1–S3.
 
 Date: 2026-09-24. Plan: `tmp/soak-review-2026-09-24/PLAN.md` v7.1, §9 phase 1 step 1.
 Driver: `otter-cache` @ 325e692, used through the public API only (D5).
@@ -174,3 +176,111 @@ It takes them from `CCM_MAX_HEAP_SIZE` (default `500M`) and `CCM_HEAP_NEWSIZE` (
 With `MAX_HEAP_SIZE=1G` exported, the nodes still ran `-Xms500M -Xmx500M`.
 `ccmctl` must export `CCM_MAX_HEAP_SIZE=1G` and a `CCM_HEAP_NEWSIZE` to get the §3.2 profile.
 G0 should assert `-Xmx` on each node's command line.
+
+## S4 — toxic faults under load (phase 2)
+
+Date: 2026-10-09. Plan: PLAN v7.16 §5.1, §5.2 and §9 step 6, before the v7.17 amendment.
+Driver and harness: `otter-cache` @ e59980b.
+Spike code: `soak/cmd/spike-s4/` (throwaway, deleted after the spikes).
+Raw logs: `tmp/soak-review-2026-09-24/spikes/s4-5.0.3-p5/` and `s4-5.0.3-p4/`; per-fault samples in `samples-T<n>.jsonl`.
+
+**Fixture.** Cassandra 5.0.3, a fresh 3-node cluster per protocol, the cell's driver configuration (`cell.Open`), compression on.
+The load is the night's mix at 1500 ops/s with W = 32, after a preload and a 3 min warm-up.
+toxiproxy 2.12.0 started with `-proxy-metrics -seed 42`.
+Each fault ran through `chaos.RunLifecycle` with the real `cell.Recovery` (R1–R3).
+The install and recovery bounds were widened to 3 and 5 min, so the measured times are natural, not cut off.
+The effect checks were prototypes of §5.1's, not PLAN v7.17 §59.3's, which replace them after Codex plan review round 58:
+the F-black check accepted any probe error, the byte counters were summed over whatever sockets matched,
+and the pinned probes had 10 s deadlines for F-lat and F-bw and 5 s for F-black and F-halfopen.
+Each kind ran twice per protocol, on rotating nodes:
+F-lat at 200 and 1500 ms (jitter 20%), F-bw at 16 and 128 KB/s, F-black, F-halfopen and F-reset.
+Active was 60 s for F-lat and F-bw, 90 s for F-black and F-halfopen (past heartbeat retirement), and 0 for F-reset.
+Two faults hit the control connection's node: F-black in p5 (T3) and F-lat in p4 (T1).
+In p5 the control connection then moved, so the later rep-0 targets chosen as "the control node" were ordinary nodes.
+
+### Results
+
+| Kind | Effect time (p5 / p4) | Removal → done (budget) | G8 | G7 |
+|---|---|---|---|---|
+| F-lat 200 ms | 0.20 / 0.22 s | 10 / 10 s (90 s) | rows 2 only | 0 |
+| F-lat 1500 ms | 1.30 / 1.20 s | 10 / 10 s (90 s) | rows 2 only | 0 |
+| F-bw 16 KB/s | 2.12 / 2.12 s | 10 / 10 s (90 s) | rows 2, 8 | 0 |
+| F-bw 128 KB/s | 2.62 / 2.16 s | 10 / 10 s (90 s) | rows 2, 8 | 0 |
+| F-black | 5.08 / 5.07 s, twice each | 15 s, all four (120 s) | rows 2, 8; 4 on p4 | 0 |
+| F-halfopen | 5.08 / 5.07 s, twice each | 15 s, all four (120 s) | rows 2, 8; 4 on p4 | 0 |
+| F-reset | 0.00, 1.34 / 0.11, 0.83 s | 15–16 s (90 s) | rows 2, 8; 4 on p4 | 0 |
+
+- The effect times of F-black and F-halfopen are the probe's own 5 s deadline: the first probe already timed out.
+- Removal → done includes the recovery streak, three consecutive samples 5 s apart; the streak began 0–6 s after the removal.
+  Every recovery is under a fifth of its budget.
+- Across both runs no terminal error was `unexpected`.
+  Every error was row 2 (`context.DeadlineExceeded`, `ErrTimeoutNoResponse`), row 8 (`heartbeat failed`, `EOF`, the frame read timeouts below) or row 4 (the LWT cas-unknown, including protocol 4's partial accept).
+  No new error shape appeared, so §6.1 needs no new row.
+- G7 stayed 0 in every window, and G10a and G10b found no violation.
+  The stream balance returned to 0 at the end of each run.
+- Under F-black and F-halfopen, the driver marked the node DOWN about 47 s after the install (heartbeat retirement, then failed reconnects).
+  Reconnect attempts then held 0–1 sockets, each for about the 5 s `ConnectTimeout`.
+  After the removal the pool refilled within 1 s.
+
+### Finding 1: toxiproxy's byte metrics cannot show a live connection
+
+`-proxy-metrics` exposes `toxiproxy_proxy_{received,sent}_bytes_total`.
+The counters are added only when a link's `io.Copy` returns, at connection close (`link.go:115-160` in the v2.12.0 module).
+The driver's connections are long-lived, so `/metrics` showed no proxy series at all after minutes of load.
+§5.1's F-halfopen check ("the upstream byte counter grows") therefore cannot use them.
+The kernel's per-socket `TCP_INFO` works: `ss -ti` gives `bytes_acked` and `bytes_received` for toxiproxy's own sockets.
+- Toxiproxy→server sockets have the destination `127.0.1.N:9042`, and no other process connects to `:9042`.
+- Proxy→client sockets have the source `127.0.1.N:19042`.
+
+Measured over a 5 s probe:
+
+| Kind | toxiproxy→server `bytes_acked` growth | proxy→client `bytes_acked` growth |
+|---|---|---|
+| F-halfopen | +118 695 … +179 637 | 0 |
+| F-black | 0 | 0 |
+
+So the requests reach the server under F-halfopen and not under F-black, which is what §5.1 means to tell apart.
+A delta must be taken per socket, over sockets present in both samples.
+Summed deltas went negative when a connection closed between the samples: F-black's raw sums were −10 826, 0, 0 and −5 289 B, and p4 T9's proxy→client sum was negative too.
+PLAN v7.17 r2 drops these counters for a probe connection of the harness's own (§59.3).
+
+### Finding 2: F-bw closes connections; a driver probe cannot measure its throughput
+
+The driver reads a whole frame body (protocol 4) or a whole segment payload (protocol 5) under one `Timeout` deadline:
+`connReader.Read` calls `io.ReadFull` on the whole buffer after arming the deadline once (`conn.go:1519-1563`).
+A body that takes longer than `Timeout` = 2 s to arrive fails with an `i/o timeout`, and the connection closes.
+The errors are row 8, so they are admitted inside the window.
+- Protocol 4: `unable to read frame body: read 32759/54055 bytes` at 16 KB/s, and `read 250359/543488 bytes` at 128 KB/s.
+  About 2 s × the rate arrived each time.
+  `blob` responses are 256 KiB–1 MiB, so at 128 KB/s every large read on the node closes its connection.
+- Protocol 5: payloads are at most 128 KiB per segment, so at 128 KB/s each segment arrives in about 1 s and no frame read times out.
+  Connections still closed in that window (p5 T7: six `heartbeat failed` errors), from heartbeats queued behind the throttled responses.
+  At 16 KB/s, `failed to read compressed frame payload … i/o timeout` closes the connection, as on protocol 4.
+- So F-bw is mostly a repeated connection-close fault for large responses, not a slow-throughput fault.
+  Only p5 at 128 KB/s showed a slow read that completed: the pinned blob probe read 264 134 B in 2.58 s.
+- §5.1's check ("a large-read probe's throughput falls below 2 × the limit") cannot be evaluated through the driver.
+  The probe fails within about 2 s, which bounds its throughput only at S / 2 s ≈ 126 KB/s, above 2 × 16 KB/s.
+- What works is toxiproxy's proxy→client sockets: the largest per-connection `bytes_acked` growth over 2 s.
+
+  | Limit | p5 | p4 |
+  |---|---|---|
+  | 16 KB/s | 15.4 KB/s | 15.5 KB/s |
+  | 128 KB/s | 127.4 KB/s | 124.9 KB/s |
+
+  All four are below 2 × the limit, and the total over the node's connections was above 0.
+- Not a driver finding on present evidence: the operation's own 2 s context deadline would fail it anyway.
+  What the per-body deadline adds is the connection close, which ends the other streams on that connection.
+  The behaviour is the documented one (the CASSGO-125 comments around `conn.go:1085` and `conn.go:1370`).
+
+### Smaller facts for the plan
+
+- F-lat at 1500 ms ± 20% puts a pinned read at up to about 1.8 s.
+  An effect-check probe needs its own deadline above that (the spike used 10 s); `cell.pinned`'s 2 s would time out.
+- F-reset: with load on, toxiproxy resets each connection at its next upstream byte.
+  The node's sockets dropped to 0 within 0–1.34 s, so §5.1's one-shot check needs sampling well below 1 s (100 ms was used).
+- F-black needs two toxics (downstream and upstream), and the removal check must see both gone.
+  `GET /proxies/<name>/toxics` returning `[]` served as the removal check.
+- toxiproxy's `-seed` flag is a no-op in v2.12.0.
+  `cmd/server/server.go:70` builds `rand.New(rand.NewSource(cli.seed))` and discards it.
+  The latency toxic's jitter draws from the global `math/rand` (`toxics/latency.go:25`), which is seeded at random.
+  So the per-chunk jitter is not replayable; the schedule can fix only the latency and the jitter's amplitude.

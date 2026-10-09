@@ -376,6 +376,12 @@ func (r *cellRun) prepare() error {
 	if planErr != nil {
 		r.col.InvalidConfig = append(r.col.InvalidConfig, planErr.Error())
 	}
+	// A kind the executor cannot run is refused here, before the cluster exists, not at its slot (PLAN §59.4).
+	for _, k := range scheduleKinds(sch) {
+		if !chaos.Supported(k, cell.Buildable) {
+			r.col.InvalidConfig = append(r.col.InvalidConfig, fmt.Sprintf("fault kind %s is not implemented", k))
+		}
+	}
 
 	r.streams = map[string]*artifact.JSONL{}
 	open := func(name string) *artifact.JSONL {
@@ -687,7 +693,8 @@ func (r *cellRun) workload(ctx context.Context) {
 	defer exCancel()
 	rec := &cell.Recovery{Session: r.primary, Registry: r.reg, Nodes: func() []netip.Addr { return r.addrs }, HostIDs: r.hostIDs,
 		DriverAddrs: r.sampler.DriverAddrs, ProbeKey: workload.Key{P: 1, C: 1}, FDDir: "/proc/self/fd", NetDir: "/proc/net"}
-	builder := &cell.Builder{Cluster: r.cl, Schema: cell.SchemaOps{Session: r.primary.Session}, ProcDir: "/proc"}
+	builder := &cell.Builder{Cluster: r.cl, Schema: cell.SchemaOps{Session: r.primary.Session}, ProcDir: "/proc",
+		Proxy: r.srv.Client(), Registry: r.reg, Event: func(name string, data any) { r.rec.Event(name, time.Now(), data) }}
 	ex := &chaos.Executor{Schedule: r.sch, Specs: chaos.Specs(), Start: r.epoch, Build: builder.Build, Recovery: rec,
 		Churn: r.churner.Churn, Windows: r.windows, OnTransition: r.onTransition}
 	exDone := make(chan chaos.Report, 1)
@@ -1233,4 +1240,15 @@ func ForeignProcesses(procDir string) []string {
 //   - error: the joined violations, or nil
 func Preflight(sch chaos.Schedule, tl config.Timeline) error {
 	return chaos.Preflight(sch, tl.Cooldown, chaos.Specs())
+}
+
+// scheduleKinds lists a schedule's distinct kinds, mandatory and optional, in order.
+func scheduleKinds(sch chaos.Schedule) []chaos.Kind {
+	var kinds []chaos.Kind
+	for _, p := range slices.Concat(sch.Mandatory, sch.Optional) {
+		if !slices.Contains(kinds, p.Kind) {
+			kinds = append(kinds, p.Kind)
+		}
+	}
+	return kinds
 }

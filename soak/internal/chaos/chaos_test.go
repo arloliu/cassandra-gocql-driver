@@ -471,3 +471,63 @@ func TestExecutorChurnOverrunSentinelStopsFaults(t *testing.T) {
 	require.Contains(t, rep.FaultsStopped, "C1")
 	require.Equal(t, 1, rep.MandatoryExecuted)
 }
+
+// releasing is a fault that holds resources until Release (PLAN §59.5).
+type releasing struct {
+	fake
+	releases atomic.Int32
+	removed  atomic.Bool
+	order    []string
+	mu       sync.Mutex
+}
+
+func (r *releasing) Remove(ctx context.Context) error {
+	r.mu.Lock()
+	r.order = append(r.order, "remove")
+	r.mu.Unlock()
+	return r.fake.Remove(ctx)
+}
+
+func (r *releasing) Release() {
+	r.mu.Lock()
+	r.order = append(r.order, "release")
+	r.mu.Unlock()
+	r.releases.Add(1)
+}
+
+func TestLifecycleReleasesOnEveryPath(t *testing.T) {
+	tests := []struct {
+		name string
+		f    *releasing
+		hang bool
+	}{
+		{"done", &releasing{}, false},
+		{"failed install, after its undo", &releasing{fake: fake{installErr: errors.New("boom")}}, false},
+		{"failed removal", &releasing{fake: fake{removeErr: errors.New("boom")}}, false},
+		{"outer deadline during active", &releasing{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var w Windows
+			var f Fault = tt.f
+			tm := fastTiming()
+			if tt.hang {
+				f = &hangingRelease{releasing: tt.f}
+				tm.Slack = 20 * time.Millisecond
+			}
+			RunLifecycle(t.Context(), "M4", FaultHalfOpen, f, &recovery{}, tm, &w, 1, nil)
+			require.Equal(t, int32(1), tt.f.releases.Load(), "Release runs exactly once")
+			tt.f.mu.Lock()
+			defer tt.f.mu.Unlock()
+			require.Equal(t, "release", tt.f.order[len(tt.f.order)-1], "Release runs after any removal or undo")
+		})
+	}
+}
+
+// hangingRelease ignores its active duration, so only the outer deadline ends it.
+type hangingRelease struct{ *releasing }
+
+func (h *hangingRelease) Hold(ctx context.Context, _ time.Duration) error {
+	<-ctx.Done()
+	return ctx.Err()
+}

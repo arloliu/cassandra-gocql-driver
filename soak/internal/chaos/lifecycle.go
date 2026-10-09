@@ -55,6 +55,13 @@ type Fault interface {
 	Remove(ctx context.Context) error
 }
 
+// Releaser is a fault that holds resources past its steps, such as a toxic fault's probe connections
+// (PLAN §59.5); RunLifecycle calls Release on every exit path, after any undo.
+type Releaser interface {
+	// Release frees the fault's resources; it must be idempotent and must not depend on a live context.
+	Release()
+}
+
 // Recovery evaluates R1–R3 once.
 type Recovery interface {
 	// Sample returns the violations of R1–R3 now; empty means all hold.
@@ -150,6 +157,9 @@ type Window struct {
 func RunLifecycle(ctx context.Context, id string, kind Kind, f Fault, rec Recovery, t Timing,
 	windows *Windows, width int, onTransition func(Transition)) Outcome {
 	out := Outcome{ID: id, Kind: kind, Start: time.Now()}
+	if r, ok := f.(Releaser); ok {
+		defer r.Release()
+	}
 	emit := func(s State, detail string) {
 		if onTransition != nil {
 			onTransition(Transition{Time: time.Now(), ID: id, Kind: kind, State: s, Detail: detail})

@@ -14,6 +14,7 @@ import (
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/probe"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/proxy"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/toxic"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/view"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/workload"
 )
@@ -57,11 +58,38 @@ type Builder struct {
 	Schema SchemaOps
 	// ProcDir is /proc in production.
 	ProcDir string
+	// Proxy is the toxiproxy API, for the toxic faults (PLAN §59.3).
+	Proxy toxic.Ops
+	// Registry dials the toxic faults' probe connections under the session id "probe".
+	Registry *view.Registry
+	// SS is the ss executable the toxic faults read sockets with.
+	SS string
+	// Event records a toxic fault's toxic and effect events; may be nil.
+	Event func(name string, data any)
+	// ToxicTiming overrides the toxic faults' round bounds; zero keeps toxic.DefaultTiming.
+	ToxicTiming toxic.Timing
 
-	ddlSeq atomic.Int64
+	ddlSeq   atomic.Int64
+	toxicSeq atomic.Int64
 }
 
-// Build returns the fault for one planned phase-1 fault.
+// Buildable reports whether Builder.Build builds a kind; chaos.Supported extends it to composites (PLAN §59.4).
+//
+// Parameters:
+//   - k: the kind
+//
+// Returns:
+//   - bool: true for the phase-1 kinds and the toxic kinds
+func Buildable(k chaos.Kind) bool {
+	switch k {
+	case chaos.FaultStop, chaos.FaultTwo, chaos.FaultFull, chaos.FaultKill, chaos.FaultPause, chaos.FaultDDL,
+		chaos.FaultLat, chaos.FaultBW, chaos.FaultBlack, chaos.FaultHalfOpen, chaos.FaultReset:
+		return true
+	}
+	return false
+}
+
+// Build returns the fault for one planned fault.
 //
 // Parameters:
 //   - p: the planned fault
@@ -95,8 +123,13 @@ func (b *Builder) Build(p chaos.Planned) (chaos.Fault, error) {
 		return chaos.NewPauseFault(b.Cluster, state, p.Targets[0]), nil
 	case chaos.FaultDDL:
 		return chaos.NewDDLFault(b.Schema, fmt.Sprintf("ddl_scratch_%d", b.ddlSeq.Add(1))), nil
+	case chaos.FaultLat, chaos.FaultBW, chaos.FaultBlack, chaos.FaultHalfOpen, chaos.FaultReset:
+		if err := needTargets(); err != nil {
+			return nil, err
+		}
+		return b.toxic(p)
 	default:
-		return nil, fmt.Errorf("fault kind %s is not implemented in phase 1", p.Kind)
+		return nil, fmt.Errorf("fault kind %s is not implemented", p.Kind)
 	}
 }
 
@@ -179,4 +212,26 @@ func pinned(ctx context.Context, s *gocql.Session, h *gocql.HostInfo, stmt strin
 	qctx, cancel := context.WithTimeout(ctx, pinnedTimeout)
 	defer cancel()
 	return s.Query(stmt, args...).SetHostID(h.HostID()).Consistency(gocql.Quorum).ScanContext(qctx, dest...)
+}
+
+// toxic builds a toxic fault on the planned target's proxy.
+func (b *Builder) toxic(p chaos.Planned) (chaos.Fault, error) {
+	target := p.Targets[0]
+	var n int
+	if _, err := fmt.Sscanf(target, "node%d", &n); err != nil {
+		return nil, fmt.Errorf("toxic target %q is not a node name", target)
+	}
+	node := netip.AddrFrom4([4]byte{127, 0, 1, byte(n)})
+	addr := netip.AddrPortFrom(node, proxy.ProxyPort).String()
+	dialer := b.Registry.Dialer("probe", 0, ConnectTimeout, 0)
+	ss := b.SS
+	if ss == "" {
+		ss = "ss"
+	}
+	return toxic.New(toxic.Config{Kind: p.Kind, Seq: int(b.toxicSeq.Add(1)), Proxy: target, Node: node, Param: p.Param,
+		Ops: b.Proxy, Sockets: &KernelSockets{Nodetool: b.Cluster.Nodetool, Node: target, SS: ss}, Event: b.Event,
+		Timing: b.ToxicTiming,
+		Open: func(ctx context.Context, name string) (toxic.Conn, error) {
+			return proxy.DialProbe(ctx, dialer.DialContext, addr, name)
+		}})
 }

@@ -1,6 +1,7 @@
 package cellrun
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -387,4 +388,28 @@ func replaceOnce(t *testing.T, path, from, to string) {
 	require.NoError(t, err)
 	require.Contains(t, string(raw), from)
 	require.NoError(t, os.WriteFile(path, []byte(strings.Replace(string(raw), from, to, 1)), 0o600))
+}
+
+// A configuration that schedules F-lat or F-bw must carry its parameter range; a phase-1 one needs none (PLAN §59.4).
+func TestLoadCalibrationToxicParamInvariant(t *testing.T) {
+	dir := copyFixture(t)
+	cal, err := LoadCalibration(dir)
+	require.NoError(t, err)
+	require.False(t, slices.ContainsFunc(cal.Missing, func(m string) bool { return strings.Contains(m, "parameter range") }),
+		"the fixture's phase-1 configuration needs no range: %v", cal.Missing)
+
+	path := filepath.Join(dir, "config.json")
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var conf map[string]any
+	require.NoError(t, json.Unmarshal(raw, &conf))
+	shared := conf["base"].(map[string]any)["shared"].(map[string]any)
+	shared["optional"] = append(shared["optional"].([]any), "F-lat")
+	raw, err = json.Marshal(conf)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, raw, 0o644))
+	cal, err = LoadCalibration(dir)
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(cal.Missing, func(m string) bool { return strings.Contains(m, "F-lat has no parameter range") }),
+		"%v", cal.Missing)
 }

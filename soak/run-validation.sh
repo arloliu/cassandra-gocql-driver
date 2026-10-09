@@ -11,7 +11,7 @@
 #   soak/run-validation.sh -batch DIR
 # -slots selects canaries by id; they run in the canonical order of PLAN §44.2,
 # and control-open and control-close always run.
-# Without -slots every canary runs.
+# Without -slots every canary runs; -slots none runs the two controls only (PLAN §59.7 step 5).
 #
 # It must be the main process of its own systemd service unit, and refuses to start otherwise:
 #   systemd-run --user --collect --unit=soak-validation-<date> -p KillMode=mixed -p TimeoutStopSec=2400 \
@@ -175,7 +175,9 @@ else
   [[ -z "$CCM_CONFIG" || "$CCM_CONFIG" == /* ]] || die "-ccm-config must be an absolute path"
   [[ -z "$REPOSITORY" || "$REPOSITORY" == /* ]] || die "-repository must be an absolute path"
   declare -A want=()
-  if [[ -n "$SLOTS_ARG" ]]; then
+  if [[ "$SLOTS_ARG" == none ]]; then
+    : # the controls only (PLAN §59.7 step 5): want stays empty
+  elif [[ -n "$SLOTS_ARG" ]]; then
     IFS=, read -r -a picked <<<"$SLOTS_ARG"
     ((${#picked[@]})) || die "no slots"
     for id in "${picked[@]}"; do

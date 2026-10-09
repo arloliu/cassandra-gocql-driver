@@ -75,6 +75,10 @@ type Spec struct {
 	Width int
 	// SubFaults, when positive, makes the kind a composite of that many F-stop sub-faults (F-roll).
 	SubFaults int
+	// ParamMin and ParamMax bound the seeded parameter of F-lat (latency, ms) and F-bw (rate, KB/s); zero, and
+	// absent from the encoding, elsewhere, so a phase-1 catalog encodes as before (PLAN §59.4).
+	ParamMin int `json:"ParamMin,omitempty"`
+	ParamMax int `json:"ParamMax,omitempty"`
 }
 
 // SlotKind is what a reserved slot holds.
@@ -113,6 +117,8 @@ type Planned struct {
 	SubActive []time.Duration `json:"sub_active,omitempty"`
 	// Mandatory is false for an optional fault.
 	Mandatory bool `json:"mandatory"`
+	// Param is F-lat's latency in ms or F-bw's rate in KB/s, drawn by the seed (PLAN §59.4).
+	Param int `json:"param,omitempty"`
 }
 
 // Schedule is the seeded plan of a cell, written to schedule.json.
@@ -145,8 +151,8 @@ func Specs() map[Kind]Spec {
 		FaultTwo:      {Install: m, ActiveMin: 30 * s, ActiveMax: 90 * s, Remove: start, Recovery: 180 * s, Width: 2},
 		FaultDDL:      {Install: 30 * s, ActiveMin: 60 * s, ActiveMax: 60 * s, Remove: 30 * s, Recovery: 60 * s},
 		FaultTopo:     {Install: 8 * m, Remove: 8 * m, Recovery: 90 * s},
-		FaultLat:      {Install: m, ActiveMin: 30 * s, ActiveMax: 120 * s, Remove: m, Recovery: 90 * s, Width: 1},
-		FaultBW:       {Install: m, ActiveMin: 30 * s, ActiveMax: 120 * s, Remove: m, Recovery: 90 * s, Width: 1},
+		FaultLat:      {Install: m, ActiveMin: 30 * s, ActiveMax: 120 * s, Remove: m, Recovery: 90 * s, Width: 1, ParamMin: 200, ParamMax: 1500},
+		FaultBW:       {Install: m, ActiveMin: 30 * s, ActiveMax: 120 * s, Remove: m, Recovery: 90 * s, Width: 1, ParamMin: 16, ParamMax: 128},
 		FaultBlack:    {Install: m, ActiveMin: 30 * s, ActiveMax: 120 * s, Remove: m, Recovery: 120 * s, Width: 1},
 		FaultHalfOpen: {Install: m, ActiveMin: 30 * s, ActiveMax: 90 * s, Remove: m, Recovery: 120 * s, Width: 1},
 		FaultReset:    {Install: m, Remove: m, Recovery: 90 * s, Width: 1},
@@ -224,6 +230,53 @@ func PhaseOneOptional() []Kind {
 	return []Kind{FaultStop, FaultKill, FaultPause, FaultTwo, FaultFull}
 }
 
+// PhaseTwoOptional returns the kinds a phase-2 night draws optional faults from: every short kind, F-ddl excluded
+// (PLAN §59.1 P7).
+//
+// Returns:
+//   - []Kind: F-stop, F-kill, F-pause, F-two, F-full, F-lat, F-bw, F-black, F-halfopen, F-reset
+func PhaseTwoOptional() []Kind {
+	return []Kind{FaultStop, FaultKill, FaultPause, FaultTwo, FaultFull, FaultLat, FaultBW, FaultBlack, FaultHalfOpen, FaultReset}
+}
+
+// PhaseTwoAssignment returns a cell's phase-2 assignment (PLAN §5.4).
+//
+// Parameters:
+//   - cell: the cell id, e.g. c50p5
+//
+// Returns:
+//   - Assignment: M1–M6 and L
+//   - error: for an unknown cell
+func PhaseTwoAssignment(cell string) (Assignment, error) {
+	switch cell {
+	case "c41p4", "c50p5":
+		return Assignment{Short: []Kind{FaultKill, FaultPause, FaultStop, FaultLat, FaultBlack, FaultFull}, Long: FaultTopo}, nil
+	case "c41p5", "c50p4":
+		return Assignment{Short: []Kind{FaultKill, FaultPause, FaultTwo, FaultBW, FaultHalfOpen, FaultReset}, Long: FaultRoll}, nil
+	}
+	return Assignment{}, fmt.Errorf("no phase-2 assignment for cell %q", cell)
+}
+
+// Supported reports whether the executor can run a kind: a composite when its F-stop sub-faults are buildable,
+// any other kind of the catalog when it is buildable itself (PLAN §59.4).
+//
+// Parameters:
+//   - k: the kind
+//   - buildable: whether a fault builder builds a kind
+//
+// Returns:
+//   - bool: true when the kind can run
+func Supported(k Kind, buildable func(Kind) bool) bool {
+	sp, ok := Specs()[k]
+	switch {
+	case !ok:
+		return false
+	case sp.SubFaults > 0:
+		return buildable(FaultStop)
+	}
+	return buildable(k)
+}
+
 // PhaseOneAssignment returns the phase-1 assignment, the same for every cell.
 //
 // Returns:
@@ -246,8 +299,13 @@ func PhaseOneAssignment() Assignment {
 //
 // Returns:
 //   - Schedule: the plan
-//   - error: when the slots and the assignment do not match
+//   - error: when the slots and the assignment do not match, or a scheduled kind has an empty parameter range
 func Plan(seed uint64, slots []Slot, a Assignment, shuffle bool, nodes []string, optionalKinds []Kind, specs map[Kind]Spec) (Schedule, error) {
+	for _, k := range slices.Concat(a.Short, []Kind{a.Long}, optionalKinds) {
+		if sp := specs[k]; sp.ParamMax > 0 && sp.ParamMax < sp.ParamMin {
+			return Schedule{}, fmt.Errorf("plan: %s's parameter range [%d, %d] is empty", k, sp.ParamMin, sp.ParamMax)
+		}
+	}
 	rng := rand.New(rand.NewPCG(seed, seed^0xc4a05))
 	short := slices.Clone(a.Short)
 	if shuffle {
@@ -382,6 +440,10 @@ func plan(rng *rand.Rand, slot string, k Kind, nodes []string, specs map[Kind]Sp
 			p.Targets = append(p.Targets, nodes[i])
 		}
 		slices.Sort(p.Targets)
+	}
+	// Drawn last and only for the toxic parameters, so a schedule without them makes the same draws (PLAN §59.4).
+	if sp.ParamMax > 0 {
+		p.Param = sp.ParamMin + rng.IntN(sp.ParamMax-sp.ParamMin+1)
 	}
 	return p
 }

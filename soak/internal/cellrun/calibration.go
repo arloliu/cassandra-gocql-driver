@@ -177,6 +177,9 @@ func LoadCalibration(dir string) (Calibration, error) {
 	if !(tl.Warmup > 0 && tl.Warmup < tl.Cooldown && tl.Cooldown <= tl.Workload) {
 		miss("config.json: the effective timeline %v is not 0 < warm-up < cool-down ≤ workload", tl)
 	}
+	for _, k := range toxicParamless(conf) {
+		miss("config.json: %s has no parameter range, yet the configuration schedules it", k)
+	}
 	cal.NumConns, cal.NodeCount = conf.Base.Shared.Driver.NumConns, conf.Base.Shared.Cluster.Nodes
 	c := &cal.Collected
 	c.Mode, c.Timeline, c.WorkloadSeconds, c.Ran = conf.Overrides.Mode, tl, cal.Verdict.WorkloadSeconds, true
@@ -579,4 +582,18 @@ func eachLine(path string, fn func([]byte) error) error {
 		return errors.Join(fmt.Errorf("read %s", path), err)
 	}
 	return nil
+}
+
+// toxicParamless lists the parameterised kinds a configuration schedules without a range in its catalog (PLAN §59.4):
+// ParamMin and ParamMax are omitempty, so an incomplete new-format file would otherwise decode as a phase-1 one.
+func toxicParamless(conf config.Config) []chaos.Kind {
+	scheduled := slices.Concat(conf.Base.Cell.Short, []chaos.Kind{conf.Base.Cell.Long}, conf.Base.Shared.Optional, conf.Overrides.Faults)
+	var out []chaos.Kind
+	for _, k := range []chaos.Kind{chaos.FaultLat, chaos.FaultBW} {
+		sp := conf.Base.Shared.Faults[k]
+		if slices.Contains(scheduled, k) && (sp.ParamMin <= 0 || sp.ParamMax < sp.ParamMin) {
+			out = append(out, k)
+		}
+	}
+	return out
 }

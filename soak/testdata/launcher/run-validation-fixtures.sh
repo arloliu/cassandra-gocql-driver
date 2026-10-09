@@ -93,6 +93,9 @@ if wanted reject; then
   newbatch reject3
   run reject3 -gates "$GATES" -slots K9
   check "an unknown canary exits 2" test "$EXIT" = 2
+  newbatch reject5
+  run reject5 -gates "$GATES" -slots none,K7
+  check "none with a canary exits 2" test "$EXIT" = 2
   newbatch reject4
   run reject4 -gates "$ROOT/absent.json"
   check "a missing gates file exits 2" test "$EXIT" = 2
@@ -117,6 +120,15 @@ if wanted pass; then
   check "control: -kind control" grep -qzP -- "-kind\ncontrol\n" "$BATCH/attempts/control-open-1/args"
   check "validation.md has one row per attempt" test "$(grep -c '^| control-\|^| k' "$BATCH/validation.md")" -eq 4
   check "no unit stays loaded" no_units_left
+fi
+
+if wanted controls; then
+  echo "controls: -slots none runs control-open and control-close only (PLAN §59.7 step 5)"
+  newbatch controls
+  run controls -date "$DATE" -gates "$GATES" -slots none
+  check "exit 0" test "$EXIT" = 0
+  check "exactly the two controls" lq '.batch.slots == ["control-open", "control-close"]'
+  check "both validated" lq 'all(.slots[]; .effective.result == "validated" and (.attempts | length) == 1)'
 fi
 
 if wanted dotted; then

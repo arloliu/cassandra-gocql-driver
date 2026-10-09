@@ -153,3 +153,37 @@ func TestServerLifecycle(t *testing.T) {
 	_, err = os.Stat(logPath)
 	require.NoError(t, err)
 }
+
+func TestClientToxicUpdateAndList(t *testing.T) {
+	c, got := fakeAPI(t, http.StatusOK, `[{"name":"soak-t1-down","type":"timeout"},{"name":"soak-t1-up","type":"timeout"}]`)
+	ctx := context.Background()
+	require.NoError(t, c.UpdateToxic(ctx, "node2", "soak-t1-down", 0))
+	names, err := c.Toxics(ctx, "node2")
+	require.NoError(t, err)
+	require.Equal(t, []string{"soak-t1-down", "soak-t1-up"}, names)
+
+	require.Len(t, *got, 2)
+	require.Equal(t, recorded{"POST", "/proxies/node2/toxics/soak-t1-down", `{"toxicity":0}`}, (*got)[0])
+	require.Equal(t, recorded{"GET", "/proxies/node2/toxics", ""}, (*got)[1])
+}
+
+func TestClientToxicsEmpty(t *testing.T) {
+	c, _ := fakeAPI(t, http.StatusOK, `[]`)
+	names, err := c.Toxics(context.Background(), "node2")
+	require.NoError(t, err)
+	require.Empty(t, names)
+}
+
+func TestClientNotFound(t *testing.T) {
+	c, _ := fakeAPI(t, http.StatusNotFound, `{"error":"toxic not found","status":404}`)
+	err := c.RemoveToxic(context.Background(), "node2", "soak-t1-up")
+	require.ErrorIs(t, err, ErrNotFound)
+	err = c.UpdateToxic(context.Background(), "node2", "soak-t1-up", 0)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestClientMalformedToxicList(t *testing.T) {
+	c, _ := fakeAPI(t, http.StatusOK, `{"not":"a list"}`)
+	_, err := c.Toxics(context.Background(), "node2")
+	require.Error(t, err)
+}

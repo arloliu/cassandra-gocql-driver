@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +55,13 @@ type smokeConfig struct {
 func runSmoke(ctx context.Context, cfg smokeConfig) (err error) {
 	logf := func(format string, args ...any) {
 		fmt.Printf("%s "+format+"\n", append([]any{time.Now().Format("15:04:05")}, args...)...)
+	}
+	// A bad -faults is refused before any fixture exists, so it cannot pass as a run with no faults (§64 BW08).
+	var planned []chaos.Planned
+	if cfg.faults != "" {
+		if planned, err = parseSmokeFaults(cfg.faults, chaos.Specs()); err != nil {
+			return fmt.Errorf("-faults: %w", err)
+		}
 	}
 	if err := os.MkdirAll(cfg.outDir, 0o755); err != nil {
 		return err
@@ -203,8 +211,8 @@ func runSmoke(ctx context.Context, cfg smokeConfig) (err error) {
 			}
 		}
 	}()
-	if cfg.faults != "" {
-		runSmokeFaults(ctx, cfg, logf, cl, primary, reg, windows)
+	if len(planned) > 0 {
+		runSmokeFaults(ctx, cfg, logf, cl, primary, reg, windows, srv.Client(), planned)
 	}
 	ticker := time.NewTicker(time.Second)
 	deadline := time.After(cfg.duration)
@@ -283,17 +291,17 @@ loop:
 
 // runSmokeFaults runs each listed fault through its real lifecycle, one after another, while the load runs.
 func runSmokeFaults(ctx context.Context, cfg smokeConfig, logf func(string, ...any), cl *ccmctl.Cluster,
-	primary *cell.Session, reg *view.Registry, windows *chaos.Windows) {
+	primary *cell.Session, reg *view.Registry, windows *chaos.Windows, tox *proxy.Client, planned []chaos.Planned) {
 	nodes := []netip.Addr{netip.MustParseAddr("127.0.1.1"), netip.MustParseAddr("127.0.1.2"), netip.MustParseAddr("127.0.1.3")}
 	rec := &cell.Recovery{Session: primary, Registry: reg, Nodes: func() []netip.Addr { return nodes },
 		DriverAddrs: append(slicesClone(nodes), netip.MustParseAddr("127.0.1.4")), ProbeKey: workload.Key{P: 1, C: 1},
 		FDDir: "/proc/self/fd", NetDir: "/proc/net"}
-	b := &cell.Builder{Cluster: cl, Schema: cell.SchemaOps{Session: primary.Session}, ProcDir: "/proc"}
+	b := &cell.Builder{Cluster: cl, Schema: cell.SchemaOps{Session: primary.Session}, ProcDir: "/proc",
+		Proxy: tox, Registry: reg, Event: func(name string, data any) {
+			raw, _ := json.Marshal(data)
+			logf("  event %s %s", name, raw)
+		}}
 	specs := chaos.Specs()
-	targets := map[chaos.Kind][]string{
-		chaos.FaultStop: {"node2"}, chaos.FaultKill: {"node3"}, chaos.FaultPause: {"node1"},
-		chaos.FaultTwo: {"node1", "node3"}, chaos.FaultFull: {"node1", "node2", "node3"},
-	}
 	if cfg.removeBound > 0 {
 		for _, k := range []chaos.Kind{chaos.FaultStop, chaos.FaultKill, chaos.FaultTwo, chaos.FaultFull} {
 			sp := specs[k]
@@ -301,14 +309,8 @@ func runSmokeFaults(ctx context.Context, cfg smokeConfig, logf func(string, ...a
 			specs[k] = sp
 		}
 	}
-	names := []string{"node1", "node2", "node3"}
-	for i, name := range strings.Split(cfg.faults, ",") {
-		k := chaos.Kind(name)
-		tgt := targets[k]
-		if len(tgt) == 1 {
-			tgt = []string{names[i%len(names)]}
-		}
-		p := chaos.Planned{Slot: fmt.Sprintf("S%d", i+1), Kind: k, Targets: tgt, Active: cfg.faultActive, Mandatory: true}
+	for _, p := range smokeSchedule(planned, specs, cfg.faultActive) {
+		k := p.Kind
 		f, err := b.Build(p)
 		if err != nil {
 			logf("fault %s: %v", k, err)
@@ -341,6 +343,57 @@ func runSmokeFaults(ctx context.Context, cfg smokeConfig, logf func(string, ...a
 }
 
 func slicesClone(a []netip.Addr) []netip.Addr { return append([]netip.Addr(nil), a...) }
+
+// smokeSchedule places parsed smoke faults: a slot each, their targets, their active duration, their parameter kept.
+func smokeSchedule(planned []chaos.Planned, specs map[chaos.Kind]chaos.Spec, active time.Duration) []chaos.Planned {
+	targets := map[chaos.Kind][]string{
+		chaos.FaultStop: {"node2"}, chaos.FaultKill: {"node3"}, chaos.FaultPause: {"node1"},
+		chaos.FaultTwo: {"node1", "node3"}, chaos.FaultFull: {"node1", "node2", "node3"},
+	}
+	names := []string{"node1", "node2", "node3"}
+	out := make([]chaos.Planned, 0, len(planned))
+	for i, p := range planned {
+		tgt := targets[p.Kind]
+		if len(tgt) <= 1 {
+			tgt = []string{names[i%len(names)]}
+		}
+		p.Slot, p.Targets, p.Active, p.Mandatory = fmt.Sprintf("S%d", i+1), tgt, active, true
+		if specs[p.Kind].ActiveMax == 0 {
+			p.Active = 0 // F-reset and F-ddl have no active range
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// parseSmokeFaults parses -faults: comma-separated kinds, each optionally with ":param", F-lat's latency in ms or
+// F-bw's rate in KB/s, which those two require (PLAN §59.7 step 2).
+func parseSmokeFaults(arg string, specs map[chaos.Kind]chaos.Spec) ([]chaos.Planned, error) {
+	var out []chaos.Planned
+	for _, item := range strings.Split(arg, ",") {
+		name, param, hasParam := strings.Cut(item, ":")
+		k := chaos.Kind(name)
+		sp, ok := specs[k]
+		if !ok {
+			return nil, fmt.Errorf("unknown fault kind %q", name)
+		}
+		p := chaos.Planned{Kind: k}
+		switch {
+		case sp.ParamMax == 0 && hasParam:
+			return nil, fmt.Errorf("%s takes no parameter", k)
+		case sp.ParamMax > 0 && !hasParam:
+			return nil, fmt.Errorf("%s needs a parameter, e.g. %s:%d", k, k, sp.ParamMin)
+		case hasParam:
+			n, err := strconv.Atoi(param)
+			if err != nil || n < sp.ParamMin || n > sp.ParamMax {
+				return nil, fmt.Errorf("%s:%s: the parameter must be in [%d, %d]", k, param, sp.ParamMin, sp.ParamMax)
+			}
+			p.Param = n
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
 
 // smokeG11 evaluates the cell's G11 over a fault-free smoke run, from the end of the warm-up to the end of the load,
 // and keeps the per-second counters in progress.json (PLAN §30.3 Q3).

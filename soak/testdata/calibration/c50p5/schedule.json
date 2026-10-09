@@ -1,0 +1,467 @@
+{
+  "seed": 17908040569242239381,
+  "slots": [
+    {
+      "id": "M0",
+      "kind": "ddl",
+      "start": 900000000000,
+      "end": 1200000000000
+    },
+    {
+      "id": "C1",
+      "kind": "churn",
+      "start": 1200000000000,
+      "end": 1350000000000
+    },
+    {
+      "id": "M1",
+      "kind": "short",
+      "start": 1350000000000,
+      "end": 1800000000000
+    },
+    {
+      "id": "C2",
+      "kind": "churn",
+      "start": 1800000000000,
+      "end": 1950000000000
+    },
+    {
+      "id": "M2",
+      "kind": "short",
+      "start": 1950000000000,
+      "end": 2400000000000
+    },
+    {
+      "id": "C3",
+      "kind": "churn",
+      "start": 2400000000000,
+      "end": 2550000000000
+    },
+    {
+      "id": "M3",
+      "kind": "short",
+      "start": 2550000000000,
+      "end": 3000000000000
+    },
+    {
+      "id": "C4",
+      "kind": "churn",
+      "start": 3000000000000,
+      "end": 3150000000000
+    },
+    {
+      "id": "M4",
+      "kind": "short",
+      "start": 3150000000000,
+      "end": 3600000000000
+    },
+    {
+      "id": "C5",
+      "kind": "churn",
+      "start": 3600000000000,
+      "end": 3750000000000
+    },
+    {
+      "id": "L",
+      "kind": "long",
+      "start": 3750000000000,
+      "end": 4950000000000
+    },
+    {
+      "id": "M5",
+      "kind": "short",
+      "start": 4950000000000,
+      "end": 5400000000000
+    },
+    {
+      "id": "C6",
+      "kind": "churn",
+      "start": 5400000000000,
+      "end": 5550000000000
+    },
+    {
+      "id": "M6",
+      "kind": "short",
+      "start": 5550000000000,
+      "end": 6000000000000
+    },
+    {
+      "id": "C7",
+      "kind": "churn",
+      "start": 6000000000000,
+      "end": 6150000000000
+    }
+  ],
+  "mandatory": [
+    {
+      "slot": "M0",
+      "kind": "F-ddl",
+      "targets": null,
+      "active": 60000000000,
+      "mandatory": true
+    },
+    {
+      "slot": "M1",
+      "kind": "F-kill",
+      "targets": [
+        "node1"
+      ],
+      "active": 49000000000,
+      "mandatory": true
+    },
+    {
+      "slot": "M2",
+      "kind": "F-kill",
+      "targets": [
+        "node3"
+      ],
+      "active": 68000000000,
+      "mandatory": true
+    },
+    {
+      "slot": "M3",
+      "kind": "F-pause",
+      "targets": [
+        "node1"
+      ],
+      "active": 60000000000,
+      "mandatory": true
+    },
+    {
+      "slot": "M4",
+      "kind": "F-two",
+      "targets": [
+        "node2",
+        "node3"
+      ],
+      "active": 60000000000,
+      "mandatory": true
+    },
+    {
+      "slot": "L",
+      "kind": "F-roll",
+      "targets": [
+        "node1",
+        "node2",
+        "node3"
+      ],
+      "active": 0,
+      "sub_active": [
+        45000000000,
+        117000000000,
+        95000000000
+      ],
+      "mandatory": true
+    },
+    {
+      "slot": "M5",
+      "kind": "F-stop",
+      "targets": [
+        "node3"
+      ],
+      "active": 111000000000,
+      "mandatory": true
+    },
+    {
+      "slot": "M6",
+      "kind": "F-full",
+      "targets": [
+        "node1",
+        "node2",
+        "node3"
+      ],
+      "active": 47000000000,
+      "mandatory": true
+    }
+  ],
+  "optional": [
+    {
+      "slot": "",
+      "kind": "F-pause",
+      "targets": [
+        "node3"
+      ],
+      "active": 30000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-stop",
+      "targets": [
+        "node3"
+      ],
+      "active": 85000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-kill",
+      "targets": [
+        "node1"
+      ],
+      "active": 83000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-full",
+      "targets": [
+        "node1",
+        "node2",
+        "node3"
+      ],
+      "active": 50000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-two",
+      "targets": [
+        "node1",
+        "node3"
+      ],
+      "active": 34000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-full",
+      "targets": [
+        "node1",
+        "node2",
+        "node3"
+      ],
+      "active": 48000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-two",
+      "targets": [
+        "node1",
+        "node3"
+      ],
+      "active": 48000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-pause",
+      "targets": [
+        "node3"
+      ],
+      "active": 40000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-stop",
+      "targets": [
+        "node3"
+      ],
+      "active": 81000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-kill",
+      "targets": [
+        "node2"
+      ],
+      "active": 92000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-pause",
+      "targets": [
+        "node3"
+      ],
+      "active": 14000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-full",
+      "targets": [
+        "node1",
+        "node2",
+        "node3"
+      ],
+      "active": 57000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-two",
+      "targets": [
+        "node1",
+        "node2"
+      ],
+      "active": 42000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-stop",
+      "targets": [
+        "node2"
+      ],
+      "active": 118000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-kill",
+      "targets": [
+        "node3"
+      ],
+      "active": 116000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-full",
+      "targets": [
+        "node1",
+        "node2",
+        "node3"
+      ],
+      "active": 49000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-stop",
+      "targets": [
+        "node2"
+      ],
+      "active": 33000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-pause",
+      "targets": [
+        "node2"
+      ],
+      "active": 44000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-two",
+      "targets": [
+        "node1",
+        "node3"
+      ],
+      "active": 55000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-kill",
+      "targets": [
+        "node3"
+      ],
+      "active": 120000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-full",
+      "targets": [
+        "node1",
+        "node2",
+        "node3"
+      ],
+      "active": 43000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-kill",
+      "targets": [
+        "node2"
+      ],
+      "active": 38000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-two",
+      "targets": [
+        "node2",
+        "node3"
+      ],
+      "active": 89000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-stop",
+      "targets": [
+        "node1"
+      ],
+      "active": 52000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-pause",
+      "targets": [
+        "node1"
+      ],
+      "active": 24000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-two",
+      "targets": [
+        "node2",
+        "node3"
+      ],
+      "active": 85000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-stop",
+      "targets": [
+        "node1"
+      ],
+      "active": 115000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-kill",
+      "targets": [
+        "node3"
+      ],
+      "active": 82000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-pause",
+      "targets": [
+        "node1"
+      ],
+      "active": 56000000000,
+      "mandatory": false
+    },
+    {
+      "slot": "",
+      "kind": "F-full",
+      "targets": [
+        "node1",
+        "node2",
+        "node3"
+      ],
+      "active": 41000000000,
+      "mandatory": false
+    }
+  ]
+}

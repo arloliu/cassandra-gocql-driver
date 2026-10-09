@@ -42,6 +42,9 @@ const (
 // ErrAPIPortBusy is returned when something already answers on the API port: a foreign toxiproxy-server.
 var ErrAPIPortBusy = errors.New("proxy: toxiproxy API port already in use")
 
+// ErrNotFound is returned, wrapped, when the API answers 404: the proxy or toxic does not exist.
+var ErrNotFound = errors.New("proxy: not found")
+
 // Spec is one proxy.
 type Spec struct {
 	// Name is the proxy name, nodeN.
@@ -300,10 +303,57 @@ func (c *Client) AddToxic(ctx context.Context, proxy string, t Toxic) error {
 //   - name: the toxic name
 //
 // Returns:
-//   - error: on a transport failure or a non-2xx status
+//   - error: on a transport failure or a non-2xx status; ErrNotFound, wrapped, on 404
 func (c *Client) RemoveToxic(ctx context.Context, proxy, name string) error {
 	_, err := c.do(ctx, http.MethodDelete, "/proxies/"+proxy+"/toxics/"+name, nil)
 	return err
+}
+
+// UpdateToxic sets a toxic's toxicity and keeps its attributes.
+//
+// toxiproxy restarts the toxic's stubs without running its cleanup, so a timeout toxic updated to toxicity 0
+// forwards again instead of closing its links (PLAN §59.3).
+//
+// Parameters:
+//   - ctx: bounds the request
+//   - proxy: the proxy name
+//   - name: the toxic name
+//   - toxicity: the probability, in [0, 1], that a stub runs the toxic rather than a noop
+//
+// Returns:
+//   - error: on a transport failure or a non-2xx status; ErrNotFound, wrapped, on 404
+func (c *Client) UpdateToxic(ctx context.Context, proxy, name string, toxicity float64) error {
+	_, err := c.do(ctx, http.MethodPost, "/proxies/"+proxy+"/toxics/"+name, struct {
+		Toxicity float64 `json:"toxicity"`
+	}{toxicity})
+	return err
+}
+
+// Toxics lists the names of a proxy's toxics.
+//
+// Parameters:
+//   - ctx: bounds the request
+//   - proxy: the proxy name
+//
+// Returns:
+//   - []string: the names, in the server's order
+//   - error: on a transport failure, a non-2xx status or a malformed reply
+func (c *Client) Toxics(ctx context.Context, proxy string) ([]string, error) {
+	raw, err := c.do(ctx, http.MethodGet, "/proxies/"+proxy+"/toxics", nil)
+	if err != nil {
+		return nil, err
+	}
+	var toxics []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &toxics); err != nil {
+		return nil, fmt.Errorf("parse toxics of %s: %w", proxy, err)
+	}
+	names := make([]string, 0, len(toxics))
+	for _, t := range toxics {
+		names = append(names, t.Name)
+	}
+	return names, nil
 }
 
 // Reset enables every proxy and removes every toxic.
@@ -342,6 +392,9 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("toxiproxy %s %s: read reply: %w", method, path, err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("toxiproxy %s %s: %w: %s", method, path, ErrNotFound, bytes.TrimSpace(raw))
 	}
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("toxiproxy %s %s: status %d: %s", method, path, resp.StatusCode, bytes.TrimSpace(raw))

@@ -1,0 +1,11 @@
+
+Address          SSL   Cipher    Protocol  Version User      Keyspace Requests Driver-Name Driver-Version
+/127.0.0.1:60956 false undefined undefined 4       anonymous          3712921  ..          (devel)       
+/127.0.0.1:60942 false undefined undefined 4       anonymous          1501     ..          (devel)       
+/127.0.0.1:60948 false undefined undefined 4       anonymous          3709858  ..          (devel)       
+
+Total connected clients: 3
+
+User      Connections
+anonymous 3          
+

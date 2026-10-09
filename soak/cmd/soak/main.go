@@ -14,7 +14,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: soak cell|smoke|derive|latency-check [flags]")
+		fmt.Fprintln(os.Stderr, "usage: soak cell|smoke|derive|latency-check|rehearsal [flags]")
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -28,6 +28,8 @@ func main() {
 		os.Exit(deriveMain(os.Args[2:]))
 	case "latency-check":
 		os.Exit(latencyCheckMain(os.Args[2:]))
+	case "rehearsal":
+		os.Exit(rehearsalMain(os.Args[2:]))
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", os.Args[1])
 		os.Exit(2)

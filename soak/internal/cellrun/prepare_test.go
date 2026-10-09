@@ -56,3 +56,35 @@ func TestPrepareRejectsAMalformedAttemptID(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, entries, "nothing is created for a rejected id")
 }
+
+// A schedule with a kind the executor cannot run is refused before the cluster exists (PLAN §59.4): in batch 1,
+// F-topo's cells; F-roll's cells run, and a validation run is judged on its own F-stop and F-pause.
+func TestPrepareRefusesUnsupportedKinds(t *testing.T) {
+	for _, tc := range []struct {
+		cell    string
+		mode    gate.Mode
+		refused bool
+	}{
+		{"c41p4", gate.ModeNight, true},
+		{"c50p5", gate.ModeNight, true},
+		{"c41p5", gate.ModeNight, false},
+		{"c50p4", gate.ModeNight, false},
+		{"c50p5", gate.ModeValidate, false},
+	} {
+		o := prepareOptions(t, "")
+		o.CellID, o.Mode = tc.cell, tc.mode
+		if tc.mode == gate.ModeNight {
+			o.RunKind = artifact.RunNight
+		}
+		r := newPrepareRun(o)
+		require.NoError(t, r.prepare(), tc.cell)
+		refused := false
+		for _, reason := range r.col.InvalidConfig {
+			if reason == "fault kind F-topo is not implemented" {
+				refused = true
+			}
+		}
+		require.Equal(t, tc.refused, refused, "%s %s: %v", tc.cell, tc.mode, r.col.InvalidConfig)
+		r.closeStreams()
+	}
+}

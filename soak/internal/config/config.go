@@ -186,16 +186,19 @@ type Config struct {
 	SharedHash string `json:"shared_hash"`
 }
 
-// Cells returns the four cells of the matrix (PLAN §3.1) with their mandatory assignment (PLAN §5.4, phase 1).
+// Cells returns the four cells of the matrix (PLAN §3.1) with their phase-2 mandatory assignment (PLAN §5.4, §59.4).
 //
 // Returns:
 //   - []Cell: c41p4, c41p5, c50p4, c50p5
 func Cells() []Cell {
-	a := chaos.PhaseOneAssignment()
 	mk := func(id, version string, proto int) Cell {
 		compression := "lz4-frame"
 		if proto >= 5 {
 			compression = "lz4-segment"
+		}
+		a, err := chaos.PhaseTwoAssignment(id)
+		if err != nil {
+			panic(err) // the four ids below are the table's own
 		}
 		return Cell{ID: id, Version: version, Proto: proto, Compression: compression, Short: slices.Clone(a.Short), Long: a.Long}
 	}
@@ -246,7 +249,7 @@ func NightBase(c Cell, driver Driver, rate float64, workers int) Base {
 			Workload: workload.DefaultParams(),
 			Churn: Churn{Deadline: chaos.ChurnSlotDeadline, Create: chaos.ChurnBudget.Create, Load: chaos.ChurnBudget.Load,
 				Close: chaos.ChurnBudget.Close, Grace: chaos.ChurnBudget.Grace, Residue: chaos.ChurnBudget.Residue, Margin: chaos.ChurnBudget.Margin},
-			Optional: chaos.PhaseOneOptional(),
+			Optional: chaos.PhaseTwoOptional(),
 		},
 	})
 }
