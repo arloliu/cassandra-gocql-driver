@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/artifact"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/ccmctl"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/view"
@@ -57,19 +59,15 @@ func TestPrepareRejectsAMalformedAttemptID(t *testing.T) {
 	require.Empty(t, entries, "nothing is created for a rejected id")
 }
 
-// A schedule with a kind the executor cannot run is refused before the cluster exists (PLAN §59.4): in batch 1,
-// F-topo's cells; F-roll's cells run, and a validation run is judged on its own F-stop and F-pause.
-func TestPrepareRefusesUnsupportedKinds(t *testing.T) {
+// With batch 2 every kind of every cell runs, so prepare refuses none (PLAN §59.4; the gate's own cases are
+// chaos.Supported's tests); a validation run is checked on its own F-stop and F-pause.
+func TestPrepareAcceptsEveryPhaseTwoCell(t *testing.T) {
 	for _, tc := range []struct {
-		cell    string
-		mode    gate.Mode
-		refused bool
+		cell string
+		mode gate.Mode
 	}{
-		{"c41p4", gate.ModeNight, true},
-		{"c50p5", gate.ModeNight, true},
-		{"c41p5", gate.ModeNight, false},
-		{"c50p4", gate.ModeNight, false},
-		{"c50p5", gate.ModeValidate, false},
+		{"c41p4", gate.ModeNight}, {"c41p5", gate.ModeNight}, {"c50p4", gate.ModeNight}, {"c50p5", gate.ModeNight},
+		{"c50p5", gate.ModeValidate},
 	} {
 		o := prepareOptions(t, "")
 		o.CellID, o.Mode = tc.cell, tc.mode
@@ -78,13 +76,50 @@ func TestPrepareRefusesUnsupportedKinds(t *testing.T) {
 		}
 		r := newPrepareRun(o)
 		require.NoError(t, r.prepare(), tc.cell)
-		refused := false
-		for _, reason := range r.col.InvalidConfig {
-			if reason == "fault kind F-topo is not implemented" {
-				refused = true
-			}
-		}
-		require.Equal(t, tc.refused, refused, "%s %s: %v", tc.cell, tc.mode, r.col.InvalidConfig)
+		require.Empty(t, r.col.InvalidConfig, "%s %s", tc.cell, tc.mode)
 		r.closeStreams()
+	}
+}
+
+// node4's pid is recorded while F-topo has it, so the launcher's cleanup knows its process (PLAN §59.6).
+func TestRecordPIDsIncludesTheTopologyNode(t *testing.T) {
+	config := t.TempDir()
+	for node, pid := range map[string]string{"node1": "101", "node2": "102", "node3": "103", "node4": "104"} {
+		dir := filepath.Join(config, "gocql_soak_c50p5", node)
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "cassandra.pid"), []byte(pid+"\n"), 0o644))
+	}
+	r := newPrepareRun(prepareOptions(t, ""))
+	r.dir, r.nodes = t.TempDir(), slices.Clone(cellNodes)
+	r.cl = ccmctl.New(ccmctl.Config{Binary: "ccm", ConfigDir: config}).Cluster("gocql_soak_c50p5")
+	r.recordPIDs()
+	require.Equal(t, map[string]int{"node1": 101, "node2": 102, "node3": 103, "node4": 104}, r.res.NodePIDs)
+
+	require.NoError(t, os.RemoveAll(filepath.Join(config, "gocql_soak_c50p5", "node4")))
+	r.recordPIDs()
+	require.NotContains(t, r.res.NodePIDs, "node4", "a removed node4 leaves the record")
+}
+
+// A cell that ends while F-topo has node4 collects node4's logs with the others (PLAN §59.6).
+func TestCollectNodeLogsIncludesAPresentTopologyNode(t *testing.T) {
+	for _, present := range []bool{true, false} {
+		config := t.TempDir()
+		nodes := slices.Clone(cellNodes)
+		if present {
+			nodes = append(nodes, "node4")
+		}
+		for _, n := range nodes {
+			logs := filepath.Join(config, "gocql_soak_c50p5", n, "logs")
+			require.NoError(t, os.MkdirAll(logs, 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(logs, "system.log"), []byte(n), 0o644))
+		}
+		r := newPrepareRun(prepareOptions(t, ""))
+		r.dir, r.nodes = t.TempDir(), slices.Clone(cellNodes)
+		r.cl = ccmctl.New(ccmctl.Config{Binary: "/nonexistent/ccm", ConfigDir: config}).Cluster("gocql_soak_c50p5")
+		require.NoError(t, r.collectNodeLogs(t.Context()))
+		_, err := os.Stat(filepath.Join(r.dir, "ccm", "node4", "system.log"))
+		require.Equal(t, present, err == nil, "node4 present=%v", present)
+		_, err = os.Stat(filepath.Join(r.dir, "ccm", "node3", "system.log"))
+		require.NoError(t, err)
 	}
 }

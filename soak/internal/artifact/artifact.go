@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -143,6 +144,33 @@ func WriteJSON(path string, v any) error {
 		return fmt.Errorf("write %s: %w", filepath.Base(path), err)
 	}
 	return nil
+}
+
+// CopyNodeLogs copies a ccm node's system.log and gc logs.
+//
+// Parameters:
+//   - dst: the destination directory, created if needed
+//   - src: the node's logs directory
+//
+// Returns:
+//   - error: joining every failure to read the directory, create the destination or copy a file
+func CopyNodeLogs(dst, src string) error {
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, e := range entries {
+		if e.Name() == "system.log" || strings.HasPrefix(e.Name(), "gc.log") {
+			if err := CopyFile(filepath.Join(dst, e.Name()), filepath.Join(src, e.Name())); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // CopyFile copies a file, e.g. gates.json into the execution directory.

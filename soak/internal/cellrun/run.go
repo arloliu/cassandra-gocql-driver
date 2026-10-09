@@ -33,8 +33,8 @@ import (
 
 // Setup and teardown bounds.
 const (
-	// minDiskGiB is the free space a cell needs to start (PLAN §4.1).
-	minDiskGiB = 20
+	// minDiskGiB is the free space a cell needs to start (PLAN §4.1; v7.17 §59.6: above S5's 26 GiB high-water mark).
+	minDiskGiB = 40
 	// guardDiskGiB is the free space below which a running cell stops as fixture-invalid.
 	guardDiskGiB = 5
 	// openBound bounds the primary CreateSession, which takes no context.
@@ -184,6 +184,8 @@ type cellRun struct {
 	epoch   time.Time
 	nodes   []string
 	addrs   []netip.Addr
+	// dc is the datacenter name, read at setup.
+	dc      string
 	hostIDs map[netip.Addr]string
 	diskLow chan struct{}
 	// stopPIDs stops the pid watcher; pidsDone closes when it has stopped.
@@ -505,7 +507,8 @@ func (r *cellRun) setup(ctx context.Context) bool {
 		return fixture("toxiproxy: %v", err)
 	}
 	r.srv = srv
-	for _, spec := range proxy.NodeSpecs("127.0.1.", clusterNodes) {
+	// node4's proxy exists from the start, before F-topo starts node4 (PLAN §3.3, §59.6).
+	for _, spec := range proxy.NodeSpecs("127.0.1.", clusterNodes+1) {
 		if err := srv.Client().CreateProxy(ctx, spec); err != nil {
 			return fixture("create proxy %s: %v", spec.Name, err)
 		}
@@ -555,6 +558,7 @@ func (r *cellRun) setup(ctx context.Context) bool {
 		}
 	}
 	dc, _, _ := cell.NodeFacts(ctx, r.primary.Session)
+	r.dc = dc
 	if err := workload.CreateSchema(ctx, r.primary.Session, dc); err != nil {
 		return fixture("schema: %v", err)
 	}
@@ -694,7 +698,8 @@ func (r *cellRun) workload(ctx context.Context) {
 	rec := &cell.Recovery{Session: r.primary, Registry: r.reg, Nodes: func() []netip.Addr { return r.addrs }, HostIDs: r.hostIDs,
 		DriverAddrs: r.sampler.DriverAddrs, ProbeKey: workload.Key{P: 1, C: 1}, FDDir: "/proc/self/fd", NetDir: "/proc/net"}
 	builder := &cell.Builder{Cluster: r.cl, Schema: cell.SchemaOps{Session: r.primary.Session}, ProcDir: "/proc",
-		Proxy: r.srv.Client(), Registry: r.reg, Event: func(name string, data any) { r.rec.Event(name, time.Now(), data) }}
+		Proxy: r.srv.Client(), Registry: r.reg, Event: func(name string, data any) { r.rec.Event(name, time.Now(), data) },
+		DC: r.dc, LogDir: filepath.Join(r.dir, "ccm")}
 	ex := &chaos.Executor{Schedule: r.sch, Specs: chaos.Specs(), Start: r.epoch, Build: builder.Build, Recovery: rec,
 		Churn: r.churner.Churn, Windows: r.windows, OnTransition: r.onTransition}
 	exDone := make(chan chaos.Report, 1)
@@ -1011,24 +1016,14 @@ func (r *cellRun) resumePaused(ctx context.Context) error {
 // collectNodeLogs copies each node's system.log and gc logs, and a final nodetool status.
 func (r *cellRun) collectNodeLogs(ctx context.Context) error {
 	var errs []error
-	for _, n := range r.nodes {
-		src := filepath.Join(r.o.CCMConfig, r.cl.Name(), n, "logs")
-		dst := filepath.Join(r.dir, "ccm", n)
-		if err := os.MkdirAll(dst, 0o755); err != nil {
+	nodes := slices.Clone(r.nodes)
+	// node4 is collected when a cell ends while F-topo has it; a removed node4's logs were saved by its removal.
+	if _, err := os.Stat(r.cl.NodeDir(cell.TopoNode)); err == nil {
+		nodes = append(nodes, cell.TopoNode)
+	}
+	for _, n := range nodes {
+		if err := artifact.CopyNodeLogs(filepath.Join(r.dir, "ccm", n), filepath.Join(r.cl.NodeDir(n), "logs")); err != nil {
 			errs = append(errs, err)
-			continue
-		}
-		entries, err := os.ReadDir(src)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		for _, e := range entries {
-			if e.Name() == "system.log" || strings.HasPrefix(e.Name(), "gc.log") {
-				if err := artifact.CopyFile(filepath.Join(dst, e.Name()), filepath.Join(src, e.Name())); err != nil {
-					errs = append(errs, err)
-				}
-			}
 		}
 	}
 	if out, err := r.cl.Nodetool(ctx, "node1", "status"); err == nil {
@@ -1135,7 +1130,8 @@ func (r *cellRun) stopWatchingPIDs() {
 
 func (r *cellRun) recordPIDs() {
 	pids := map[string]int{}
-	for _, n := range r.nodes {
+	// node4 counts while F-topo has it, so the launcher's cleanup knows its process (PLAN §59.6).
+	for _, n := range append(slices.Clone(r.nodes), cell.TopoNode) {
 		if pid, err := r.cl.NodePID(n); err == nil {
 			pids[n] = pid
 		}

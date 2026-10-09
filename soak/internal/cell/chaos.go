@@ -20,7 +20,13 @@ import (
 )
 
 // pinnedTimeout bounds one pinned probe query.
+// TopoNode is the node F-topo adds and removes; its proxy exists from setup (PLAN §3.3, §59.6).
+const TopoNode = "node4"
+
 const pinnedTimeout = 2 * time.Second
+
+// TopoAddr is TopoNode's address; its JMX port is 7000 + 100 × 4, the one the preconditions probe.
+var TopoAddr = netip.MustParseAddr("127.0.1.4")
 
 // SchemaOps runs F-ddl's statements and per-node schema checks on a session.
 type SchemaOps struct {
@@ -68,9 +74,14 @@ type Builder struct {
 	Event func(name string, data any)
 	// ToxicTiming overrides the toxic faults' round bounds; zero keeps toxic.DefaultTiming.
 	ToxicTiming toxic.Timing
+	// DC is the datacenter F-topo's node joins (PLAN §59.6).
+	DC string
+	// LogDir is where F-topo saves node4's logs before removing it; the cell's ccm artifact directory.
+	LogDir string
 
 	ddlSeq   atomic.Int64
 	toxicSeq atomic.Int64
+	topoSeq  atomic.Int64
 }
 
 // Buildable reports whether Builder.Build builds a kind; chaos.Supported extends it to composites (PLAN §59.4).
@@ -79,11 +90,11 @@ type Builder struct {
 //   - k: the kind
 //
 // Returns:
-//   - bool: true for the phase-1 kinds and the toxic kinds
+//   - bool: true for the phase-1 kinds, the toxic kinds and F-topo
 func Buildable(k chaos.Kind) bool {
 	switch k {
 	case chaos.FaultStop, chaos.FaultTwo, chaos.FaultFull, chaos.FaultKill, chaos.FaultPause, chaos.FaultDDL,
-		chaos.FaultLat, chaos.FaultBW, chaos.FaultBlack, chaos.FaultHalfOpen, chaos.FaultReset:
+		chaos.FaultLat, chaos.FaultBW, chaos.FaultBlack, chaos.FaultHalfOpen, chaos.FaultReset, chaos.FaultTopo:
 		return true
 	}
 	return false
@@ -128,6 +139,17 @@ func (b *Builder) Build(p chaos.Planned) (chaos.Fault, error) {
 			return nil, err
 		}
 		return b.toxic(p)
+	case chaos.FaultTopo:
+		if b.DC == "" {
+			return nil, errors.New("F-topo needs the datacenter name")
+		}
+		ops := &topoOps{c: b.Cluster, dc: b.DC, logDir: b.LogDir, seq: int(b.topoSeq.Add(1))}
+		return chaos.NewTopoFault(ops, TopoNode, TopoAddr.String(), b.topoMembership,
+			func(s chaos.TopoStep) {
+				if b.Event != nil {
+					b.Event("topo", s)
+				}
+			}), nil
 	default:
 		return nil, fmt.Errorf("fault kind %s is not implemented", p.Kind)
 	}
@@ -234,4 +256,14 @@ func (b *Builder) toxic(p chaos.Planned) (chaos.Fault, error) {
 		Open: func(ctx context.Context, name string) (toxic.Conn, error) {
 			return proxy.DialProbe(ctx, dialer.DialContext, addr, name)
 		}})
+}
+
+// topoMembership reports whether the primary session lists TopoNode, and whether it is UP.
+func (b *Builder) topoMembership() (present, up bool) {
+	for _, h := range view.HostsOf(b.Schema.Session) {
+		if h.Addr == TopoAddr {
+			return true, h.Up
+		}
+	}
+	return false, false
 }

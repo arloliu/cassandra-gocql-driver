@@ -34,8 +34,11 @@ const (
 	DeadlineSignal = 30 * time.Second
 	// DeadlineQuery bounds status and nodetool.
 	DeadlineQuery = time.Minute
-	// DeadlineRemove bounds ccm remove.
+	// DeadlineRemove bounds ccm remove, of a cluster or of one node.
 	DeadlineRemove = 2 * time.Minute
+	// DeadlineTopology bounds a joining node's start, which waits for its bootstrap, and a decommission:
+	// F-topo's install and remove bounds (PLAN §5.2, §59.6).
+	DeadlineTopology = 8 * time.Minute
 )
 
 // waitDelay bounds how long Run waits for output pipes after the group was killed.
@@ -44,7 +47,23 @@ const waitDelay = 5 * time.Second
 // ErrDeadline is returned when a command outlived its deadline and its process group was killed.
 var ErrDeadline = errors.New("ccmctl: command exceeded its deadline")
 
-var statusLine = regexp.MustCompile(`^(\S+): (\S+)`)
+var (
+	statusLine = regexp.MustCompile(`^(\S+): (\S+)`)
+	// ringLine is a node line of nodetool status: its two-letter state, then its address.
+	ringLine = regexp.MustCompile(`^([UD][NLJM])\s+(\S+)\s`)
+)
+
+// AddSpec is a node that ccm add creates (PLAN §59.6).
+type AddSpec struct {
+	// Node is the ccm node name, e.g. node4.
+	Node string
+	// IP is the node's address, e.g. 127.0.1.4.
+	IP string
+	// JMXPort is the node's JMX port: 7000 + 100 × N, as ccm create gives node N.
+	JMXPort int
+	// DC is the datacenter the node joins.
+	DC string
+}
 
 // Config is the ccm environment.
 type Config struct {
@@ -123,6 +142,23 @@ func ParseStatus(out string) map[string]string {
 		st[m[1]] = m[2]
 	}
 	return st
+}
+
+// ParseRing reads nodetool status: each node's address and its two-letter state, e.g. UN or UJ.
+//
+// Parameters:
+//   - out: the command's output
+//
+// Returns:
+//   - map[string]string: state by address; empty when no node line parses
+func ParseRing(out string) map[string]string {
+	ring := map[string]string{}
+	for line := range strings.Lines(out) {
+		if m := ringLine.FindStringSubmatch(line); m != nil {
+			ring[m[2]] = m[1]
+		}
+	}
+	return ring
 }
 
 // Run executes one ccm command in its own process group.
@@ -230,6 +266,60 @@ func (c *Cluster) Start(ctx context.Context) error {
 	return err
 }
 
+// AddNode adds a node that bootstraps when started (-b); its remote debug port is 0, as ccm create gives
+// its nodes, instead of ccm add's default 2000 (PLAN §59.6).
+//
+// Parameters:
+//   - ctx: bounds the call
+//   - spec: the node
+//
+// Returns:
+//   - error: from ccm
+func (c *Cluster) AddNode(ctx context.Context, spec AddSpec) error {
+	_, err := c.r.Run(ctx, DeadlineNode, "add", spec.Node, "-i", spec.IP, "-j", strconv.Itoa(spec.JMXPort), "-r", "0",
+		"-d", spec.DC, "-b")
+	return err
+}
+
+// NodeJoin starts an added node and waits for the binary protocol, which opens once its bootstrap has ended.
+//
+// Parameters:
+//   - ctx: bounds the call, with DeadlineTopology
+//   - node: e.g. "node4"
+//
+// Returns:
+//   - error: from ccm
+func (c *Cluster) NodeJoin(ctx context.Context, node string) error {
+	_, err := c.r.Run(ctx, DeadlineTopology, node, "start", "--wait-for-binary-proto")
+	return err
+}
+
+// Decommission runs nodetool decommission on a node; it returns once the node has left the ring.
+//
+// Parameters:
+//   - ctx: bounds the call, with DeadlineTopology
+//   - node: e.g. "node4"
+//
+// Returns:
+//   - error: from ccm
+func (c *Cluster) Decommission(ctx context.Context, node string) error {
+	_, err := c.r.Run(ctx, DeadlineTopology, node, "decommission")
+	return err
+}
+
+// RemoveNode stops a node if it runs and deletes it from the cluster.
+//
+// Parameters:
+//   - ctx: bounds the call
+//   - node: e.g. "node4"
+//
+// Returns:
+//   - error: from ccm
+func (c *Cluster) RemoveNode(ctx context.Context, node string) error {
+	_, err := c.r.Run(ctx, DeadlineRemove, node, "remove")
+	return err
+}
+
 // NodeStop stops one node.
 //
 // Parameters:
@@ -330,6 +420,15 @@ func (c *Cluster) Remove(ctx context.Context) error {
 	return err
 }
 
+// NodeDir returns a node's directory under the ccm config dir.
+//
+// Parameters:
+//   - node: e.g. "node4"
+//
+// Returns:
+//   - string: the directory, whether or not it exists
+func (c *Cluster) NodeDir(node string) string { return filepath.Join(c.r.cfg.ConfigDir, c.name, node) }
+
 // NodePID reads one node's Cassandra process id from its ccm pid file.
 //
 // Parameters:
@@ -339,7 +438,7 @@ func (c *Cluster) Remove(ctx context.Context) error {
 //   - int: the pid
 //   - error: when the pid file is missing or malformed
 func (c *Cluster) NodePID(node string) (int, error) {
-	raw, err := os.ReadFile(filepath.Join(c.r.cfg.ConfigDir, c.name, node, "cassandra.pid"))
+	raw, err := os.ReadFile(filepath.Join(c.NodeDir(node), "cassandra.pid"))
 	if err != nil {
 		return 0, fmt.Errorf("pid of %s: %w", node, err)
 	}

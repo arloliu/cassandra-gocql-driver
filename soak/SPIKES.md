@@ -284,3 +284,39 @@ The errors are row 8, so they are admitted inside the window.
   `cmd/server/server.go:70` builds `rand.New(rand.NewSource(cli.seed))` and discards it.
   The latency toxic's jitter draws from the global `math/rand` (`toxics/latency.go:25`), which is seeded at random.
   So the per-chunk jitter is not replayable; the schedule can fix only the latency and the jitter's amplitude.
+
+## S5 — F-topo under load (phase 2)
+
+Date: 2026-10-10. Plan: PLAN v7.17 §59.6, before batch 2.
+Driver and harness: `otter-cache` @ e59980b; the spike's code was throwaway and is deleted, and its logs record every step.
+Raw logs: `tmp/soak-review-2026-09-24/spikes/s5-4.1.12-p4/`, `s5-5.0.3-p5/`, and the host's load every 10 s in `s5-host-load.txt`.
+
+**Fixture.** A fresh 3-node cluster per version (4.1.12 with protocol 4, 5.0.3 with protocol 5), the night's load (1500 ops/s, W = 32) and a 60 min warm-up, since the night's L slot starts at minute 62.5.
+Then three F-topo cycles, two minutes apart, through `chaos.RunLifecycle` with the install and remove bounds widened to 25 min.
+A cycle: `ccm add node4 -i 127.0.1.4 -j 7400 -r 0 -d datacenter1 -b`; `ccm node4 start --wait-for-binary-proto`; wait for UN in node1's `nodetool status` and for the driver to list node4 UP; `ccm node4 decommission`; wait until neither lists it; `ccm node4 remove`; then R1–R3 over the three nodes.
+
+### Results
+
+| Step | 4.1.12, three cycles | 5.0.3, three cycles | Bound |
+|---|---|---|---|
+| install (UN at; the driver had node4 UP at) | 1:21–1:26 (UN 1:11–1:16) | 1:21–1:26 (UN 1:11–1:16) | 8 min |
+| remove (decommission returned at) | 1:15–1:20 (1:12–1:17) | 1:18–1:20 (1:16–1:19) | 8 min |
+| removal to `done` | 10 s each | 10 s each | 90 s |
+| cluster directory, high-water | 26.05 GiB (26 676 MiB), in the warm-up | 26.47 GiB (27 107 MiB), in the warm-up | — |
+
+- Every maximum is under a fifth of its bound.
+- `ccm node4 start --wait-for-binary-proto` returned 4–6 s after UN, and the driver listed node4 UP 5–10 s after UN.
+  Node1's ring dropped node4 46–51 s into the decommission, and the driver dropped it within 5 s of that.
+- In the F-topo windows the terminal errors were row 2 (short-deadline timeouts) and row 4 (LWT cas-unknown), plus one row-8 scan on 4.1.12; none was `unexpected`.
+  G7 stayed 0, G10a and G10b found no violation, and the stream balance was 0 at the end.
+- Re-adding node4 at the same address after its decommission worked in all three cycles on both versions.
+- During the cycles the cluster directory held 6–13 GiB; its high-water marks of about 26 GiB were in the warm-up, against §4.1's estimate of about 3 GiB.
+- Host contention: two fuzz bursts of another session (04:53 and 05:04, CPU pressure up to 64%) fell in 4.1.12's warm-up.
+  That run recorded 511 out-of-window scan deadlines, all outside F-topo's windows; the logs do not attribute each to the bursts.
+  During every cycle the CPU pressure (`some avg10`) peaked at about 17%.
+
+### What it changes in the plan
+
+- §5.2's F-topo bounds (8 min install, 8 min remove) stand; the interview's rule asked for every maximum to be at most half of its bound.
+- `ccm add` needs `-r 0`: its default enables a remote-debug agent on port 2000, which `ccm create` leaves off for nodes 1–3.
+- The free-disk precondition rises from 20 to 40 GiB, and §4.1's estimate is replaced by the measurement.

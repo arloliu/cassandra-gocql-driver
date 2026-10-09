@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 )
 
 // fakeCCM writes a stand-in ccm that records its argv and environment,
@@ -164,4 +166,44 @@ func TestNodePID(t *testing.T) {
 
 	_, err = c.NodePID("node2")
 	require.Error(t, err)
+}
+
+func TestTopologyCommands(t *testing.T) {
+	r, dir := newTestRunner(t)
+	c := r.Cluster("gocql_soak_c50p5")
+	ctx := t.Context()
+	require.NoError(t, c.AddNode(ctx, AddSpec{Node: "node4", IP: "127.0.1.4", JMXPort: 7400, DC: "datacenter1"}))
+	require.NoError(t, c.NodeJoin(ctx, "node4"))
+	require.NoError(t, c.Decommission(ctx, "node4"))
+	require.NoError(t, c.RemoveNode(ctx, "node4"))
+	argv, err := os.ReadFile(filepath.Join(dir, "argv"))
+	require.NoError(t, err)
+	require.Equal(t, strings.Join([]string{
+		"add node4 -i 127.0.1.4 -j 7400 -r 0 -d datacenter1 -b",
+		"node4 start --wait-for-binary-proto",
+		"node4 decommission",
+		"node4 remove",
+	}, "\n")+"\n", string(argv))
+}
+
+func TestParseRing(t *testing.T) {
+	raw, err := os.ReadFile("testdata/nodetool-status-5.0.3.txt")
+	require.NoError(t, err)
+	ring := ParseRing(string(raw))
+	require.Equal(t, map[string]string{"127.0.1.1": "UN", "127.0.1.2": "UN", "127.0.1.3": "UN"}, ring)
+
+	joining := string(raw) + "UJ  127.0.1.4  12.1 MiB   16      ?                 0f3b9d0e-0000-4000-8000-000000000004  rack1\n"
+	require.Equal(t, "UJ", ParseRing(joining)["127.0.1.4"])
+	leaving := string(raw) + "UL  127.0.1.4  301.7 MiB  16      74.9%             0f3b9d0e-0000-4000-8000-000000000004  rack1\n"
+	require.Equal(t, "UL", ParseRing(leaving)["127.0.1.4"])
+	down := string(raw) + "DN  127.0.1.4  301.7 MiB  16      74.9%             0f3b9d0e-0000-4000-8000-000000000004  rack1\n"
+	require.Equal(t, "DN", ParseRing(down)["127.0.1.4"])
+	require.Empty(t, ParseRing("error: connection refused\n"))
+}
+
+// The topology commands' deadline is F-topo's install and remove bounds (PLAN §5.2, §59.6).
+func TestDeadlineTopologyIsFTopoBounds(t *testing.T) {
+	sp := chaos.Specs()[chaos.FaultTopo]
+	require.Equal(t, sp.Install, DeadlineTopology)
+	require.Equal(t, sp.Remove, DeadlineTopology)
 }

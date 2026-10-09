@@ -97,7 +97,7 @@ func runSmoke(ctx context.Context, cfg smokeConfig) (err error) {
 		logf("stop toxiproxy")
 		_ = srv.Stop(context.Background())
 	}()
-	for _, spec := range proxy.NodeSpecs("127.0.1.", 3) {
+	for _, spec := range proxy.NodeSpecs("127.0.1.", 4) {
 		if err := srv.Client().CreateProxy(ctx, spec); err != nil {
 			return err
 		}
@@ -212,7 +212,7 @@ func runSmoke(ctx context.Context, cfg smokeConfig) (err error) {
 		}
 	}()
 	if len(planned) > 0 {
-		runSmokeFaults(ctx, cfg, logf, cl, primary, reg, windows, srv.Client(), planned)
+		runSmokeFaults(ctx, cfg, logf, cl, primary, reg, windows, srv.Client(), dc, planned)
 	}
 	ticker := time.NewTicker(time.Second)
 	deadline := time.After(cfg.duration)
@@ -291,13 +291,13 @@ loop:
 
 // runSmokeFaults runs each listed fault through its real lifecycle, one after another, while the load runs.
 func runSmokeFaults(ctx context.Context, cfg smokeConfig, logf func(string, ...any), cl *ccmctl.Cluster,
-	primary *cell.Session, reg *view.Registry, windows *chaos.Windows, tox *proxy.Client, planned []chaos.Planned) {
+	primary *cell.Session, reg *view.Registry, windows *chaos.Windows, tox *proxy.Client, dc string, planned []chaos.Planned) {
 	nodes := []netip.Addr{netip.MustParseAddr("127.0.1.1"), netip.MustParseAddr("127.0.1.2"), netip.MustParseAddr("127.0.1.3")}
 	rec := &cell.Recovery{Session: primary, Registry: reg, Nodes: func() []netip.Addr { return nodes },
 		DriverAddrs: append(slicesClone(nodes), netip.MustParseAddr("127.0.1.4")), ProbeKey: workload.Key{P: 1, C: 1},
 		FDDir: "/proc/self/fd", NetDir: "/proc/net"}
 	b := &cell.Builder{Cluster: cl, Schema: cell.SchemaOps{Session: primary.Session}, ProcDir: "/proc",
-		Proxy: tox, Registry: reg, Event: func(name string, data any) {
+		Proxy: tox, Registry: reg, DC: dc, LogDir: filepath.Join(cfg.outDir, "ccm"), Event: func(name string, data any) {
 			raw, _ := json.Marshal(data)
 			logf("  event %s %s", name, raw)
 		}}

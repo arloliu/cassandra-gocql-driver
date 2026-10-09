@@ -53,10 +53,16 @@ func TestBuilderToxic(t *testing.T) {
 		require.NoError(t, err, "%s", k)
 		require.IsType(t, &toxic.Fault{}, f)
 	}
-	require.False(t, Buildable(chaos.FaultTopo))
 	require.False(t, Buildable(chaos.FaultRoll), "F-roll is built as its F-stop sub-faults")
-	_, err := b.Build(chaos.Planned{Kind: chaos.FaultTopo})
+	_, err := b.Build(chaos.Planned{Kind: chaos.FaultRoll})
 	require.ErrorContains(t, err, "not implemented")
+	require.True(t, Buildable(chaos.FaultTopo))
+	_, err = b.Build(chaos.Planned{Kind: chaos.FaultTopo})
+	require.ErrorContains(t, err, "datacenter", "F-topo needs the datacenter its node joins")
+	b.DC = "datacenter1"
+	f, err := b.Build(chaos.Planned{Kind: chaos.FaultTopo})
+	require.NoError(t, err)
+	require.IsType(t, &chaos.TopoFault{}, f)
 	_, err = b.Build(chaos.Planned{Kind: chaos.FaultLat, Targets: []string{"proxy2"}, Param: 200})
 	require.ErrorContains(t, err, "not a node name")
 	_, err = b.Build(chaos.Planned{Kind: chaos.FaultLat, Targets: []string{"node2"}})
