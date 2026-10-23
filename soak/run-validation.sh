@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016 # jq programs name their variables in single quotes
-# run-validation.sh runs a validation batch of PLAN §44.1 on c50p5: control-open, the selected canaries, control-close,
+# run-validation.sh runs a validation batch of PLAN §44.1 on one cell: control-open, the selected canaries, control-close,
 # each attempt through run-cells.sh in its own transient unit (PLAN §44.5). It never touches a cluster, a cell's
 # processes, or an execution directory's contents; it reads the artifacts, never an exit code.
 #
 # Usage, a new batch:
-#   soak/run-validation.sh -batch DIR -gates FILE [-date YYYY-MM-DD] [-slots K1,K7,...] [-ccm-config DIR] [-repository DIR]
-#                          [-- <bin/soak cell flags, e.g. -toxiproxy PATH>]
+#   soak/run-validation.sh -batch DIR -gates FILE [-cell ID] [-date YYYY-MM-DD] [-slots K1,K7,...] [-ccm-config DIR]
+#                          [-repository DIR] [-- <bin/soak cell flags, e.g. -toxiproxy PATH>]
 # and a resumed one, which takes everything else from DIR/validation-state.json:
 #   soak/run-validation.sh -batch DIR
 # -slots selects canaries by id; they run in the canonical order of PLAN §44.2,
 # and control-open and control-close always run.
 # Without -slots every canary runs; -slots none runs the two controls only (PLAN §59.7 step 5).
+# -cell picks the cell, c50p5 by default (PLAN §67.6); on any other cell only K9 may run: -slots K9 or -slots none.
 #
 # It must be the main process of its own systemd service unit, and refuses to start otherwise:
 #   systemd-run --user --collect --unit=soak-validation-<date> -p KillMode=mixed -p TimeoutStopSec=2400 \
 #     --working-directory=<repo>/soak -E PATH="<repo>/.ccm-venv/bin:$PATH" -E HOME="$HOME" \
 #     ./run-validation.sh -batch <abs dir> -gates <abs gates.json> -slots K1,K7 \
 #       -- -toxiproxy "$(mise where aqua:Shopify/toxiproxy@2.12.0)/toxiproxy-server"
-# Every attempt is `run-cells.sh -cells c50p5 -mode validate -kind <kind> -out <attempt root> -date <date>
+# Every attempt is `run-cells.sh -cells <cell> -mode validate -kind <kind> -out <attempt root> -date <date>
 # -- -gates <abs> [-canary ID] …` in the unit soak-val-<date>-<slot>-<n>, bound to this one (BindsTo=, After=):
 # `systemctl --user stop` of the batch unit stops the running attempt first, then this runner.
 # TimeoutStopSec=2400 exceeds an attempt unit's 1800.
@@ -48,23 +49,27 @@ SHOW_CALL_S=10
 HELPER_BOUND_S=5
 POLL_S=${RUN_VALIDATION_POLL_S:-5}
 SYSTEMCTL_CMD=${SYSTEMCTL:-systemctl}
-CELL=c50p5
-# The canonical order of PLAN §44.2; soak/cmd/soak's tests check it against the registry.
-CANONICAL=(K1 K2 K3 K4 K5 K6b K7 K8 K10 K11 K12 K13 K15 K16 K17)
+# The cells of the matrix, config.Cells, and the canonical order of PLAN §44.2 and §67.6;
+# soak/cmd/soak's tests check both against the Go code.
+CELLS=(c41p4 c41p5 c50p4 c50p5)
+CANONICAL=(K1 K2 K3 K4 K5 K6a K6b K7 K8 K9 K10 K11 K12 K13 K15 K16 K17)
+# The cell every canary runs on; only K9 also runs on the others (PLAN §67.6).
+DETECTOR_CELL=c50p5
 
 die() {
   echo "run-validation.sh: $1" >&2
   exit "${2:-2}"
 }
 
-BATCH="" GATES="" DATE="" SLOTS_ARG="" CCM_CONFIG="" REPOSITORY="" PASSTHROUGH=() GIVEN=()
+BATCH="" GATES="" CELL_ARG="" DATE="" SLOTS_ARG="" CCM_CONFIG="" REPOSITORY="" PASSTHROUGH=() GIVEN=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-  -batch | -gates | -date | -slots | -ccm-config | -repository)
+  -batch | -gates | -cell | -date | -slots | -ccm-config | -repository)
     [[ $# -ge 2 ]] || die "$1 needs a value"
     case "$1" in
     -batch) BATCH=$2 ;;
     -gates) GATES=$2 ;;
+    -cell) CELL_ARG=$2 ;;
     -date) DATE=$2 ;;
     -slots) SLOTS_ARG=$2 ;;
     -ccm-config) CCM_CONFIG=$2 ;;
@@ -103,6 +108,12 @@ done
 RUNNER_UNIT=${CGROUP##*/}
 
 bj() { timeout -k 2 "$HELPER_BOUND_S" jq "$@"; }
+# is_cell reports whether its argument is exactly one of CELLS.
+is_cell() {
+  local c
+  for c in "${CELLS[@]}"; do [[ "$1" == "$c" ]] && return 0; done
+  return 1
+}
 bwrite() { timeout -k 2 "$HELPER_BOUND_S" tee -- "$1" >/dev/null 2>&1; }
 sctl() { # bound args...: one systemctl call within bound seconds
   local bound=$1
@@ -150,7 +161,7 @@ render_md() {
   local md
   md=$(bj -r '
     def cell: if . == null then "-" elif type == "array" then (if length == 0 then "-" else join(" ") end) else tostring end;
-    "# Validation batch \(.batch.date) on c50p5\n",
+    "# Validation batch \(.batch.date) on \(.batch.cell // "c50p5")\n",
     "Runner `\(.batch.unit)`, gates `\(.batch.gates)`, slots \(.batch.slots | join(", ")).\n",
     (if .batch.terminal != null then "**Terminal: \(.batch.terminal.state)** at \(.batch.terminal.slot): \(.batch.terminal.reason)\n" else empty end),
     "| slot | kind | attempt root | exec dir | seed | status | failing gates | G16 | attempt result | slot result | reasons |",
@@ -165,6 +176,13 @@ if [[ -e "$STATE" ]]; then
   ((${#GIVEN[@]} == 0)) || die "a resumed batch takes its parameters from $STATE; pass only -batch"
   LEDGER=$(bj -c . "$STATE" 2>/dev/null) || die "cannot read $STATE"
   bj -e '.version == 1 and (.slots | type == "array")' >/dev/null 2>&1 <<<"$LEDGER" || die "$STATE is not a validation ledger"
+  # A ledger written before -cell has no cell: its batch could run only on c50p5 (PLAN §67.6, CA04).
+  # Any recorded value, null included, must be exactly a cell, checked on the JSON value before the shell sees it.
+  cellsJSON=$(jarr "${CELLS[@]}") || die "cannot encode the cells"
+  CELL=$(bj -r --argjson cells "$cellsJSON" '.batch | (if has("cell") then .cell else "c50p5" end) as $c
+      | if any($cells[]; . == $c) then $c else error("not a cell") end' <<<"$LEDGER" 2>/dev/null) ||
+    die "$STATE records cell $(bj -c '.batch.cell' <<<"$LEDGER" 2>/dev/null), which is not one of ${CELLS[*]}"
+  is_cell "$CELL" || die "$STATE records cell $CELL, which is not one of ${CELLS[*]}"
   RESUMED=1
 else
   [[ -n "$GATES" ]] || die "-gates is required for a new batch"
@@ -174,6 +192,11 @@ else
   [[ "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "bad date $DATE"
   [[ -z "$CCM_CONFIG" || "$CCM_CONFIG" == /* ]] || die "-ccm-config must be an absolute path"
   [[ -z "$REPOSITORY" || "$REPOSITORY" == /* ]] || die "-repository must be an absolute path"
+  CELL=${CELL_ARG:-$DETECTOR_CELL}
+  is_cell "$CELL" || die "unknown cell $CELL (one of ${CELLS[*]})"
+  if [[ "$CELL" != "$DETECTOR_CELL" && "$SLOTS_ARG" != none && "$SLOTS_ARG" != K9 ]]; then
+    die "on $CELL only K9 runs (-slots K9 or -slots none); the detector canaries run on $DETECTOR_CELL"
+  fi
   declare -A want=()
   if [[ "$SLOTS_ARG" == none ]]; then
     : # the controls only (PLAN §59.7 step 5): want stays empty
@@ -200,12 +223,12 @@ else
   slotsJSON=$(jarr "${slots[@]}") || die "cannot encode the slots"
   canariesJSON=$(printf '%s\n' "${canaries[@]}" | bj -Rsc 'split("\n") | .[:-1]') || die "cannot encode the canaries"
   passJSON=$(jarr "${PASSTHROUGH[@]}") || die "cannot encode the passthrough"
-  LEDGER=$(bj -nc --arg unit "$RUNNER_UNIT" --arg date "$DATE" --arg gates "$GATES" --arg batch "$BATCH" \
+  LEDGER=$(bj -nc --arg unit "$RUNNER_UNIT" --arg date "$DATE" --arg gates "$GATES" --arg batch "$BATCH" --arg cell "$CELL" \
     --arg ccm "$CCM_CONFIG" --arg repo "$REPOSITORY" --argjson slots "$slotsJSON" --argjson canaries "$canariesJSON" \
     --argjson pass "$passJSON" '
     {version: 1,
-     batch: {unit: $unit, date: $date, gates: $gates, dir: $batch, ccm_config: $ccm, repository: $repo, passthrough: $pass,
-             slots: $slots, terminal: null},
+     batch: {unit: $unit, date: $date, gates: $gates, dir: $batch, cell: $cell, ccm_config: $ccm, repository: $repo,
+             passthrough: $pass, slots: $slots, terminal: null},
      slots: [range(0; $slots | length) as $i | {slot: $slots[$i], canary: $canaries[$i],
              kind: (if $canaries[$i] == "" then "control" else $slots[$i] end), attempts: [], rerun_owed: false, effective: null}]}') ||
     die "cannot build the ledger"

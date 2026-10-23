@@ -127,7 +127,7 @@ func TestJudgeK7FromErrorsJSONL(t *testing.T) {
 	op := env.RecordCanaryError(errors.New("canary"))
 	r.canaryEvent(canary.Event{Canary: "K7", Kind: canary.KindInject, Time: time.Now(), OpID: op})
 	r.close(t)
-	got := judgeRun(r.dir, "K7", failing("G8"), Evidence{Complete: true})
+	got := judgeRun(r.dir, "K7", failing("G8"), Evidence{Complete: true}, nil)
 	require.Equal(t, canary.Validated, got.Result, "%v", got.Reasons)
 
 	// Inside a window only: the assertion fails.
@@ -137,7 +137,7 @@ func TestJudgeK7FromErrorsJSONL(t *testing.T) {
 	op = env.RecordCanaryError(errors.New("canary"))
 	r.canaryEvent(canary.Event{Canary: "K7", Kind: canary.KindInject, Time: time.Now(), OpID: op})
 	r.close(t)
-	got = judgeRun(r.dir, "K7", failing("G8"), Evidence{Complete: true})
+	got = judgeRun(r.dir, "K7", failing("G8"), Evidence{Complete: true}, nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 	require.Contains(t, strings.Join(got.Reasons, "\n"), "class unknown")
 }
@@ -166,7 +166,7 @@ func TestJudgeK15K17FromTheCoverageEvent(t *testing.T) {
 		r := newRecorded(t)
 		r.rec.Event("coverage", time.Now(), coverageEvent{Settlement: tc.totals, ErrorClasses: map[string]int64{}})
 		r.close(t)
-		got := judgeRun(r.dir, tc.id, tc.v, Evidence{Complete: true})
+		got := judgeRun(r.dir, tc.id, tc.v, Evidence{Complete: true}, nil)
 		require.Equal(t, tc.ok, got.Result == canary.Validated, "%s %+v: %v", tc.id, tc.totals, got.Reasons)
 	}
 }
@@ -175,14 +175,14 @@ func TestJudgeK15K17FromTheCoverageEvent(t *testing.T) {
 func TestJudgeMissingOrAlteredInputs(t *testing.T) {
 	r := newRecorded(t)
 	r.close(t)
-	got := judgeRun(r.dir, "K15", failing("G15"), Evidence{Complete: true})
+	got := judgeRun(r.dir, "K15", failing("G15"), Evidence{Complete: true}, nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 	require.Contains(t, strings.Join(got.Reasons, "\n"), "coverage")
 
 	r = newRecorded(t)
 	r.close(t)
 	require.NoError(t, os.Remove(filepath.Join(r.dir, "events.jsonl")))
-	got = judgeRun(r.dir, "K8", failing("G10"), Evidence{Complete: true})
+	got = judgeRun(r.dir, "K8", failing("G10"), Evidence{Complete: true}, nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 	require.Contains(t, strings.Join(got.Reasons, "\n"), "events.jsonl")
 
@@ -191,7 +191,7 @@ func TestJudgeMissingOrAlteredInputs(t *testing.T) {
 	r.close(t)
 	line := `{"t":1,"time":"2026-09-27T10:00:00Z","kind":"coverage","data":{"settlement":{"PrefetchUnproven":0},"short_deadline_timeouts":0,"error_classes":{}}}` + "\n"
 	require.NoError(t, os.WriteFile(filepath.Join(r.dir, "events.jsonl"), []byte(line), 0o644))
-	got = judgeRun(r.dir, "K15", failing("G15"), Evidence{Complete: true})
+	got = judgeRun(r.dir, "K15", failing("G15"), Evidence{Complete: true}, nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 	require.Contains(t, strings.Join(got.Reasons, "\n"), "not what the harness writes")
 
@@ -199,8 +199,8 @@ func TestJudgeMissingOrAlteredInputs(t *testing.T) {
 	r = newRecorded(t)
 	r.close(t)
 	require.NoError(t, os.RemoveAll(r.dir))
-	require.Equal(t, canary.Validated, judgeRun(r.dir, "", failing(), Evidence{Complete: true}).Result)
-	require.Equal(t, canary.Validated, judgeRun(r.dir, "K4", failing("G3"), Evidence{Complete: true}).Result)
+	require.Equal(t, canary.Validated, judgeRun(r.dir, "", failing(), Evidence{Complete: true}, nil).Result)
+	require.Equal(t, canary.Validated, judgeRun(r.dir, "K4", failing("G3"), Evidence{Complete: true}, nil).Result)
 }
 
 // K12: a G0 failure is fixture-invalid from G0 alone with G16 not evaluated, which rule 2 validates.
@@ -208,12 +208,12 @@ func TestK12ThroughEvaluate(t *testing.T) {
 	c := Collected{Mode: gate.ModeValidate, G0Checked: true, G0: []string{"127.0.1.1 release_version 5.0.3, want 0.0.0-k12"}}
 	v := Evaluate(c)
 	require.Equal(t, gate.VerdictFixtureInvalid, v.Status)
-	got := judgeRun(t.TempDir(), "K12", v, EvidenceOf(v, c.Incomplete))
+	got := judgeRun(t.TempDir(), "K12", v, EvidenceOf(v, c.Incomplete), nil)
 	require.Equal(t, canary.Validated, got.Result, "%v", got.Reasons)
 
 	c.Incomplete = []string{"artifact events.jsonl: write failed"}
 	v = Evaluate(c)
-	require.Equal(t, canary.NotValidated, judgeRun(t.TempDir(), "K12", v, EvidenceOf(v, c.Incomplete)).Result)
+	require.Equal(t, canary.NotValidated, judgeRun(t.TempDir(), "K12", v, EvidenceOf(v, c.Incomplete), nil).Result)
 }
 
 // The validation object roundtrips through VerdictFile, and a night verdict has none (PLAN §44.8).
@@ -249,8 +249,8 @@ func TestPrepareCanary(t *testing.T) {
 	require.ErrorContains(t, newPrepareRun(o).prepare(), "validation mode")
 
 	o = prepareOptions(t, "20260927T113426Z-1a4f")
-	o.Canary = "K9"
-	require.ErrorContains(t, newPrepareRun(o).prepare(), "K9")
+	o.Canary = "K14"
+	require.ErrorContains(t, newPrepareRun(o).prepare(), "K14")
 }
 
 // Every events.jsonl line is strict-decoded before it is dispatched: a corrupt line beside sufficient valid evidence
@@ -269,13 +269,13 @@ func TestJudgeRefusesACorruptLineBesideValidEvidence(t *testing.T) {
 		op := env.RecordCanaryError(errors.New("canary"))
 		r.canaryEvent(canary.Event{Canary: "K7", Kind: canary.KindInject, Time: time.Now(), OpID: op})
 		r.close(t)
-		require.Equal(t, canary.Validated, judgeRun(r.dir, "K7", failing("G8"), Evidence{Complete: true}).Result, name)
+		require.Equal(t, canary.Validated, judgeRun(r.dir, "K7", failing("G8"), Evidence{Complete: true}, nil).Result, name)
 		f, err := os.OpenFile(filepath.Join(r.dir, "events.jsonl"), os.O_APPEND|os.O_WRONLY, 0)
 		require.NoError(t, err)
 		_, err = f.WriteString(bad)
 		require.NoError(t, err)
 		require.NoError(t, f.Close())
-		got := judgeRun(r.dir, "K7", failing("G8"), Evidence{Complete: true})
+		got := judgeRun(r.dir, "K7", failing("G8"), Evidence{Complete: true}, nil)
 		require.Equal(t, canary.NotValidated, got.Result, name)
 		require.Contains(t, strings.Join(got.Reasons, "\n"), "events.jsonl line 2", name)
 	}
@@ -294,14 +294,14 @@ func TestK11ThroughEvaluate(t *testing.T) {
 	ev := EvidenceOf(v, nil)
 	spec, _ := canary.Lookup("K11")
 	require.Equal(t, spec.Declared, ev.Problems)
-	got := judgeRun(t.TempDir(), "K11", v, ev)
+	got := judgeRun(t.TempDir(), "K11", v, ev, nil)
 	require.Equal(t, canary.Validated, got.Result, "%v", got.Reasons)
 
 	// Without the drop, G11 passes: not validated.
 	c = green()
 	delete(c.CooldownP99, "lwt")
 	v = Evaluate(c)
-	require.Equal(t, canary.NotValidated, judgeRun(t.TempDir(), "K11", v, EvidenceOf(v, nil)).Result)
+	require.Equal(t, canary.NotValidated, judgeRun(t.TempDir(), "K11", v, EvidenceOf(v, nil), nil).Result)
 }
 
 // K13's F-stop is pinned to node2 after chaos.Plan, and schedule.json holds the pinned schedule (PLAN §44.5);
@@ -358,7 +358,7 @@ func TestK13ThroughEvaluate(t *testing.T) {
 	require.Len(t, c.Dials9042, 1)
 	v := Evaluate(c)
 	require.Equal(t, []string{"G5"}, v.FailingGates)
-	got := judgeRun(r.dir, "K13", v, EvidenceOf(v, nil))
+	got := judgeRun(r.dir, "K13", v, EvidenceOf(v, nil), nil)
 	require.Equal(t, canary.Validated, got.Result, "%v", got.Reasons)
 	good := v
 
@@ -366,14 +366,14 @@ func TestK13ThroughEvaluate(t *testing.T) {
 	c.Dials9042 = []string{"dial to 127.0.1.3:9042 at " + time.Now().Format(time.RFC3339)}
 	v = Evaluate(c)
 	require.Equal(t, []string{"G5"}, v.FailingGates)
-	got = judgeRun(r.dir, "K13", v, EvidenceOf(v, nil))
+	got = judgeRun(r.dir, "K13", v, EvidenceOf(v, nil), nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 	require.Contains(t, strings.Join(got.Reasons, "\n"), "127.0.1.2:9042")
 
 	// Nor is G5's rewritten dial without K13's own records.
 	empty := newRecorded(t)
 	empty.close(t)
-	got = judgeRun(empty.dir, "K13", good, EvidenceOf(good, nil))
+	got = judgeRun(empty.dir, "K13", good, EvidenceOf(good, nil), nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 }
 
@@ -419,7 +419,7 @@ func TestK10ThroughEvaluate(t *testing.T) {
 	require.ElementsMatch(t, []string{"G12", "G13"}, v.FailingGates)
 	r := newRecorded(t)
 	r.close(t)
-	got := judgeRun(r.dir, "K10", v, EvidenceOf(v, nil))
+	got := judgeRun(r.dir, "K10", v, EvidenceOf(v, nil), nil)
 	require.Equal(t, canary.Validated, got.Result, "%v", got.Reasons)
 
 	// The same failing gates through another group's drift: not K10's detection.
@@ -433,7 +433,7 @@ func TestK10ThroughEvaluate(t *testing.T) {
 	c.G12.After = map[string]int{"main": 2, "main.other": 150}
 	v = Evaluate(c)
 	require.ElementsMatch(t, []string{"G12", "G13"}, v.FailingGates)
-	got = judgeRun(r.dir, "K10", v, EvidenceOf(v, nil))
+	got = judgeRun(r.dir, "K10", v, EvidenceOf(v, nil), nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 	require.Contains(t, strings.Join(got.Reasons, "\n"), canary.K10Group)
 }
@@ -455,7 +455,7 @@ func TestK16ThroughEvaluate(t *testing.T) {
 	c.CooldownP99["read"] = c.WarmupP99["read"] * 3
 	v := Evaluate(c)
 	require.Equal(t, []string{"G14"}, v.FailingGates)
-	got := judgeRun(r.dir, "K16", v, EvidenceOf(v, nil))
+	got := judgeRun(r.dir, "K16", v, EvidenceOf(v, nil), nil)
 	require.Equal(t, canary.Validated, got.Result, "%v", got.Reasons)
 
 	// Too few delayed completions in one class: not validated through the assertion, with G14 still failing.
@@ -464,7 +464,7 @@ func TestK16ThroughEvaluate(t *testing.T) {
 	low["lwt"] = canary.ClassCounts{Total: 4000, Delayed: 59}
 	short.canaryEvent(canary.Event{Canary: "K16", Kind: canary.KindFinalCounts, Time: time.Now(), Counts: low})
 	short.close(t)
-	got = judgeRun(short.dir, "K16", v, EvidenceOf(v, nil))
+	got = judgeRun(short.dir, "K16", v, EvidenceOf(v, nil), nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 	require.Contains(t, strings.Join(got.Reasons, "\n"), "class lwt: 59 of 4000")
 
@@ -473,7 +473,7 @@ func TestK16ThroughEvaluate(t *testing.T) {
 	bad.close(t)
 	line := `{"t":1,"time":"2026-09-28T10:00:00Z","kind":"canary","data":{"canary":"K16","kind":"final-counts","time":"2026-09-28T10:00:00Z","counts":{"lwt":{"total":4000}}}}` + "\n"
 	require.NoError(t, os.WriteFile(filepath.Join(bad.dir, "events.jsonl"), []byte(line), 0o644))
-	got = judgeRun(bad.dir, "K16", v, EvidenceOf(v, nil))
+	got = judgeRun(bad.dir, "K16", v, EvidenceOf(v, nil), nil)
 	require.Equal(t, canary.NotValidated, got.Result)
 	require.Contains(t, strings.Join(got.Reasons, "\n"), "not what the harness writes")
 
@@ -481,7 +481,7 @@ func TestK16ThroughEvaluate(t *testing.T) {
 	c.Windows = append(c.Windows, gate.Interval{Start: 6400, End: 6500})
 	v = Evaluate(c)
 	require.Equal(t, gate.StatusNotEvaluated, statusOf(v, "G14"))
-	require.Equal(t, canary.NotValidated, judgeRun(r.dir, "K16", v, EvidenceOf(v, nil)).Result)
+	require.Equal(t, canary.NotValidated, judgeRun(r.dir, "K16", v, EvidenceOf(v, nil), nil).Result)
 }
 
 // Every canary whose extra assertion rejects empty records is judged through it: with its must-fail gates fired and
@@ -495,9 +495,9 @@ func TestEveryAssertionIsJudged(t *testing.T) {
 		asserted = append(asserted, s.ID)
 		r := newRecorded(t)
 		r.close(t)
-		got := judgeRun(r.dir, s.ID, failing(s.MustFail...), Evidence{Complete: true})
+		got := judgeRun(r.dir, s.ID, failing(s.MustFail...), Evidence{Complete: true}, nil)
 		require.Equal(t, canary.NotValidated, got.Result, s.ID)
 		require.Contains(t, strings.Join(got.Reasons, "\n"), "extra assertion", s.ID)
 	}
-	require.Equal(t, []string{"K7", "K8", "K10", "K13", "K15", "K16", "K17"}, asserted)
+	require.Equal(t, []string{"K6a", "K7", "K8", "K9", "K10", "K13", "K15", "K16", "K17"}, asserted)
 }

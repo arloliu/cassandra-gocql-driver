@@ -91,8 +91,24 @@ if wanted reject; then
   run reject2 -gates "$GATES" -slots K7,K7
   check "a duplicate slot exits 2" test "$EXIT" = 2
   newbatch reject3
-  run reject3 -gates "$GATES" -slots K9
+  run reject3 -gates "$GATES" -slots K14
   check "an unknown canary exits 2" test "$EXIT" = 2
+  (cd "$SOAK_DIR" && ./run-validation.sh -batch "$ROOT/x" -- -cell c41p4 >/dev/null 2>&1)
+  check "-cell after -- exits 2" test $? -eq 2
+  newbatch reject6
+  run reject6 -gates "$GATES" -cell c99p9 -slots K9
+  check "an unknown cell exits 2" test "$EXIT" = 2
+  newbatch reject9
+  run reject9 -gates "$GATES" -cell "c41p4 c41p5" -slots K9
+  check "two cells joined by a space exit 2" test "$EXIT" = 2
+  check "and nothing was recorded" test ! -e "$ROOT/reject9/validation-state.json"
+  newbatch reject7
+  run reject7 -gates "$GATES" -cell c41p4 -slots K9,K7
+  check "a canary other than K9 off c50p5 exits 2" test "$EXIT" = 2
+  newbatch reject8
+  run reject8 -gates "$GATES" -cell c41p4
+  check "every canary off c50p5 exits 2" test "$EXIT" = 2
+  check "and nothing was recorded" test ! -e "$ROOT/reject8/validation-state.json"
   newbatch reject5
   run reject5 -gates "$GATES" -slots none,K7
   check "none with a canary exits 2" test "$EXIT" = 2
@@ -108,6 +124,8 @@ if wanted pass; then
   run pass -date "$DATE" -gates "$GATES" -slots K7,K1 -- -toxiproxy /opt/toxi
   check "exit 0" test "$EXIT" = 0
   check "slots in canonical order" lq '.batch.slots == ["control-open", "k1", "k7", "control-close"]'
+  check "the default cell, c50p5, recorded" lq '.batch.cell == "c50p5"'
+  check "k7: -cells c50p5" grep -qzP -- "^-cells\nc50p5\n" "$BATCH/attempts/k7-1/args"
   check "every slot validated in one attempt" lq 'all(.slots[]; .effective.result == "validated" and (.attempts | length) == 1)'
   check "attempts recorded with unit, root, summary, token and exec dir" lq \
     'all(.slots[].attempts[]; .state == "resolved" and (.unit | test("^soak-val-2026-09-27-")) and (.summary | test("/night-"))
@@ -129,6 +147,70 @@ if wanted controls; then
   check "exit 0" test "$EXIT" = 0
   check "exactly the two controls" lq '.batch.slots == ["control-open", "control-close"]'
   check "both validated" lq 'all(.slots[]; .effective.result == "validated" and (.attempts | length) == 1)'
+fi
+
+if wanted cell; then
+  echo "cell: -cell c41p4 -slots K9 runs the controls and K9 on c41p4 (PLAN §67.6)"
+  newbatch cell
+  run cell -date "$DATE" -gates "$GATES" -cell c41p4 -slots K9
+  check "exit 0" test "$EXIT" = 0
+  check "the cell recorded" lq '.batch.cell == "c41p4"'
+  check "control-open, k9, control-close" lq '.batch.slots == ["control-open", "k9", "control-close"]'
+  check "every slot validated" lq 'all(.slots[]; .effective.result == "validated" and (.attempts | length) == 1)'
+  for a in control-open-1 k9-1 control-close-1; do
+    check "$a: -cells c41p4" grep -qzP -- "^-cells\nc41p4\n" "$BATCH/attempts/$a/args"
+  done
+  check "exec dirs under the cell" lq 'all(.slots[].attempts[]; .exec_dir | test("/soak-2026-09-27/c41p4/"))'
+  check "validation.md names the cell" grep -q "on c41p4" "$BATCH/validation.md"
+  newbatch cell-controls
+  run cell-controls -date "$DATE" -gates "$GATES" -cell c50p4 -slots none
+  check "-slots none off c50p5 exits 0" test "$EXIT" = 0
+  check "two controls on c50p4" lq '.batch.cell == "c50p4" and .batch.slots == ["control-open", "control-close"]'
+
+  echo "cell: a summary whose cell is not the ledger's is unresolved at layer cell"
+  newbatch cell-mismatch
+  FAKE_VPLAN="k9-1=cell-mismatch" run cell-mismatch -date "$DATE" -gates "$GATES" -cell c41p4 -slots K9 >/dev/null
+  check "exit 3, unresolved at layer cell" bash -c "test '$EXIT' = 3 && jq -e '.slots[1].attempts[0] | .state == \"unresolved\" and .layer == \"cell\"' '$BATCH/validation-state.json' >/dev/null"
+
+  echo "cell: a resumed batch takes its cell from the ledger"
+  newbatch cell-resume
+  ledger control-open k9 control-close
+  ledger_edit '.batch.cell = "c41p4"'
+  run cell-resume
+  check "exit 0" test "$EXIT" = 0
+  check "every attempt on c41p4" bash -c "grep -qzP -- '^-cells\nc41p4\n' '$BATCH/attempts/k9-1/args' && grep -qzP -- '^-cells\nc41p4\n' '$BATCH/attempts/control-close-1/args'"
+  newbatch cell-resume-flag
+  ledger control-open k9 control-close
+  run cell-resume-flag -cell c41p4
+  check "-cell on a resumed batch exits 2" test "$EXIT" = 2
+  newbatch cell-resume-unknown
+  ledger control-open k9 control-close
+  ledger_edit '.batch.cell = "c99p9"'
+  run cell-resume-unknown
+  check "a recorded cell outside the matrix exits 2" test "$EXIT" = 2
+  check "nothing submitted" test "$(attempts control-open)" = 0
+  n=0
+  for v in '"c41p4 c41p5"' '"c41p4\n"' null false '["c50p5"]'; do
+    n=$((n + 1))
+    newbatch "cell-resume-bad-$n"
+    ledger control-open k9 control-close
+    ledger_edit ".batch.cell = $v"
+    run "cell-resume-bad-$n"
+    check "a recorded cell $v exits 2" test "$EXIT" = 2
+    check "and nothing was submitted" test "$(attempts control-open)" = 0
+  done
+
+  echo "cell: a version-1 ledger without a cell resumes as c50p5, a submitted attempt included (PLAN §67.6, CA04)"
+  newbatch cell-legacy
+  ledger control-open k7 control-close
+  check "the ledger has no cell" lq '.batch | has("cell") | not'
+  mkdir -p "$BATCH/attempts/control-open-1"
+  "$HERE/fake-run-cells.sh" -cells c50p5 -mode validate -kind control -out "$BATCH/attempts/control-open-1" -date "$DATE" -- -gates "$GATES" >/dev/null
+  submitted "$BATCH/attempts/control-open-1"
+  run cell-legacy
+  check "exit 0" test "$EXIT" = 0
+  check "the submitted attempt resolved as c50p5's" lq '.slots[0].attempts | length == 1 and .[0].state == "resolved" and .[0].result == "validated"'
+  check "the next attempts ran on c50p5" grep -qzP -- "^-cells\nc50p5\n" "$BATCH/attempts/k7-1/args"
 fi
 
 if wanted dotted; then
@@ -182,7 +264,7 @@ if wanted layers; then
     no-summary:summary cell-problem:cell cell-main:cell launcher2:cell receipt-unproven:receipt foreign-execdir:receipt \
     linked-execdir:receipt report-unresolved:report report-exit:report verdict-nonfinal:verdict verdict-canary:verdict \
     verdict-mismatch:verdict linked-verdict:verdict config-missing:config config-linked:config config-noseed:config \
-    config-nested:config config-fraction:config config-overflow:config config-fifo:config; do
+    config-nested:config config-fraction:config config-overflow:config config-fifo:config cell-mismatch:cell; do
     b=${c%%:*} layer=${c#*:}
     newbatch "layer-$b"
     FAKE_VPLAN="k7-1=$b" run "layer-$b" -date "$DATE" -gates "$GATES" -slots K7 >/dev/null

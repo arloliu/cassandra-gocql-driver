@@ -129,8 +129,8 @@ func TestCriticalG13(t *testing.T) {
 	churns := []ChurnResidue{churn(0, 1), churn(1, 5), churn(2, 2), churn(3, 4), {Slot: "C", Index: 4}}
 	kC, kCh := G13Critical(churns)
 	require.InDelta(t, 5, kC.Value, 0)
-	requireBoundary(t, kC, func(k float64) Status { return G13(churns[:4], nil, with(KC, k)).Status })
-	requireBoundary(t, kCh, func(k float64) Status { return G13(churns[:4], nil, with(KCh, k)).Status })
+	requireBoundary(t, kC, func(k float64) Status { return G13(churns[:4], nil, with(KC, k), ModeNight).Status })
+	requireBoundary(t, kCh, func(k float64) Status { return G13(churns[:4], nil, with(KCh, k), ModeNight).Status })
 
 	kC, kCh = G13Critical([]ChurnResidue{{Index: 0}})
 	require.False(t, kC.OK, "an unmeasured churn gives nothing")

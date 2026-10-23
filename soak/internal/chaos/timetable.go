@@ -119,6 +119,19 @@ type Planned struct {
 	Mandatory bool `json:"mandatory"`
 	// Param is F-lat's latency in ms or F-bw's rate in KB/s, drawn by the seed (PLAN §59.4).
 	Param int `json:"param,omitempty"`
+	// Pinned marks a fault whose parameter and active duration were fixed after the draw (PLAN §67.3);
+	// Preflight bounds it by its own active duration.
+	Pinned bool `json:"pinned,omitempty"`
+}
+
+// Pin is a fault in a slot of its own whose parameter and active duration are fixed, not drawn (K6a, PLAN §67.3).
+type Pin struct {
+	// Slot is the pinned fault's slot.
+	Slot Slot `json:"slot"`
+	// Kind is the fault kind; Param its parameter; Active its active duration.
+	Kind   Kind          `json:"kind"`
+	Param  int           `json:"param"`
+	Active time.Duration `json:"active"`
 }
 
 // Schedule is the seeded plan of a cell, written to schedule.json.
@@ -220,6 +233,59 @@ func ValidationTimetable() []Slot {
 		{"V2", SlotShort, minutes(27.5), minutes(35)},
 		{"C3", SlotChurn, minutes(35), minutes(37.5)},
 	}
+}
+
+// PinSlot adds a pinned fault's slot to a fixed timetable, and its kind to the fixed faults, both in start order.
+//
+// Parameters:
+//   - slots: the timetable
+//   - faults: the fixed faults, one per short slot in slot order
+//   - p: the pin
+//
+// Returns:
+//   - []Slot: the timetable with the pin's slot, sorted by start
+//   - []Kind: the fixed faults with the pin's kind at its slot's place
+func PinSlot(slots []Slot, faults []Kind, p Pin) ([]Slot, []Kind) {
+	out := append(slices.Clone(slots), p.Slot)
+	slices.SortStableFunc(out, func(a, b Slot) int { return int(a.Start - b.Start) })
+	var kinds []Kind
+	next := 0
+	for _, sl := range out {
+		switch {
+		case sl.Kind != SlotShort:
+		case sl.ID == p.Slot.ID:
+			kinds = append(kinds, p.Kind)
+		case next < len(faults):
+			kinds = append(kinds, faults[next])
+			next++
+		}
+	}
+	return out, append(kinds, faults[next:]...)
+}
+
+// ApplyPin fixes the planned fault in a pin's slot to the pin's parameter and active duration, and marks it pinned;
+// its targets stay drawn.
+//
+// Parameters:
+//   - sch: the planned schedule; it is not modified
+//   - p: the pin
+//
+// Returns:
+//   - Schedule: the schedule with the pinned fault
+//   - error: when the slot holds no planned fault of the pin's kind
+func ApplyPin(sch Schedule, p Pin) (Schedule, error) {
+	sch.Mandatory = slices.Clone(sch.Mandatory)
+	for i, pl := range sch.Mandatory {
+		if pl.Slot != p.Slot.ID {
+			continue
+		}
+		if pl.Kind != p.Kind {
+			return Schedule{}, fmt.Errorf("pin: slot %s holds %s, not %s", p.Slot.ID, pl.Kind, p.Kind)
+		}
+		sch.Mandatory[i].Param, sch.Mandatory[i].Active, sch.Mandatory[i].Pinned = p.Param, p.Active, true
+		return sch, nil
+	}
+	return Schedule{}, fmt.Errorf("pin: no planned fault in slot %s", p.Slot.ID)
 }
 
 // PhaseOneOptional returns the kinds a phase-1 night draws optional faults from: the short kinds, F-ddl excluded (M0 only).
@@ -391,7 +457,15 @@ func Preflight(sch Schedule, end time.Duration, specs map[Kind]Spec) error {
 			errs = append(errs, fmt.Errorf("slot %s: unknown fault kind %s", p.Slot, p.Kind))
 			continue
 		}
-		worst := OuterDeadline(specs, p.Kind, specs[p.Kind].ActiveMax)
+		active := specs[p.Kind].ActiveMax
+		if p.Pinned {
+			// A pinned fault runs its own active duration, which need not be within the catalog's (PLAN §67.3).
+			if active = p.Active; active <= 0 {
+				errs = append(errs, fmt.Errorf("slot %s: pinned %s has no active duration", p.Slot, p.Kind))
+				continue
+			}
+		}
+		worst := OuterDeadline(specs, p.Kind, active)
 		if worst > sl.End-sl.Start {
 			errs = append(errs, fmt.Errorf("slot %s: %s worst-case outer deadline %s exceeds the slot's %s",
 				p.Slot, p.Kind, worst, sl.End-sl.Start))

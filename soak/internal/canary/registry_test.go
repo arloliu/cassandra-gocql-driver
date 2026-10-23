@@ -7,16 +7,17 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/workload"
 )
 
-// The registry is PLAN §44.2 as data: every phase-1 canary, in the table's order.
+// The registry is PLAN §44.2 as data, with §67's K6a and K9: every live canary, in the canonical order.
 func TestRegistryIsTheCanaryTable(t *testing.T) {
 	var ids []string
 	for _, s := range All() {
 		ids = append(ids, s.ID)
 	}
-	require.Equal(t, []string{"K1", "K2", "K3", "K4", "K5", "K6b", "K7", "K8", "K10", "K11", "K12", "K13", "K15", "K16", "K17"}, ids)
+	require.Equal(t, []string{"K1", "K2", "K3", "K4", "K5", "K6a", "K6b", "K7", "K8", "K9", "K10", "K11", "K12", "K13", "K15", "K16", "K17"}, ids)
 
 	type row struct {
 		start          time.Duration
@@ -32,9 +33,11 @@ func TestRegistryIsTheCanaryTable(t *testing.T) {
 		"K3":  {min(12), []string{"G4"}, []string{"G12"}, nil, true, false},
 		"K4":  {min(12), []string{"G3"}, []string{"G14"}, nil, true, false},
 		"K5":  {min(12), []string{"G7"}, nil, nil, true, false},
+		"K6a": {0, nil, nil, nil, true, false},
 		"K6b": {min(12), []string{"G6"}, nil, nil, true, false},
 		"K7":  {min(12), []string{"G8"}, nil, nil, true, false},
 		"K8":  {min(12), []string{"G10"}, nil, nil, true, false},
+		"K9":  {0, []string{"G9"}, nil, nil, true, false},
 		"K10": {0, []string{"G12", "G13"}, []string{"G2"}, nil, true, false},
 		"K11": {min(20), []string{"G11"}, []string{"G14"}, []string{"G14: missing evidence: class lwt has no cool-down p99"}, true, false},
 		"K12": {0, nil, nil, nil, true, true},
@@ -57,6 +60,14 @@ func TestRegistryIsTheCanaryTable(t *testing.T) {
 			require.Contains(t, s.Collateral, gate, "%s: a declared evidence entry belongs to a collateral gate", s.ID)
 		}
 		require.Empty(t, intersect(s.MustFail, s.Collateral), s.ID)
+		wantExcluded := map[string]string(nil)
+		if s.ID == "K9" {
+			wantExcluded = map[string]string{"G14": "cool-down contaminated"}
+		}
+		require.Equal(t, wantExcluded, s.Excluded, s.ID)
+		for g := range s.Excluded {
+			require.NotContains(t, append(slices.Clone(s.MustFail), s.Collateral...), g, "%s: an excluded gate is neither must-fail nor collateral", s.ID)
+		}
 	}
 }
 
@@ -64,7 +75,12 @@ func TestRegistryIsTheCanaryTable(t *testing.T) {
 func TestRegistryHooks(t *testing.T) {
 	for _, s := range All() {
 		wantSkip, wantPin, wantSwitches, wantStop := int64(0), false, workload.Switches{}, ""
+		var wantFault *chaos.Pin
 		switch s.ID {
+		case "K6a":
+			// F-lat at 3000 ms for exactly 60 s, in V0 at minutes 10–15 (PLAN §67.3).
+			wantFault = &chaos.Pin{Slot: chaos.Slot{ID: "V0", Kind: chaos.SlotShort, Start: 10 * time.Minute, End: 15 * time.Minute},
+				Kind: chaos.FaultLat, Param: 3000, Active: time.Minute}
 		case "K13":
 			wantStop = "node2"
 		case "K6b":
@@ -80,6 +96,7 @@ func TestRegistryHooks(t *testing.T) {
 		require.Equal(t, wantPin, s.PinKey, s.ID)
 		require.Equal(t, wantSwitches, s.Switches, s.ID)
 		require.Equal(t, wantStop, s.StopTarget, s.ID)
+		require.Equal(t, wantFault, s.Pin, s.ID)
 	}
 	none, ok := Lookup("")
 	require.False(t, ok)
@@ -94,8 +111,8 @@ func TestLookupAndKind(t *testing.T) {
 	require.Equal(t, "control", Kind(""))
 	_, ok = Lookup("k7")
 	require.False(t, ok, "ids are case-sensitive")
-	_, ok = Lookup("K9")
-	require.False(t, ok, "K9 is phase 2")
+	_, ok = Lookup("K14")
+	require.False(t, ok, "K14 has no live canary (PLAN §67.5)")
 }
 
 func TestK12ExpectsAVersionNoCellRuns(t *testing.T) {

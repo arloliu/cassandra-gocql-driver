@@ -93,7 +93,7 @@ func parseCellArgs(args []string, handling flag.ErrorHandling) (cellrun.Options,
 	case gate.ModeValidate:
 		if o.Canary != "" {
 			if s, ok := canary.Lookup(o.Canary); !ok || !s.Implemented {
-				return o, fmt.Errorf("-canary %s is not an implemented phase-1 canary", o.Canary)
+				return o, fmt.Errorf("-canary %s is not an implemented canary", o.Canary)
 			}
 		}
 		want := canary.Kind(o.Canary)

@@ -11,6 +11,7 @@ import (
 
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/canary"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/cellrun"
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/config"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
 )
 
@@ -40,7 +41,7 @@ func TestCellCanaryFlag(t *testing.T) {
 		"default mode (night)": {"-canary", "K7"},
 		"a disagreeing kind":   {"-mode", "validate", "-canary", "K7", "-kind", "control"},
 		"a canary kind, none":  {"-mode", "validate", "-kind", "k7"},
-		"unknown id":           {"-mode", "validate", "-canary", "K9"},
+		"unknown id":           {"-mode", "validate", "-canary", "K14"},
 		"lowercase id":         {"-mode", "validate", "-canary", "k7"},
 		"unknown mode":         {"-mode", "calibrate"},
 	} {
@@ -69,7 +70,20 @@ func TestCellExitCodes(t *testing.T) {
 	require.Equal(t, 2, cellExit(gate.ModeValidate, pass), "no judgment: it could not run")
 }
 
-// run-validation.sh's canonical slot order is the registry's (PLAN §44.2).
+// run-validation.sh's cells are config.Cells (PLAN §67.6).
+func TestRunValidationCells(t *testing.T) {
+	raw, err := os.ReadFile("../../run-validation.sh")
+	require.NoError(t, err)
+	m := regexp.MustCompile(`(?m)^CELLS=\(([^)]*)\)$`).FindSubmatch(raw)
+	require.NotNil(t, m, "run-validation.sh declares CELLS=(…)")
+	var ids []string
+	for _, c := range config.Cells() {
+		ids = append(ids, c.ID)
+	}
+	require.Equal(t, ids, strings.Fields(string(m[1])))
+}
+
+// run-validation.sh's canonical slot order is the registry's (PLAN §44.2, §67.6).
 func TestRunValidationCanonicalOrder(t *testing.T) {
 	raw, err := os.ReadFile("../../run-validation.sh")
 	require.NoError(t, err)

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/gate"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/proxy"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/workload"
@@ -44,6 +45,10 @@ type Event struct {
 	Counts    map[string]ClassCounts `json:"counts,omitempty"`
 	// Detail identifies any other injection, e.g. K2's pair of endpoints.
 	Detail string `json:"detail,omitempty"`
+	// Proxy and Toxic name K9's hidden toxic and the proxy it is on; Err is why its addition or deletion failed.
+	Proxy string `json:"proxy,omitempty"`
+	Toxic string `json:"toxic,omitempty"`
+	Err   string `json:"err,omitempty"`
 }
 
 // ErrorRef is the part of an errors.jsonl line K7's assertion reads: the recorder's own classification.
@@ -53,7 +58,25 @@ type ErrorRef struct {
 	Class    string
 }
 
-// Records are the persisted records an extra assertion reads (PLAN §44.8, r2 AQ09).
+// Transition is a fault's lifecycle transition from events.jsonl, with its event's offset from the workload epoch,
+// the clock the cheap samples share (K6a, K9).
+type Transition struct {
+	// T is the event's seconds since the workload epoch.
+	T float64
+	chaos.Transition
+}
+
+// StreamSample is the primary's stream counters in one cheap sample of samples.jsonl (K6a).
+type StreamSample struct {
+	// T is the sample's seconds since the workload epoch.
+	T float64
+	// Present is false when the sample has no primary counters.
+	Present bool
+	// Started, Finished, Abandoned and Balance are the recorded counters.
+	Started, Finished, Abandoned, Balance int64
+}
+
+// Records are the persisted records an extra assertion reads (PLAN §44.8, r2 AQ09, §67.7).
 type Records struct {
 	// Events are the canary's events.
 	Events []Event
@@ -61,6 +84,16 @@ type Records struct {
 	Errors []ErrorRef
 	// Coverage is the coverage event's settlement totals; nil when there is none.
 	Coverage *workload.SettlementTotals
+	// Transitions are every fault event's transition, in record order (K6a, K9).
+	Transitions []Transition
+	// Report is the executor's report event; nil when there is none or it was not read (K9).
+	Report *chaos.Report
+	// Schedule is schedule.json; nil when it was not read (K9).
+	Schedule *chaos.Schedule
+	// Streams are the cheap samples' primary counters, in record order (K6a).
+	Streams []StreamSample
+	// Thresholds are the run's thresholds (K6a's kS).
+	Thresholds gate.Thresholds
 }
 
 // Assert evaluates a canary's extra assertion (PLAN §44.2), from the final verdict and the persisted records only.
@@ -80,6 +113,10 @@ func Assert(id string, v gate.Verdict, rec Records) []string {
 		}
 	}
 	switch id {
+	case "K6a":
+		return assertK6a(rec)
+	case "K9":
+		return assertK9(rec)
 	case "K7":
 		var ops []uint64
 		for _, e := range own {
@@ -145,6 +182,37 @@ func Assert(id string, v gate.Verdict, rec Records) []string {
 		}
 	}
 	return nil
+}
+
+// lifecycleOf returns one fault's transitions, which must be exactly want, in record order (PLAN §67.3, §67.4).
+// Their wall times and their envelope offsets must both be non-decreasing.
+// The two are not compared with each other:
+// an offset is monotonic time since the workload epoch and a wall time is not,
+// so a wall-clock correction during an honest run moves one and not the other;
+// cellrun's reader checks the envelope's wall time against the transition's.
+func lifecycleOf(all []Transition, id string, want []chaos.State) ([]Transition, []string) {
+	var trs []Transition
+	for _, tr := range all {
+		if tr.ID == id {
+			trs = append(trs, tr)
+		}
+	}
+	if len(trs) == 0 {
+		return nil, []string{fmt.Sprintf("no transition of %s", id)}
+	}
+	got := make([]chaos.State, len(trs))
+	for i, tr := range trs {
+		got[i] = tr.State
+	}
+	if !slices.Equal(got, want) {
+		return nil, []string{fmt.Sprintf("%s's transitions are %v, want %v", id, got, want)}
+	}
+	for i := 1; i < len(trs); i++ {
+		if prev, tr := trs[i-1], trs[i]; tr.Time.Before(prev.Time) || tr.T < prev.T {
+			return nil, []string{fmt.Sprintf("%s's %s transition precedes its %s transition", id, tr.State, prev.State)}
+		}
+	}
+	return trs, nil
 }
 
 // assertK13 checks that the rewritten dial is a :9042 dial in G5's dial audit, made after the arm that followed G0.

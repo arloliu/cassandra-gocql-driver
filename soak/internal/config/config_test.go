@@ -202,6 +202,32 @@ func TestNoCanaryNoOverrideField(t *testing.T) {
 	require.NotContains(t, string(raw), "canary")
 	require.NotContains(t, string(raw), "expected_version")
 	require.NotContains(t, string(raw), "stop_target")
+	require.NotContains(t, string(raw), "pin")
+}
+
+// Only K6a adds a slot: V0 at minutes 10–15 with its pinned F-lat, ahead of the validation timetable (PLAN §67.3);
+// every other canary keeps the control's timetable and faults.
+func TestPinnedSlot(t *testing.T) {
+	b := base(t, "c50p5")
+	control := ValidationOverrides("")
+	for _, s := range canary.All() {
+		o := ValidationOverrides(s.ID)
+		if s.ID != "K6a" {
+			require.Nil(t, o.Pin, s.ID)
+			require.Equal(t, control.Timetable, o.Timetable, s.ID)
+			require.Equal(t, control.Faults, o.Faults, s.ID)
+			continue
+		}
+		require.Equal(t, s.Pin, o.Pin)
+		c, err := New(b, o, 1)
+		require.NoError(t, err)
+		_, slots, a, fixed := c.Effective()
+		require.True(t, fixed)
+		require.Equal(t, "V0", slots[0].ID)
+		require.Equal(t, ValidationWarmup, slots[0].Start, "V0 starts at the end of the warm-up")
+		require.Equal(t, chaos.ValidationTimetable(), slots[1:])
+		require.Equal(t, []chaos.Kind{chaos.FaultLat, chaos.FaultStop, chaos.FaultPause}, a.Short)
+	}
 }
 
 // Only K13 pins the validation F-stop, to node2 (PLAN §44.5).

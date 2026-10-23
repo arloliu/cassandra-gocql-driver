@@ -16,6 +16,9 @@ import (
 
 var nodes = []string{"node1", "node2", "node3"}
 
+// instantFault succeeds at every step at once, whatever its active duration.
+type instantFault struct{}
+
 func TestOuterDeadlinesMatchThePlan(t *testing.T) {
 	specs := Specs()
 	want := map[Kind]time.Duration{
@@ -121,6 +124,56 @@ func TestPreflightSlotBoundary(t *testing.T) {
 	}
 	require.NoError(t, Preflight(sch(worst), NightChaosEnd, specs))
 	require.Error(t, Preflight(sch(worst-time.Second), NightChaosEnd, specs))
+}
+
+// K6a's V0 holds a pinned F-lat (PLAN §67.3): the pin fixes the parameter and the active duration after the draw,
+// and Preflight bounds a pinned fault by its own active duration, so 60 s fits V0's five minutes and 61 s does not.
+func TestPreflightPinnedFault(t *testing.T) {
+	specs := Specs()
+	pin := Pin{Slot: Slot{ID: "V0", Kind: SlotShort, Start: 10 * time.Minute, End: 15 * time.Minute}, Kind: FaultLat, Param: 3000, Active: time.Minute}
+	slots, faults := PinSlot(ValidationTimetable(), []Kind{FaultStop, FaultPause}, pin)
+	var ids []string
+	for _, sl := range slots {
+		ids = append(ids, sl.ID)
+	}
+	require.Equal(t, []string{"V0", "C1", "V1", "C2", "V2", "C3"}, ids)
+	require.Equal(t, slots[1].Start, slots[0].End, "V0 ends where C1 starts")
+	require.Equal(t, []Kind{FaultLat, FaultStop, FaultPause}, faults)
+	require.Equal(t, ValidationTimetable(), slots[1:], "the validation timetable is unchanged")
+
+	sch, err := Plan(1, slots, Assignment{Short: faults}, false, nodes, nil, specs)
+	require.NoError(t, err)
+	require.ErrorContains(t, Preflight(sch, ValidationChaosEnd, specs), "slot V0", "a drawn F-lat's worst case does not fit V0")
+
+	pinned, err := ApplyPin(sch, pin)
+	require.NoError(t, err)
+	v0 := pinned.Mandatory[0]
+	require.Len(t, v0.Targets, 1)
+	require.Equal(t, Planned{Slot: "V0", Kind: FaultLat, Targets: v0.Targets, Active: time.Minute, Mandatory: true, Param: 3000, Pinned: true}, v0)
+	require.Equal(t, sch.Mandatory[1:], pinned.Mandatory[1:], "only V0 is pinned")
+	require.NotEqual(t, sch.Mandatory[0], pinned.Mandatory[0], "the plan it was applied to is not modified")
+	require.Equal(t, 5*time.Minute, OuterDeadline(specs, FaultLat, time.Minute))
+	require.NoError(t, Preflight(pinned, ValidationChaosEnd, specs))
+
+	long := pin
+	long.Active = 61 * time.Second
+	pinned61, err := ApplyPin(sch, long)
+	require.NoError(t, err)
+	require.ErrorContains(t, Preflight(pinned61, ValidationChaosEnd, specs), "slot V0")
+	zero := pin
+	zero.Active = 0
+	pinned0, err := ApplyPin(sch, zero)
+	require.NoError(t, err)
+	require.ErrorContains(t, Preflight(pinned0, ValidationChaosEnd, specs), "active")
+
+	other := pin
+	other.Slot.ID = "V9"
+	_, err = ApplyPin(sch, other)
+	require.ErrorContains(t, err, "V9")
+	other = pin
+	other.Kind = FaultBW
+	_, err = ApplyPin(sch, other)
+	require.ErrorContains(t, err, "F-bw")
 }
 
 func TestAdmitOptional(t *testing.T) {
@@ -345,6 +398,35 @@ func TestExecutorRunsEverySlot(t *testing.T) {
 	require.Len(t, rep.Outcomes, 5)
 }
 
+// K6a's pinned V0 runs as a third mandatory fault, with its pinned parameter and active duration (PLAN §67.3).
+// It counts toward G15's mandatory coverage.
+func TestExecutorRunsThePinnedFault(t *testing.T) {
+	pin := Pin{Slot: Slot{ID: "V0", Kind: SlotShort, Start: 10 * time.Minute, End: 15 * time.Minute}, Kind: FaultLat, Param: 3000, Active: time.Minute}
+	slots, faults := PinSlot(ValidationTimetable(), []Kind{FaultStop, FaultPause}, pin)
+	sch, err := Plan(5, slots, Assignment{Short: faults}, false, nodes, nil, Specs())
+	require.NoError(t, err)
+	sch, err = ApplyPin(sch, pin)
+	require.NoError(t, err)
+	// Every slot is already due, so the timetable runs at once; the faults hold for no time.
+	var built []Planned
+	e := &Executor{Schedule: sch, Specs: Specs(), Start: time.Now().Add(-time.Hour), Recovery: &recovery{},
+		Build: func(p Planned) (Fault, error) { built = append(built, p); return instantFault{}, nil },
+		Churn: func(context.Context, Slot) error { return nil }, Windows: &Windows{}, Interval: time.Millisecond}
+	rep := e.Run(t.Context())
+	require.Empty(t, rep.Fixture)
+	require.Equal(t, 3, rep.MandatoryFaults)
+	require.Equal(t, 3, rep.MandatoryExecuted)
+	require.Equal(t, 3, rep.ChurnExecuted)
+	require.Equal(t, sch.Mandatory[0], built[0], "the executor builds the pinned fault as planned")
+	require.True(t, built[0].Pinned)
+	require.Equal(t, 3000, built[0].Param)
+	var ids []string
+	for _, o := range rep.Outcomes {
+		ids = append(ids, o.ID)
+	}
+	require.Equal(t, []string{"V0", "V1", "V2"}, ids)
+}
+
 func TestExecutorAdmitsOptionalFaultsThatFit(t *testing.T) {
 	b := &builder{}
 	sch := fastSchedule(t, Assignment{Short: []Kind{FaultKill}, Long: FaultRoll}, []Kind{FaultPause})
@@ -531,3 +613,8 @@ func (h *hangingRelease) Hold(ctx context.Context, _ time.Duration) error {
 	<-ctx.Done()
 	return ctx.Err()
 }
+
+// Install, Hold and Remove succeed at once.
+func (instantFault) Install(context.Context) error             { return nil }
+func (instantFault) Hold(context.Context, time.Duration) error { return nil }
+func (instantFault) Remove(context.Context) error              { return nil }

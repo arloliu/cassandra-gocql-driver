@@ -119,16 +119,20 @@ func G12(in G12Input, th Thresholds) Result {
 }
 
 // G13 checks every churn slot (PLAN §6).
+// A validation run's three churns give a residue slope that snapshot noise alone can push past kCh,
+// so in validation mode the slope is recorded as a detail and not judged (PLAN §67.12 Q2);
+// the per-churn terms are judged in both modes.
 //
 // Parameters:
 //   - churns: one residue per executed churn slot, in index order
 //   - failures: churn failures the executor recorded (overrun, error)
 //   - th: needs KC and KCh
+//   - mode: the run mode
 //
 // Returns:
 //   - Result: fail on any churn failure, unmeasured churn, open registry entry, attributed socket,
-//     non-zero stream balance, a group drift beyond kC, or a residue slope over the churn index above kCh
-func G13(churns []ChurnResidue, failures []string, th Thresholds) Result {
+//     non-zero stream balance, a group drift beyond kC, or, in night mode, a residue slope over the churn index above kCh
+func G13(churns []ChurnResidue, failures []string, th Thresholds, mode Mode) Result {
 	v, err := th.getAll(KC, KCh)
 	if err != nil {
 		return invalid("G13", err)
@@ -156,7 +160,15 @@ func G13(churns []ChurnResidue, failures []string, th Thresholds) Result {
 			details = append(details, fmt.Sprintf("%s: %s", c.Slot, d))
 		}
 	}
-	if slope, ok := TheilSenSlope(residueSeries(churns)); ok && slope > kCh {
+	slope, ok := TheilSenSlope(residueSeries(churns))
+	if mode == ModeValidate {
+		r := result("G13", details)
+		if ok {
+			r.Details = append(r.Details, fmt.Sprintf("residue slope %.2f goroutines per churn, recorded and not judged in validation mode (kCh %.2f)", slope, kCh))
+		}
+		return r
+	}
+	if ok && slope > kCh {
 		details = append(details, fmt.Sprintf("residue slope %.2f goroutines per churn > %.2f", slope, kCh))
 	}
 	return result("G13", details)

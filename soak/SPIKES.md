@@ -1,6 +1,7 @@
-# Soak harness — spikes S1–S3 (phase 1) and S4–S5 (phase 2)
+# Soak harness — spikes S1–S3 (phase 1), S4–S5 (phase 2) and S6–S8 (phase-2 canaries)
 
-Phase 2's spikes are in [S4](#s4--toxic-faults-under-load-phase-2) and [S5](#s5--f-topo-under-load-phase-2) below; this header and the fixture describe S1–S3.
+Phase 2's spikes are in [S4](#s4--toxic-faults-under-load-phase-2) and [S5](#s5--f-topo-under-load-phase-2) below,
+and the phase-2 canaries' in [S6–S8](#s6s8--the-phase-2-canaries-k14-k6a-and-k9); this header and the fixture describe S1–S3.
 
 Date: 2026-09-24. Plan: `tmp/soak-review-2026-09-24/PLAN.md` v7.1, §9 phase 1 step 1.
 Driver: `otter-cache` @ 325e692, used through the public API only (D5).
@@ -320,3 +321,44 @@ A cycle: `ccm add node4 -i 127.0.1.4 -j 7400 -r 0 -d datacenter1 -b`; `ccm node4
 - §5.2's F-topo bounds (8 min install, 8 min remove) stand; the interview's rule asked for every maximum to be at most half of its bound.
 - `ccm add` needs `-r 0`: its default enables a remote-debug agent on port 2000, which `ccm create` leaves off for nodes 1–3.
 - The free-disk precondition rises from 20 to 40 GiB, and §4.1's estimate is replaced by the measurement.
+
+## S6–S8 — the phase-2 canaries K14, K6a and K9
+
+Date: 2026-10-22. Plan: PLAN v7.18 §67, after night B and before §9 step 8 (§59.1 P1).
+Harness: `otter-cache` @ 2ca151e, built from its exported tree; judged with night B's frozen `gates.json`
+(`tmp/soak-nightB-2026-10-22/derived-2026-10-22/`).
+Scripts and raw records: `tmp/soak-review-2026-09-24/spikes/s6/` and `spikes/s{6,7,8}-…-5.0.3-p5/`.
+
+**Fixture.** Each spike is one real c50p5 validate control run (`run-cells.sh -cells c50p5 -mode validate -kind control`).
+A script outside the harness reads the run's own `schedule.json` and `events.jsonl` and injects through `nodetool` (S6)
+or toxiproxy's API (S7, S8);
+the harness does not know about it, so the gates show what the injection does to an unmodified run.
+A host-load sampler ran beside each, once a minute: it saw no `fuzzworker` except in one S7 sample,
+and CPU pressure (`some avg10`) stayed under 8%.
+
+### Results
+
+| Spike | Injection | What the run showed | Verdict |
+|---|---|---|---|
+| S6, K14 | `nodetool setconcurrency ReadStage 1` on node2, the node no mandatory fault targeted, from 720 s to 2400 s | node2 completed about 160 000 reads a minute, its pending count stayed at 16 or below, and it dropped no message | **negative**: every gate passed, G16 included |
+| S7, K6a | a downstream `latency` toxic of 3000 ms, jitter 0, on node1's proxy from 720 s to 780 s, outside any window | the primary balance went from 2–9 to 39–70 during the delay and was 8 five seconds after it; `abandoned` stayed 0 and the driver reported no host event | **positive**: G6 passed; G8 and G11 failed only because the delay had no window |
+| S8, K9 | a downstream `timeout` toxic, `timeout` 0, on node2's proxy, added on V2's (F-pause) `remove` transition and deleted on its `failed` one | recovery's 120 s ended with R1, R2 and R3 failing on node2; the driver marked it UP 9 s after the deletion | **positive**: G9 the only failing gate, G14 `not-evaluated` (`cool-down contaminated`) |
+
+- S6: with one read thread a node kept up with the soak's load, so ReadStage throttling cannot make G16's dropped-message term fire here.
+  The run's only dropped messages (534 on node1) fell in the round pair over F-pause's window, which G16 excludes.
+- S7: the late streams were held and then finished, as the driver's timeout arm and `notifyStreamEnd` say:
+  a 2 s request timeout abandons the call, not the stream, and the 5 s heartbeat timeout kept the connections up.
+  Throughput fell to about 3% of the offered rate during the delay.
+- S7 also failed G13 on its residue slope, 5.50 goroutines per churn against kCh = 5, unrelated to the delay:
+  the residues −7, −2 and +4 came from in-flight scan prefetches (`nextIter.fetchAsync.func1`) at the churn snapshots.
+- S8: G2, G4, G5 and G6 passed with the note that no quiet checkpoint follows a failed fault;
+  the 543 terminal errors in V2's window were all admitted.
+
+### What it changes in the plan (PLAN v7.18 §67)
+
+- K14 takes §7's fallback: no live canary; G16 stays advisory and is validated by `internal/gate`'s unit tests.
+- K6a pins an F-lat of 3000 ms (jitter 600 ms, by F-lat's own rule) for exactly 60 s in a slot of its own, V0 at minutes 10–15,
+  so its deadlines fall in a window;
+  its extra assertion requires the rise above kS and the drain without abandoned streams.
+- K9 wraps the validation F-pause with the hidden toxic, and excludes G14 with exactly `cool-down contaminated`.
+- In validation mode G13's residue slope over three churns is recorded and not judged (the maintainer's decision, 2026-10-23).

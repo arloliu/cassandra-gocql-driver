@@ -210,5 +210,51 @@ func TestRule6FixtureSuspect(t *testing.T) {
 }
 
 func TestUnknownCanary(t *testing.T) {
-	requireNot(t, judge("K9", allPass()), "K9")
+	requireNot(t, judge("K14", allPass()), "K14")
+}
+
+// K9 excludes G14 with exactly one detail (PLAN §67.7): pass, or not-evaluated with that detail alone; nothing else.
+func TestRule5ExcludedGate(t *testing.T) {
+	k9 := withGates(allPass(), gate.StatusFail, "G9")
+	requireValidated(t, judge("K9", k9))
+	requireValidated(t, judge("K9", withResult(k9, "G14", gate.StatusNotEvaluated, "cool-down contaminated")))
+
+	requireNot(t, judge("K9", withResult(k9, "G14", gate.StatusNotEvaluated, "the workload did not run")), "G14")
+	requireNot(t, judge("K9", withResult(k9, "G14", gate.StatusNotEvaluated, "cool-down contaminated", "another")), "G14")
+	requireNot(t, judge("K9", withResult(k9, "G14", gate.StatusNotEvaluated)), "G14")
+	requireNot(t, judge("K9", withResult(k9, "G14", gate.StatusFail, "cool-down contaminated")), "G14")
+	requireNot(t, judge("K9", withResult(k9, "G14", gate.StatusInvalidConfig, "cool-down contaminated")), "G14")
+	requireNot(t, judge("K9", withResult(allPass(), "G14", gate.StatusNotEvaluated, "cool-down contaminated")), "G9")
+	requireNot(t, judge("K9", withResult(k9, "G2", gate.StatusNotEvaluated, "cool-down contaminated")), "G2")
+
+	// A canary without exclusions, and the control, still reject any not-evaluated gate.
+	k7 := withGates(allPass(), gate.StatusFail, "G8")
+	requireNot(t, judge("K7", withResult(k7, "G14", gate.StatusNotEvaluated, "cool-down contaminated")), "G14")
+	requireNot(t, judge("", withResult(allPass(), "G14", gate.StatusNotEvaluated, "cool-down contaminated")), "G14")
+}
+
+// K6a has no must-fail gate (PLAN §67.7): every gate but G16 passes,
+// and a G16 failure alone, which makes the verdict fixture-invalid, leaves the attempt validated;
+// the batch's rerun rule decides it.
+func TestRule5K6a(t *testing.T) {
+	requireValidated(t, judge("K6a", allPass()))
+	g16 := withGates(allPass(), gate.StatusFail, "G16")
+	g16.Status, g16.FailingGates, g16.Reasons = gate.VerdictFixtureInvalid, nil, []string{"G16: [fired]"}
+	requireValidated(t, judge("K6a", g16))
+	requireNot(t, judge("", g16), "G16")
+	for _, g := range []string{"G6", "G8", "G11", "G13"} {
+		requireNot(t, judge("K6a", withGates(allPass(), gate.StatusFail, g)), g)
+	}
+	requireNot(t, judge("K6a", withResult(allPass(), "G14", gate.StatusNotEvaluated, "cool-down contaminated")), "G14")
+}
+
+// withResult returns v with one gate's status and details replaced, the verdict's status untouched.
+func withResult(v gate.Verdict, g string, status gate.Status, details ...string) gate.Verdict {
+	v.Gates = append([]gate.Result(nil), v.Gates...)
+	for i, r := range v.Gates {
+		if r.Gate == g {
+			v.Gates[i].Status, v.Gates[i].Details = status, details
+		}
+	}
+	return v
 }

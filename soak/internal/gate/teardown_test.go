@@ -1,6 +1,8 @@
 package gate
 
 import (
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -61,10 +63,10 @@ func TestG13(t *testing.T) {
 			Before: map[string]int{"a": 100}, After: map[string]int{"a": 100 + residue}}
 	}
 	flatRun := []ChurnResidue{churn(0, 0), churn(1, 1), churn(2, 0), churn(3, 1), churn(4, 0)}
-	require.Equal(t, StatusPass, G13(flatRun, nil, th).Status)
+	require.Equal(t, StatusPass, G13(flatRun, nil, th, ModeNight).Status)
 
 	rising := []ChurnResidue{churn(0, 0), churn(1, 2), churn(2, 4), churn(3, 5)}
-	r := G13(rising, nil, th)
+	r := G13(rising, nil, th, ModeNight)
 	require.Equal(t, StatusFail, r.Status)
 	require.Contains(t, r.Details[len(r.Details)-1], "residue slope")
 
@@ -78,8 +80,42 @@ func TestG13(t *testing.T) {
 	} {
 		c := churn(0, 0)
 		mutate(&c)
-		require.Equal(t, StatusFail, G13([]ChurnResidue{c}, nil, th).Status, name)
+		require.Equal(t, StatusFail, G13([]ChurnResidue{c}, nil, th, ModeNight).Status, name)
+		require.Equal(t, StatusFail, G13([]ChurnResidue{c}, nil, th, ModeValidate).Status, name+" in validation mode")
 	}
-	require.Equal(t, StatusFail, G13(nil, []string{"C2 overran"}, th).Status)
-	require.Equal(t, StatusInvalidConfig, G13(nil, nil, Thresholds{KC: 1}).Status)
+	require.Equal(t, StatusFail, G13(nil, []string{"C2 overran"}, th, ModeNight).Status)
+	require.Equal(t, StatusFail, G13(nil, []string{"C2 overran"}, th, ModeValidate).Status)
+	require.Equal(t, StatusInvalidConfig, G13(nil, nil, Thresholds{KC: 1}, ModeNight).Status)
+	require.Equal(t, StatusInvalidConfig, G13(nil, nil, Thresholds{KC: 1}, ModeValidate).Status)
+}
+
+// In validation mode G13 records the residue slope of its three churns and does not judge it (PLAN §67.12 Q2):
+// S7's residues −7, −2 and +4 give 5.50 > kCh = 5, a failure at night and a pass with the slope as a detail here;
+// the per-churn terms are judged in both modes.
+func TestG13ValidationModeRecordsTheSlope(t *testing.T) {
+	th := fullThresholds()
+	th[KCh] = 5
+	churn := func(i, residue int) ChurnResidue {
+		return ChurnResidue{Slot: fmt.Sprintf("C%d", i+1), Index: i, Measured: true,
+			Before: map[string]int{"a": 100, "b": 10}, After: map[string]int{"a": 100 + residue, "b": 10}}
+	}
+	s7 := []ChurnResidue{churn(0, -7), churn(1, -2), churn(2, 4)}
+	th[KC] = 8
+	night := G13(s7, nil, th, ModeNight)
+	require.Equal(t, StatusFail, night.Status)
+	require.Equal(t, []string{"residue slope 5.50 goroutines per churn > 5.00"}, night.Details)
+
+	val := G13(s7, nil, th, ModeValidate)
+	require.Equal(t, StatusPass, val.Status)
+	require.Equal(t, []string{"residue slope 5.50 goroutines per churn, recorded and not judged in validation mode (kCh 5.00)"}, val.Details)
+
+	drift := slices.Clone(s7)
+	drift[1].After = map[string]int{"a": 98, "b": 19}
+	got := G13(drift, nil, th, ModeValidate)
+	require.Equal(t, StatusFail, got.Status, "a per-churn group drift beyond kC still fails")
+	require.Contains(t, got.Details[0], `C2: group "b" 10 → 19`)
+	require.Contains(t, got.Details[len(got.Details)-1], "recorded and not judged")
+
+	require.Equal(t, StatusPass, G13(s7[:1], nil, th, ModeValidate).Status)
+	require.Empty(t, G13(s7[:1], nil, th, ModeValidate).Details, "one churn has no slope to record")
 }

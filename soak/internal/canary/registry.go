@@ -1,12 +1,14 @@
-// Package canary holds the phase-1 detector-validation canaries (PLAN §44):
+// Package canary holds the detector-validation canaries (PLAN §44, §67):
 // the registry of §44.2, the validation judgment of §44.3, and the injections of §44.4.
 package canary
 
 import (
+	"maps"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/chaos"
 	"github.com/apache/cassandra-gocql-driver/v2/soak/internal/workload"
 )
 
@@ -24,7 +26,10 @@ const minute = time.Minute
 // k11Declared is K11's one declared evidence entry: no LWT completes in the cool-down, so G14 has no p99 for it.
 const k11Declared = "G14: missing evidence: class lwt has no cool-down p99"
 
-// Spec is one canary of the table in PLAN §44.2.
+// k9Excluded is K9's excluded gate: its failed window stays open to the end, so G14 is not evaluated (PLAN §67.4).
+const k9Excluded = "cool-down contaminated"
+
+// Spec is one canary of the table in PLAN §44.2, or of §67.7 for K6a and K9.
 type Spec struct {
 	// ID is the canary id, e.g. K7.
 	ID string
@@ -37,6 +42,8 @@ type Spec struct {
 	Collateral []string
 	// Declared lists the exact evidence.problems entries the canary may cause, each of a collateral gate (§44.3 rule 3).
 	Declared []string
+	// Excluded maps a gate to the one detail with which it may be not-evaluated instead of passing (K9, PLAN §67.7).
+	Excluded map[string]string
 	// ExpectedVersion replaces G0's expected Cassandra version (K12); empty keeps the cell's.
 	ExpectedVersion string
 	// SkipFinished makes the primary's stream counters drop one in this many finished increments (K6b); 0 for none.
@@ -47,20 +54,25 @@ type Spec struct {
 	Switches workload.Switches
 	// StopTarget pins the validation F-stop to this node (K13); empty keeps the drawn target.
 	StopTarget string
-	// Implemented is false for a canary cmd/soak refuses; since the second batch (§44.1) every phase-1 canary is implemented.
+	// Pin is a fault in a slot of its own ahead of the validation timetable (K6a, PLAN §67.3); nil for none.
+	Pin *chaos.Pin
+	// Implemented is false for a canary cmd/soak refuses; every canary of the registry is implemented.
 	Implemented bool
 }
 
-// registry is the table of PLAN §44.2, in its order.
+// registry is the table of PLAN §44.2 with §67's K6a and K9, in the canonical order (§67.6).
 var registry = []Spec{
 	{ID: "K1", Start: 12 * minute, MustFail: []string{"G1", "G2"}, Collateral: []string{"G12"}, Implemented: true},
 	{ID: "K2", Start: 12 * minute, MustFail: []string{"G2", "G4"}, Collateral: []string{"G12"}, Implemented: true},
 	{ID: "K3", Start: 12 * minute, MustFail: []string{"G4"}, Collateral: []string{"G12"}, Implemented: true},
 	{ID: "K4", Start: 12 * minute, MustFail: []string{"G3"}, Collateral: []string{"G14"}, Implemented: true},
 	{ID: "K5", Start: 12 * minute, MustFail: []string{"G7"}, Implemented: true},
+	{ID: "K6a", Pin: &chaos.Pin{Slot: chaos.Slot{ID: "V0", Kind: chaos.SlotShort, Start: 10 * minute, End: 15 * minute},
+		Kind: chaos.FaultLat, Param: 3000, Active: minute}, Implemented: true},
 	{ID: "K6b", Start: 12 * minute, MustFail: []string{"G6"}, SkipFinished: 500, Implemented: true},
 	{ID: "K7", Start: 12 * minute, MustFail: []string{"G8"}, Implemented: true},
 	{ID: "K8", Start: 12 * minute, MustFail: []string{"G10"}, PinKey: true, Implemented: true},
+	{ID: "K9", MustFail: []string{"G9"}, Excluded: map[string]string{"G14": k9Excluded}, Implemented: true},
 	{ID: "K10", MustFail: []string{"G12", "G13"}, Collateral: []string{"G2"}, Implemented: true},
 	{ID: "K11", Start: 20 * minute, MustFail: []string{"G11"}, Collateral: []string{"G14"}, Declared: []string{k11Declared}, Implemented: true},
 	{ID: "K12", ExpectedVersion: "0.0.0-k12", Implemented: true},
@@ -70,7 +82,7 @@ var registry = []Spec{
 	{ID: "K17", Collateral: []string{"G15"}, Switches: workload.Switches{NoSpeculation: true}, Implemented: true},
 }
 
-// All returns every phase-1 canary in the table's order (PLAN §44.2).
+// All returns every canary in the canonical order (PLAN §44.2, §67.6).
 //
 // Returns:
 //   - []Spec: the canaries; the caller may modify the copy
@@ -78,6 +90,11 @@ func All() []Spec {
 	out := make([]Spec, len(registry))
 	for i, s := range registry {
 		s.MustFail, s.Collateral, s.Declared = slices.Clone(s.MustFail), slices.Clone(s.Collateral), slices.Clone(s.Declared)
+		s.Excluded = maps.Clone(s.Excluded)
+		if s.Pin != nil {
+			pin := *s.Pin
+			s.Pin = &pin
+		}
 		out[i] = s
 	}
 	return out
@@ -90,7 +107,7 @@ func All() []Spec {
 //
 // Returns:
 //   - Spec: the canary
-//   - bool: false for an id that is not a phase-1 canary
+//   - bool: false for an id that is not a canary of the registry
 func Lookup(id string) (Spec, bool) {
 	for _, s := range All() {
 		if s.ID == id {

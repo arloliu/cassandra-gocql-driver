@@ -240,7 +240,7 @@ func Run(ctx context.Context, o Options) (string, VerdictFile, error) {
 	r.vfile.Evidence = evidence
 	if r.o.Mode == gate.ModeValidate {
 		// The judgment reads the persisted records, so it runs once every stream is closed (PLAN §44.3, §44.8).
-		val := judgeRun(r.dir, r.canary.ID, v, evidence)
+		val := judgeRun(r.dir, r.canary.ID, v, evidence, r.th)
 		r.vfile.Validation = &val
 	}
 	r.vmu.Unlock()
@@ -339,6 +339,14 @@ func (r *cellRun) prepare() error {
 		optional = r.conf.Base.Shared.Optional
 	}
 	sch, planErr := chaos.Plan(r.o.Seed, slots, assignment, !fixed, r.nodes, optional, chaos.Specs())
+	// K6a's pinned fault takes its parameter and active duration after the draw, before schedule.json is written (PLAN §67.3).
+	if pin := r.conf.Overrides.Pin; pin != nil && planErr == nil {
+		if pinned, err := chaos.ApplyPin(sch, *pin); err != nil {
+			planErr = err
+		} else {
+			sch = pinned
+		}
+	}
 	// K13 pins the validation F-stop after the draw and before schedule.json is written (PLAN §44.5).
 	if target := r.conf.Overrides.StopTarget; target != "" && planErr == nil {
 		for i, p := range sch.Mandatory {
@@ -700,7 +708,7 @@ func (r *cellRun) workload(ctx context.Context) {
 	builder := &cell.Builder{Cluster: r.cl, Schema: cell.SchemaOps{Session: r.primary.Session}, ProcDir: "/proc",
 		Proxy: r.srv.Client(), Registry: r.reg, Event: func(name string, data any) { r.rec.Event(name, time.Now(), data) },
 		DC: r.dc, LogDir: filepath.Join(r.dir, "ccm")}
-	ex := &chaos.Executor{Schedule: r.sch, Specs: chaos.Specs(), Start: r.epoch, Build: builder.Build, Recovery: rec,
+	ex := &chaos.Executor{Schedule: r.sch, Specs: chaos.Specs(), Start: r.epoch, Build: r.buildFault(builder), Recovery: rec,
 		Churn: r.churner.Churn, Windows: r.windows, OnTransition: r.onTransition}
 	exDone := make(chan chaos.Report, 1)
 	go func() { exDone <- ex.Run(exCtx) }()
@@ -1036,6 +1044,18 @@ func (r *cellRun) collectNodeLogs(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// buildFault builds a planned fault and lets the canary wrap it: K9 wraps the validation F-pause (PLAN §67.4).
+func (r *cellRun) buildFault(b *cell.Builder) func(chaos.Planned) (chaos.Fault, error) {
+	deps := canary.FaultDeps{Ops: b.Proxy, Event: func(e canary.Event) { r.rec.Event("canary", e.Time, e) }}
+	return func(p chaos.Planned) (chaos.Fault, error) {
+		f, err := b.Build(p)
+		if err != nil {
+			return nil, err
+		}
+		return canary.WrapFault(r.canary.ID, p, f, deps), nil
+	}
 }
 
 // onTransition records a lifecycle step and schedules the quiet checkpoint after a done fault.

@@ -290,7 +290,7 @@ func (c Collected) runGates() []gate.Result {
 		out = append(out, gate.Bool("G12", []string{"teardown was not measured"}))
 	}
 	out = append(out,
-		gate.G13(c.Churns, c.Report.ChurnFailures, c.Thresholds),
+		gate.G13(c.Churns, c.Report.ChurnFailures, c.Thresholds, c.Mode),
 		gate.G14(c.WarmupP99, c.CooldownP99, c.Classes, c.cooldownContaminated(), c.Thresholds),
 		gate.G15(gate.Coverage{
 			MandatoryFaults: c.Report.MandatoryFaults, MandatoryExecuted: c.Report.MandatoryExecuted,

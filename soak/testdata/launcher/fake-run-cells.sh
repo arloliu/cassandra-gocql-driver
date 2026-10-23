@@ -5,7 +5,7 @@
 # the default is a validated attempt.
 # It writes exactly the artifacts run-cells.sh and run-night.sh write: a summary under <out>/soak-<date>/,
 # the night.json alias, and in the execution directory verdict.json, config.json and launcher-cleanup.json.
-# The exit-1 cell entry is a real validate-mode summary's (testdata/validation/exit1-cell.json), paths rewritten.
+# The exit-1 cell entry is a real validate-mode summary's (testdata/validation/exit1-cell.json), paths and cell rewritten.
 # Its arguments are recorded one per line in <out>/args.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -105,8 +105,8 @@ jq -n --arg a "$ATTEMPT" --arg d "$DIR" --argjson e "$rexit" --argjson u "$runre
   '{attempt: $a, exec_dir: $d, exit: $e, reason: "fake", unresolved: $u, retained: []}' >"$DIR/launcher-cleanup.json"
 
 # The cell entry: the real exit-1 entry, paths rewritten; exit 0 is the same entry with a success result.
-cell=$(jq -c --arg dir "$DIR" --arg kind "$KIND" --arg a "$ATTEMPT" --arg r "$OUT/receipts/$CELLS.json" \
-  '.receipt.exec_dir = $dir | .receipt.report = ($dir + "/launcher-cleanup.json") | .receipt.kind = $kind
+cell=$(jq -c --arg dir "$DIR" --arg kind "$KIND" --arg a "$ATTEMPT" --arg r "$OUT/receipts/$CELLS.json" --arg cell "$CELLS" \
+  '.cell = $cell | .receipt.cell = $cell | .receipt.exec_dir = $dir | .receipt.report = ($dir + "/launcher-cleanup.json") | .receipt.kind = $kind
    | .receipt.attempt = $a | .receipt.receipt = $r | .unit_output = "fake"' "$HERE/../validation/exit1-cell.json")
 if ((le == 0)); then
   cell=$(jq -c '.unit_result = "success" | .main = "code=exited/status=0" | .client_status = "0"
@@ -116,6 +116,7 @@ elif ((le == 2)); then
 fi
 case "$B" in
 cell-problem) cell=$(jq -c '.problems = ["verdict.json unreadable"]' <<<"$cell") ;;
+cell-mismatch) cell=$(jq -c 'if .cell == "c41p5" then .cell = "c50p5" else .cell = "c41p5" end' <<<"$cell") ;;
 cell-main) cell=$(jq -c '.main = "code=killed/status=TERM"' <<<"$cell") ;;
 receipt-unproven) cell=$(jq -c '.receipt.proven = false' <<<"$cell") ;;
 esac

@@ -148,6 +148,21 @@ type Sampler struct {
 	requests chan string
 }
 
+// streamSnapshot is a session's stream counters as the cheap sample reads them.
+type streamSnapshot interface {
+	Snapshot() (started, finished, abandoned int64)
+}
+
+var _ streamSnapshot = (*probe.StreamCounters)(nil)
+
+// sessionStreams reads a session's stream counters once:
+// the balance comes from the same snapshot as the counters it is computed from,
+// so an abandonment between two reads cannot split them (PLAN §67.3, r3 CB01).
+func sessionStreams(c streamSnapshot) SessionStreams {
+	st, fin, ab := c.Snapshot()
+	return SessionStreams{Started: st, Finished: fin, Abandoned: ab, Balance: st - fin - ab}
+}
+
 // CaptureBaseline measures baseline₀: goroutine groups and fds, before the primary session opens.
 //
 // Returns:
@@ -310,8 +325,7 @@ func (s *Sampler) cheap(now time.Time) Cheap {
 	}
 	c.Sockets = s.socketsBySession()
 	for _, sess := range sessions {
-		st, fin, ab := sess.Streams.Snapshot()
-		c.Streams[sess.ID] = SessionStreams{Started: st, Finished: fin, Abandoned: ab, Balance: sess.Streams.Balance()}
+		c.Streams[sess.ID] = sessionStreams(sess.Streams)
 		c.Logs[sess.ID] = sess.Logger.Counts()
 	}
 	if progress != nil {

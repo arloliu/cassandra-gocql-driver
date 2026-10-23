@@ -55,7 +55,7 @@ func Judge(in Input) Validation {
 	spec, known := Lookup(in.Canary)
 	switch {
 	case in.Canary != "" && !known:
-		fail("canary %q is not a phase-1 canary", in.Canary)
+		fail("canary %q is not a canary of the registry", in.Canary)
 	case in.Canary == "K12":
 		rule2(v, fail)
 	default:
@@ -159,9 +159,11 @@ func fixtureAndAnnotations(v gate.Verdict, fail func(string, ...any)) {
 	}
 }
 
-// rule5 checks the gate statuses of a canary run.
+// rule5 checks the gate statuses of a canary run; an excluded gate passes or is not evaluated with exactly its one detail
+// (PLAN §67.7).
 func rule5(spec Spec, v gate.Verdict, fail func(string, ...any)) {
 	for _, r := range v.Gates {
+		detail, excluded := spec.Excluded[r.Gate]
 		switch {
 		case slices.Contains(spec.MustFail, r.Gate):
 			if r.Status != gate.StatusFail {
@@ -170,6 +172,10 @@ func rule5(spec Spec, v gate.Verdict, fail func(string, ...any)) {
 		case slices.Contains(spec.Collateral, r.Gate):
 			if r.Status != gate.StatusPass && r.Status != gate.StatusFail {
 				fail("rule 5: collateral gate %s is %s", r.Gate, r.Status)
+			}
+		case excluded:
+			if r.Status != gate.StatusPass && (r.Status != gate.StatusNotEvaluated || !slices.Equal(r.Details, []string{detail})) {
+				fail("rule 5: excluded gate %s is %s %q, want pass or not-evaluated with exactly %q", r.Gate, r.Status, r.Details, detail)
 			}
 		case r.Gate == "G16":
 			if r.Status != gate.StatusPass && r.Status != gate.StatusFail {

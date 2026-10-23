@@ -169,6 +169,8 @@ type Overrides struct {
 	ExpectedVersion string `json:"expected_version,omitempty"`
 	// StopTarget pins the validation F-stop to this node (K13); empty keeps the drawn target.
 	StopTarget string `json:"stop_target,omitempty"`
+	// Pin is K6a's pinned fault, whose slot Timetable and Faults already hold (PLAN §67.3); the schedule applies it.
+	Pin *chaos.Pin `json:"pin,omitempty"`
 	// G15Scale scales the G15 minimums; zero means 1.
 	G15Scale float64 `json:"g15_scale,omitempty"`
 }
@@ -257,7 +259,8 @@ func NightBase(c Cell, driver Driver, rate float64, workers int) Base {
 // ValidationOverrides returns the overrides of a validation run (PLAN §7): its own timeline and timetable,
 // F-stop then F-pause as the fixed faults, and the scaled G15 minimums.
 //
-// A canary's overrides are its id, K12's expected version and K13's F-stop pin (PLAN §44.4); every other hook follows from the id.
+// A canary's overrides are its id, K12's expected version, K13's F-stop pin and K6a's pinned fault in its own slot
+// (PLAN §44.4, §67.3); every other hook follows from the id.
 //
 // Parameters:
 //   - id: the canary id, empty for the control run
@@ -272,6 +275,10 @@ func ValidationOverrides(id string) Overrides {
 	}
 	if s, ok := canary.Lookup(id); ok {
 		o.ExpectedVersion, o.StopTarget = s.ExpectedVersion, s.StopTarget
+		if s.Pin != nil {
+			o.Timetable, o.Faults = chaos.PinSlot(o.Timetable, o.Faults, *s.Pin)
+			o.Pin = s.Pin
+		}
 	}
 	return o
 }
