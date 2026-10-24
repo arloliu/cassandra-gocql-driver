@@ -72,8 +72,9 @@ const (
 
 	// Disabled mode completely disables schema metadata caching.
 	//
-	// Token-aware routing falls back to the configured fallback policy (e.g., RoundRobinHostPolicy,
-	// DCAwareRoundRobinPolicy) since replica information is not available.
+	// NewSession refuses this mode with ErrMetadataCacheRequired for a host selection policy
+	// whose MetadataRequired reports true, such as TokenAwareHostPolicy,
+	// since replica information is not available.
 	// Session.KeyspaceMetadata queries system tables on every call instead of using a cache.
 	//
 	// Having schema change listeners will result in an error during session creation.
@@ -631,7 +632,8 @@ func (cfg *ClusterConfig) validate() error {
 	logger := cfg.newLogger()
 
 	if cfg.Metadata.CacheMode == Disabled {
-		mrp, ok := cfg.PoolConfig.HostSelectionPolicy.(MetadataRequiredPolicy)
+		// A SingleHostReadyPolicy is looked through, so a wrapped policy is judged as it would be on its own.
+		mrp, ok := unwrapReadyPolicy(cfg.PoolConfig.HostSelectionPolicy).(MetadataRequiredPolicy)
 		if !ok {
 			logger.Warning(metadataCacheDisabledWarningMsg)
 		} else if mrp.MetadataRequired() {

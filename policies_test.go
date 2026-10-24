@@ -1998,3 +1998,33 @@ func TestHostPolicy_TokenAware_NetworkStrategyVnodesNoRepeat(t *testing.T) {
 		})
 	}
 }
+
+// TestUnwrapReadyPolicy checks that the schema refresh and NewSession's validation see through
+// any number of SingleHostReadyPolicy layers, and through nothing else.
+func TestUnwrapReadyPolicy(t *testing.T) {
+	tokenAware := TokenAwareHostPolicy(RoundRobinHostPolicy())
+	roundRobin := RoundRobinHostPolicy()
+	custom := testHostSelectionPolicy{}
+
+	for _, tc := range []struct {
+		name     string
+		policy   HostSelectionPolicy
+		want     HostSelectionPolicy
+		notifier bool
+	}{
+		{"token-aware", tokenAware, tokenAware, true},
+		{"round-robin", roundRobin, roundRobin, false},
+		{"custom", custom, custom, false},
+		{"ready around token-aware", SingleHostReadyPolicy(tokenAware), tokenAware, true},
+		{"ready twice around token-aware", SingleHostReadyPolicy(SingleHostReadyPolicy(tokenAware)), tokenAware, true},
+		{"ready around round-robin", SingleHostReadyPolicy(roundRobin), roundRobin, false},
+		{"ready around custom", SingleHostReadyPolicy(custom), custom, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := unwrapReadyPolicy(tc.policy)
+			require.True(t, got == tc.want, "unwrapReadyPolicy returned %T, want %T", got, tc.want)
+			_, notifier := got.(schemaRefreshNotifier)
+			require.Equal(t, tc.notifier, notifier, "whether the unwrapped policy takes schema refreshes")
+		})
+	}
+}

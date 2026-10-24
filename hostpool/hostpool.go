@@ -172,6 +172,10 @@ func (r *hostPoolHostPolicy) Pick(qry gocql.ExecutableStatement) gocql.NextHost 
 	}
 }
 
+// MetadataRequired reports false: host pool selection reads no schema metadata.
+//
+// Returns:
+//   - bool: always false
 func (r *hostPoolHostPolicy) MetadataRequired() bool {
 	return false
 }

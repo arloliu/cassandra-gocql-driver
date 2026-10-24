@@ -558,8 +558,8 @@ func (s *Session) init() error {
 		return ErrNoConnectionsStarted
 	}
 
-	// Invoke KeyspaceChanged to let the policy cache the session keyspace
-	// parameters. This is used by tokenAwareHostPolicy to discover replicas.
+	// The first schema refresh. It gives a token-aware policy its replica maps through schemaRefreshed;
+	// it calls no KeyspaceChanged, since the session is not initialized yet.
 	if !s.cfg.disableControlConn && s.schemaDescriber != nil {
 		err := s.schemaDescriber.refreshSchemaMetadata()
 		if err != nil {

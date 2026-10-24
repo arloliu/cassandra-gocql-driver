@@ -861,8 +861,11 @@ func refreshSchemas(session *Session) error {
 
 	sessionInitialized := session.initialized()
 
-	// Notify policy if it supports schema refresh notifications
-	notifier, supportsRefresh := session.policy.(schemaRefreshNotifier)
+	// Notify policy if it supports schema refresh notifications.
+	// A SingleHostReadyPolicy is looked through: it hides the wrapped policy's schemaRefreshed,
+	// and the refresh below calls no KeyspaceChanged before the session is initialized,
+	// so a wrapped token-aware policy would build no replica maps for the keyspaces that exist at session creation.
+	notifier, supportsRefresh := unwrapReadyPolicy(session.policy).(schemaRefreshNotifier)
 	if supportsRefresh {
 		notifier.schemaRefreshed(session.schemaDescriber.getSchemaMetaForRead())
 	}

@@ -133,6 +133,25 @@ func TestClusterConfig_validate_HostSelectionPolicyRequiresMetadata(t *testing.T
 			expectedError:       nil,
 			expectsWarning:      false,
 		},
+		{
+			name:                "Metadata cache is disabled and a SingleHostReadyPolicy wraps a policy that requires metadata",
+			cacheMode:           Disabled,
+			hostSelectionPolicy: SingleHostReadyPolicy(SingleHostReadyPolicy(TokenAwareHostPolicy(RoundRobinHostPolicy()))),
+			expectedError:       ErrMetadataCacheRequired,
+		},
+		{
+			name:                "Metadata cache is disabled and a SingleHostReadyPolicy wraps a policy that does not require metadata",
+			cacheMode:           Disabled,
+			hostSelectionPolicy: SingleHostReadyPolicy(RoundRobinHostPolicy()),
+			expectedError:       nil,
+		},
+		{
+			name:                "Metadata cache is disabled and a SingleHostReadyPolicy wraps a policy that does not implement MetadataRequiredPolicy",
+			cacheMode:           Disabled,
+			hostSelectionPolicy: SingleHostReadyPolicy(testHostSelectionPolicy{}),
+			expectedError:       nil,
+			expectsWarning:      true,
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -145,9 +164,7 @@ func TestClusterConfig_validate_HostSelectionPolicyRequiresMetadata(t *testing.T
 			}
 			err := cfg.validate()
 			assertEqual(t, "error", testCase.expectedError, err)
-			if testCase.expectsWarning {
-				assertTrue(t, "has warning", strings.Contains(logger.String(), metadataCacheDisabledWarningMsg))
-			}
+			assertEqual(t, "has warning", testCase.expectsWarning, strings.Contains(logger.String(), metadataCacheDisabledWarningMsg))
 		})
 	}
 }

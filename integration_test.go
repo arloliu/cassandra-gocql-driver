@@ -1179,7 +1179,8 @@ func TestHostSelectionPolicyKeyspaceChangedEvents(t *testing.T) {
 
 	session, err := cluster.CreateSession()
 	require.NoError(t, err)
-	defer session.Close()
+	// Cleanups run last-in, first-out: the session closes after the keyspace's DROP below.
+	t.Cleanup(session.Close)
 
 	// Regression test for CASSGO-132: KeyspaceChanged events are fired during session creation.
 	events := policy.CapturedEvents()
@@ -1189,8 +1190,16 @@ func TestHostSelectionPolicyKeyspaceChangedEvents(t *testing.T) {
 
 	// CREATE
 	ksName := randomNameWithPrefix("gocql_test_")
-	err = session.Query(fmt.Sprintf("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}", ksName)).ExecContext(context.Background())
+	err = session.Query(fmt.Sprintf("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}", ksName)).ExecContext(t.Context())
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		// t.Context() is already cancelled when cleanups run.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		if err := session.Query(fmt.Sprintf("DROP KEYSPACE IF EXISTS %s", ksName)).ExecContext(ctx); err != nil {
+			t.Logf("cleanup: drop keyspace %s: %v", ksName, err)
+		}
+	})
 
 	require.Eventually(t, func() bool {
 		events = policy.CapturedEvents()
@@ -1203,7 +1212,7 @@ func TestHostSelectionPolicyKeyspaceChangedEvents(t *testing.T) {
 
 	// ALTER
 	policy.ResetEvents()
-	err = session.Query(fmt.Sprintf("ALTER KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '2'}", ksName)).ExecContext(context.Background())
+	err = session.Query(fmt.Sprintf("ALTER KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '2'}", ksName)).ExecContext(t.Context())
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		events = policy.CapturedEvents()
@@ -1216,7 +1225,7 @@ func TestHostSelectionPolicyKeyspaceChangedEvents(t *testing.T) {
 
 	// DROP
 	policy.ResetEvents()
-	err = session.Query(fmt.Sprintf("DROP KEYSPACE %s", ksName)).ExecContext(context.Background())
+	err = session.Query(fmt.Sprintf("DROP KEYSPACE %s", ksName)).ExecContext(t.Context())
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		events = policy.CapturedEvents()
@@ -1226,4 +1235,28 @@ func TestHostSelectionPolicyKeyspaceChangedEvents(t *testing.T) {
 	require.Len(t, events, 1)
 	require.Equal(t, ksName, events[0].Keyspace)
 	require.Equal(t, SchemaChangeTypeDropped, events[0].Change)
+}
+
+// TestSingleHostReadyTokenAwareReplicasAtInit checks that a token-aware policy wrapped in SingleHostReadyPolicy
+// holds the replica map of a keyspace that existed before the session, as soon as the session is created.
+// The init-time schema refresh calls no KeyspaceChanged,
+// so it reaches the wrapped policy only because the driver looks through the wrapper to its schemaRefreshed.
+func TestSingleHostReadyTokenAwareReplicasAtInit(t *testing.T) {
+	cluster := createCluster()
+	tokenAware := TokenAwareHostPolicy(RoundRobinHostPolicy()).(*tokenAwareHostPolicy)
+	cluster.Metadata.CacheMode = Full
+	cluster.PoolConfig.HostSelectionPolicy = SingleHostReadyPolicy(tokenAware)
+
+	session, err := cluster.CreateSession()
+	require.NoError(t, err)
+	t.Cleanup(session.Close)
+
+	// system_auth exists on every cluster before any test runs.
+	ks, ok := session.schemaDescriber.getSchemaMetaForRead().keyspaceMeta["system_auth"]
+	require.True(t, ok, "the init-time refresh must have cached system_auth")
+	require.NotNil(t, ks.placementStrategy, "system_auth must have a placement strategy")
+	meta := tokenAware.getMetadataReadOnly()
+	require.NotNil(t, meta)
+	require.NotEmpty(t, meta.replicas[ks.placementStrategy.strategyKey()],
+		"the wrapped token-aware policy must hold system_auth's replica map right after CreateSession")
 }

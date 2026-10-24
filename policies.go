@@ -471,7 +471,17 @@ type schemaRefreshNotifier interface {
 // If metadata is required and MetadataCacheMode is not set to at least KeyspaceOnly, it will result in an error during session creation.
 //
 // All built-in policies implement this interface.
+//
+// A policy that wraps another by embedding HostSelectionPolicy inherits neither the wrapped policy's MetadataRequired
+// nor the internal hook a TokenAwareHostPolicy builds its replica maps with on a schema refresh.
+// A TokenAwareHostPolicy wrapped that way holds no replica maps for the keyspaces that exist when the session is created
+// until a host is added or removed, and NewSession does not refuse it when the metadata cache is disabled.
+// SingleHostReadyPolicy is looked through and has neither limitation.
 type MetadataRequiredPolicy interface {
+	// MetadataRequired reports whether the policy needs the driver's schema metadata cache.
+	//
+	// Returns:
+	//   - bool: true when NewSession must refuse a ClusterConfig whose Metadata.CacheMode is Disabled
 	MetadataRequired() bool
 }
 
@@ -531,6 +541,10 @@ func (r *roundRobinHostPolicy) HostDown(host *HostInfo) {
 	r.RemoveHost(host)
 }
 
+// MetadataRequired reports false: round-robin selection reads no schema metadata.
+//
+// Returns:
+//   - bool: always false
 func (r *roundRobinHostPolicy) MetadataRequired() bool {
 	return false
 }
@@ -1007,7 +1021,10 @@ func (t *tokenAwareHostPolicy) Pick(qry ExecutableStatement) NextHost {
 	}
 }
 
-// Always require metadata for token-aware host selection.
+// MetadataRequired reports true: token-aware selection builds its replica maps from keyspace metadata.
+//
+// Returns:
+//   - bool: always true
 func (t *tokenAwareHostPolicy) MetadataRequired() bool {
 	return true
 }
@@ -1053,6 +1070,10 @@ func (d *dcAwareRR) RemoveHost(host *HostInfo) {
 func (d *dcAwareRR) HostUp(host *HostInfo)   { d.AddHost(host) }
 func (d *dcAwareRR) HostDown(host *HostInfo) { d.RemoveHost(host) }
 
+// MetadataRequired reports false: DC-aware selection reads no schema metadata.
+//
+// Returns:
+//   - bool: always false
 func (d *dcAwareRR) MetadataRequired() bool {
 	return false
 }
@@ -1178,6 +1199,10 @@ func (d *rackAwareRR) Pick(q ExecutableStatement) NextHost {
 	return roundRobbin(int(nextStartOffset), d.hosts[0].get(), d.hosts[1].get(), d.hosts[2].get())
 }
 
+// MetadataRequired reports false: rack-aware selection reads no schema metadata.
+//
+// Returns:
+//   - bool: always false
 func (d *rackAwareRR) MetadataRequired() bool {
 	return false
 }
@@ -1227,11 +1252,33 @@ func (s *singleHostReadyPolicy) Ready() bool {
 	return true
 }
 
-// Requires metadata if the wrapped policy requires it.
-// If the wrapped policy does not implement MetadataRequiredPolicy, returns false.
+// MetadataRequired reports whether the wrapped policy requires the metadata cache.
+//
+// Returns:
+//   - bool: the wrapped policy's MetadataRequired, or false when it does not implement MetadataRequiredPolicy
 func (s *singleHostReadyPolicy) MetadataRequired() bool {
 	fallback, ok := s.HostSelectionPolicy.(MetadataRequiredPolicy)
 	return ok && fallback.MetadataRequired()
+}
+
+// unwrapReadyPolicy returns the policy inside any number of SingleHostReadyPolicy layers.
+//
+// SingleHostReadyPolicy embeds HostSelectionPolicy, which hides the wrapped policy's unexported methods,
+// so the schema refresh and NewSession's validation look through it with this.
+//
+// Parameters:
+//   - p: the configured policy
+//
+// Returns:
+//   - HostSelectionPolicy: the innermost policy that is not a SingleHostReadyPolicy; any other p as it is
+func unwrapReadyPolicy(p HostSelectionPolicy) HostSelectionPolicy {
+	for {
+		s, ok := p.(*singleHostReadyPolicy)
+		if !ok || s.HostSelectionPolicy == nil {
+			return p
+		}
+		p = s.HostSelectionPolicy
+	}
 }
 
 // ConvictionPolicy decides whether a host that failed should be marked DOWN.
