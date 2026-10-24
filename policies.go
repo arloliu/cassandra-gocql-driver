@@ -474,8 +474,9 @@ type schemaRefreshNotifier interface {
 //
 // A policy that wraps another by embedding HostSelectionPolicy inherits neither the wrapped policy's MetadataRequired
 // nor the internal hook a TokenAwareHostPolicy builds its replica maps with on a schema refresh.
-// A TokenAwareHostPolicy wrapped that way holds no replica maps for the keyspaces that exist when the session is created
-// until a host is added or removed, and NewSession does not refuse it when the metadata cache is disabled.
+// A TokenAwareHostPolicy wrapped that way holds no replica maps for the keyspaces that exist when the session is created:
+// a later topology change rebuilds them all, and a later change to one of those keyspaces adds that keyspace's.
+// NewSession does not refuse such a wrapper when the metadata cache is disabled either.
 // SingleHostReadyPolicy is looked through and has neither limitation.
 type MetadataRequiredPolicy interface {
 	// MetadataRequired reports whether the policy needs the driver's schema metadata cache.
