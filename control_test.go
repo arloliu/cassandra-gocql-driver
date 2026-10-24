@@ -178,6 +178,17 @@ func TestControl_HeartbeatSurvivesAPanickingRound(t *testing.T) {
 		ch := f.session.control.getConn()
 		return ch != nil && !ch.conn.Closed()
 	}, lifecycleBudget, 20*time.Millisecond, "the heartbeat must replace the control connection")
-	require.Zero(t, atomic.LoadInt32(&f.session.control.reconnecting),
-		"the reconnecting claim must be released")
+
+	// The round that published the replacement can still hold its claim here:
+	// setupConn logs and requests the schema refresh after publishing, reconnect then requests the ring refresh,
+	// and only reconnect's deferred function releases the claim, before it calls testControlReconnectDone.
+	// A held claim fails the test only if no round releases it, so look again after each round ends.
+	deadline := time.After(lifecycleBudget)
+	for atomic.LoadInt32(&f.session.control.reconnecting) != 0 {
+		select {
+		case <-reconnectDone:
+		case <-deadline:
+			t.Fatal("the reconnecting claim must be released")
+		}
+	}
 }

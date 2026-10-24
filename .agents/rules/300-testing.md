@@ -424,6 +424,25 @@ fails the original lines every time and passes the locked ones.
 It is kept under `tmp/correctness-review-2026-09-18/_repro/`, not as a package test,
 because it duplicates the fixture lines and would stay green if the real fixture were reverted.
 
+`TestControl_HeartbeatSurvivesAPanickingRound` was a **test** defect,
+first seen on 2026-10-24 as one failure in a full `-race` run of the unit lane.
+Once the heartbeat had replaced the control connection, the test read `controlConn.reconnecting` once and required zero:
+"the reconnecting claim must be released", at `control_test.go:181`, after 12.01s.
+The round that publishes the replacement still holds that claim.
+`setupConn` logs "Control connection connected to host." and requests the schema refresh after `publish`,
+`reconnect` then requests the ring refresh,
+and only `reconnect`'s deferred function releases the claim, just before it calls `testControlReconnectDone`.
+The test now looks again each time a round ends, which that hook signals,
+until the claim is free or `lifecycleBudget` runs out.
+A claim that is never released still fails it, with the same message:
+a mutation that keeps the claim only in the round that publishes fails at the deadline.
+Measured with a prebuilt `-race` binary, 600 single-test processes 16 at a time:
+**1/600 before, 0/600 after**, minutes apart, and the one failure had the recorded signature.
+As for `TestReconnectSkipsFilteredHosts`, a rate that low is not the proof; a forced interleaving is.
+A logger that sleeps 300 ms at that "connected" line, which sits between the publication and the release,
+fails the old assertion 5 of 5 with the same message and passes the new one 5 of 5.
+It is kept under `tmp/flake-heartbeat-2026-10-24/` with the scan script.
+
 ## Test Patterns
 **Table-Driven** — Use ONLY for multiple cases:
 ```go
