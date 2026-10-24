@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0-otter] - 2026-10-25
+
+Minor release.
+It adopts upstream's CASSGO-132,
+which adds the exported `MetadataRequiredPolicy` and `ErrMetadataCacheRequired`,
+makes `NewSession` refuse a token-aware policy when the metadata cache is `Disabled`,
+and stops calling `HostSelectionPolicy.KeyspaceChanged` while a session is created.
+It also fixes NetworkTopologyStrategy replica lists that repeated a host,
+and a `PREPARE` on a closing connection that failed as cancelled instead of closed.
+
+### Added
+
+- **`MetadataRequiredPolicy`, an optional interface for host selection policies (CASSGO-132).**
+  Its `MetadataRequired` reports whether the policy needs the driver's schema metadata cache.
+  Every built-in policy implements it:
+  `TokenAwareHostPolicy` reports true;
+  the round-robin, DC-aware, rack-aware and `hostpool` policies report false;
+  `SingleHostReadyPolicy` reports what the policy it wraps reports,
+  or false when that policy does not implement `MetadataRequiredPolicy`.
+
+- **`ErrMetadataCacheRequired` is the error `NewSession` returns for a policy that requires the metadata cache
+  when the cache is `Disabled`.**
+
+### Changed
+
+- **`NewSession` refuses a token-aware policy when `Metadata.CacheMode` is `Disabled` (CASSGO-132).**
+  It returns `ErrMetadataCacheRequired` for a policy whose `MetadataRequired` reports true,
+  looking through any `SingleHostReadyPolicy` around it.
+  Before, the session was created and token-aware routing had no replica information to use.
+  Set `CacheMode` to `KeyspaceOnly`, which is enough for token-aware routing, or drop the token-aware policy.
+  With the cache `Disabled` and a policy that does not implement `MetadataRequiredPolicy`,
+  `NewSession` logs a warning and creates the session.
+  The default mode, `Full`, is unaffected.
+
+- **`HostSelectionPolicy.KeyspaceChanged` is no longer called while a session is created (CASSGO-132).**
+  The first schema refresh called it with a synthetic `CREATED` event for every keyspace that already existed.
+  It is now called only for changes the driver sees after the session is initialized,
+  so a custom policy that learned the existing keyspaces from those calls no longer gets them.
+  `TokenAwareHostPolicy` still gets its replica maps when the session is created, through an internal hook,
+  on its own and inside any number of `SingleHostReadyPolicy` layers.
+  Inside an application's own wrapper that embeds `HostSelectionPolicy` it does not:
+  it holds no replica maps for the keyspaces that exist when the session is created,
+  so a query with a routing key in one of them has the token's primary owner as its only replica candidate,
+  ahead of the fallback policy.
+  A topology change rebuilds the maps,
+  and creating or updating a keyspace adds the map for its replication strategy, which keyspaces with that strategy share.
+  `NewSession` does not refuse such a wrapper when the cache is `Disabled` either,
+  unless the wrapper implements `MetadataRequiredPolicy` itself.
+
+### Fixed
+
+- **A NetworkTopologyStrategy replica list could name a host twice and leave out a replica.**
+  With vnodes, the walk from a token meets the same host again,
+  and once every rack of a data center had been seen, the next host was listed without checking the list.
+  A list could come out as `[a a b]`:
+  a replica was left out, and token-aware routing sent speculative executions and retries back to the host already tried.
+  A data center with fewer hosts than its replication factor was padded with repeats.
+  A host is now listed at most once per token,
+  and a data center's factor is capped at its number of token-owning hosts, as Cassandra does.
+  The lists match Cassandra 3.0's `calculateNaturalEndpoints`, so a list that had no repeat keeps its order.
+
+- **A `PREPARE` on a connection that was closing could fail with `context.Canceled`, and its query was then not retried.**
+  The shared `PREPARE` runs on the connection's own context, which closing the connection cancels.
+  The executor reads a bare context error as the caller's own cancellation,
+  so an idempotent query that its retry policy would have taken to the next host failed instead,
+  although the caller's context was alive.
+  Such an error is now `ErrConnectionClosed`, as it already was for a query waiting on that connection,
+  and the retry policy decides.
+
 ## [2.7.5-otter] - 2026-09-24
 
 Patch release for the second half of the correctness review of v2.7.3-otter:
